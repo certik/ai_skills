@@ -18,7 +18,7 @@ everything passes, and commit.
 
 - The LFortran repository is the current working directory.
 - The `lf` conda/pixi environment is available at `/Users/ondrej/.pixi/envs/lf/`.
-- `lfortran` on PATH points to `src/bin/lfortran` (in-tree build).
+- `lfortran` on PATH points to `src/bin/lfortran` (the latest in-tree build).
 - `flang` is available on PATH.
 - `ninja` is the build tool (in-tree build in the repo root).
 
