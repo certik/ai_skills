@@ -145,8 +145,8 @@ common prefix and number them in compilation order:
 
 #### 2. `run.sh` — Reproduction script
 
-Create an executable bash script `run.sh` that reproduces the bug (replace any
-previous `run.sh` if it exists):
+Create an executable bash script `run.sh` in the project root directory that
+reproduces the bug (replace any previous `run.sh` if it exists):
 
 ```bash
 #!/usr/bin/env bash
