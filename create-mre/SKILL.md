@@ -127,26 +127,31 @@ Confirm:
 - [ ] Flang compiles and runs successfully
 - [ ] LFortran fails with the same (or closely related) error as the original
 - [ ] No code can be removed without losing the bug
+- [ ] All MRE files are in the repository root (`./`), not in any subdirectory
 
 ### Phase 6: Produce Output Files
 
-Create the following deliverables in the current working directory:
+**IMPORTANT: All output files MUST be created directly in the repository root
+directory (`./`). Do NOT create a subdirectory (e.g., `mre_dir/`, `mre/`,
+`output/`) for MRE files. Every file — `.f90` files, `run.sh` — goes in `./`.**
 
 #### 1. The MRE Fortran file(s)
 
+Create the `.f90` file(s) directly in the repository root (`./`).
 Name the file descriptively based on the bug, e.g.:
-- `mre_derived_type_alloc.f90`
-- `mre_intrinsic_reshape.f90`
+- `./mre_derived_type_alloc.f90`
+- `./mre_intrinsic_reshape.f90`
 
 If multiple files are needed (e.g., module dependencies), name them with a
 common prefix and number them in compilation order:
-- `mre_mod1.f90` (module)
-- `mre_main.f90` (program)
+- `./mre_mod1.f90` (module)
+- `./mre_main.f90` (program)
 
-#### 2. `run.sh` — Reproduction script
+#### 2. `./run.sh` — Reproduction script
 
-Create an executable bash script `run.sh` in the project root directory that
-reproduces the bug (replace any previous `run.sh` if it exists):
+Create an executable bash script **`./run.sh`** in the repository root directory
+(the same directory as `CMakeLists.txt`, `fpm.toml`, etc.). Replace any previous
+`./run.sh` if it exists. Do NOT place it inside any subdirectory:
 
 ```bash
 #!/usr/bin/env bash
@@ -196,9 +201,9 @@ Print a summary for the user:
 ```
 MRE created successfully!
 
-Files:
+Files (all in repository root ./):
   <list of .f90 files>
-  run.sh
+  ./run.sh
 
 Bug: <one-line description>
 Error type: <compilation | runtime | wrong output>
