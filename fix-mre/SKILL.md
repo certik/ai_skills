@@ -134,7 +134,7 @@ Return to the LFortran root and run reference tests:
 ```bash
 eval "$(/Users/ondrej/miniforge3/bin/conda shell.bash activate /Users/ondrej/.pixi/envs/lf/)"
 cd <lfortran-root>
-./run_tests.py
+./run_tests.py &> log
 ```
 
 - If reference tests pass, proceed to Phase 7.
