@@ -226,12 +226,15 @@ RUN(NAME test_name LABELS gfortran llvm ...)
 ```bash
 eval "$(/Users/ondrej/miniforge3/bin/conda shell.bash activate /Users/ondrej/.pixi/envs/lf/)"
 cd integration_tests
+./run_tests.py -j16 --detect-leaks &> log_leaks
+tail -n30 log_leaks
 ./run_tests.py -j16 &> log
 tail -n30 log
 ```
 
-- If all tests pass, continue.
+- If all tests pass (both with and without leaks), continue.
 - If any test fails, examine the log, fix regressions, rebuild, and re-run.
+- Both test runs must pass: with leaks and without leaks.
 
 #### Reference Tests (Compiler Fix Only)
 
