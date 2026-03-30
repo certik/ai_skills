@@ -104,7 +104,7 @@ but the instructions in this SKILL.md file take precedence.
 2. Read the test `.f90` file to understand what it does.
 3. Run the test with leak detection:
    ```bash
-   eval "$(/Users/ondrej/miniforge3/bin/conda shell.bash activate /Users/ondrej/.pixi/envs/lf/)"
+   export PATH="/Users/ondrej/.pixi/envs/lf/bin:$PATH"
    cd integration_tests
    lfortran --detect-leaks <test_name>.f90
    ./a.out
@@ -193,7 +193,7 @@ If this is a compiler leak:
    appropriate pass. Follow the pattern of existing cleanup code nearby.
 3. Rebuild:
    ```bash
-   eval "$(/Users/ondrej/miniforge3/bin/conda shell.bash activate /Users/ondrej/.pixi/envs/lf/)"
+   export PATH="/Users/ondrej/.pixi/envs/lf/bin:$PATH"
    ninja
    ```
 4. Re-run the test with leak detection to verify the fix:
@@ -224,7 +224,7 @@ RUN(NAME test_name LABELS gfortran llvm ...)
 #### Integration Tests
 
 ```bash
-eval "$(/Users/ondrej/miniforge3/bin/conda shell.bash activate /Users/ondrej/.pixi/envs/lf/)"
+export PATH="/Users/ondrej/.pixi/envs/lf/bin:$PATH"
 cd integration_tests
 ./run_tests.py -j16 --detect-leaks &> log_leaks
 tail -n30 log_leaks
@@ -239,7 +239,7 @@ tail -n30 log
 #### Reference Tests (Compiler Fix Only)
 
 ```bash
-eval "$(/Users/ondrej/miniforge3/bin/conda shell.bash activate /Users/ondrej/.pixi/envs/lf/)"
+export PATH="/Users/ondrej/.pixi/envs/lf/bin:$PATH"
 cd <lfortran-root>
 ./run_tests.py &> log
 tail -n30 log
