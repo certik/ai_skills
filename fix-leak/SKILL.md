@@ -117,6 +117,11 @@ but the instructions in this SKILL.md file take precedence.
 Determine whether this is a user leak or a compiler leak by examining BOTH the
 Fortran source AND the ASR output.
 
+**IMPORTANT: Phase 2 must take no more than ~30% of your effort. Do NOT spawn
+sub-agents for deep code exploration. Read the source file, run `--show-asr`
+with and without `--skip-pass=all`, and make a classification. If uncertain,
+report to the user — do not over-investigate.**
+
 #### Step 2a: Analyze the Fortran source
 
 Read the `.f90` file carefully and look for:
@@ -131,7 +136,7 @@ pointers, this is likely a **USER_LEAK**.
 
 Generate the ASR to see what the compiler produces:
 ```bash
-lfortran --show-asr --no-color <test_name>.f90 2>&1 | head -500
+lfortran --show-asr --no-color <test_name>.f90 2>&1 | head -200
 ```
 
 Look for:
@@ -149,9 +154,9 @@ deallocations, this is a **compiler leak**.
 If you suspect a compiler leak, identify which pass creates the temporary:
 ```bash
 # Show ASR before passes
-lfortran --show-asr --skip-pass=all --no-color <test_name>.f90 2>&1 | head -500
+lfortran --show-asr --skip-pass=all --no-color <test_name>.f90 2>&1 | head -200
 # Compare with ASR after passes
-lfortran --show-asr --no-color <test_name>.f90 2>&1 | head -500
+lfortran --show-asr --no-color <test_name>.f90 2>&1 | head -200
 ```
 
 Search the pass source code for the temporary variable name pattern to find
@@ -181,7 +186,8 @@ If this is a user leak:
    deallocated. This is a user-code leak, not a compiler bug.
    ```
 
-3. Skip to Phase 6 (Summary).
+3. Proceed to Phase 5 (Run Tests). This is required even for USER_LEAK
+   to catch regressions from earlier sessions.
 
 ### Phase 3b: Fix Compiler Leak
 
@@ -220,6 +226,24 @@ RUN(NAME test_name LABELS gfortran llvm ...)
 ```
 
 ### Phase 5: Run Tests
+
+**HARD RULE: If any test that was passing before your change now fails, you
+MUST revert your compiler changes and re-diagnose. Do NOT commit with known
+regressions. Do NOT proceed to Phase 6.**
+
+#### Smoke Test (Always — Both USER_LEAK and Compiler Fix)
+
+Rebuild and run a quick regression check:
+```bash
+export PATH="/Users/ondrej/.pixi/envs/lf/bin:$PATH"
+ninja -j16
+cd integration_tests
+lfortran derived_types_89.f90 -o /tmp/smoke_dt89 && /tmp/smoke_dt89
+lfortran class_61.f90 -o /tmp/smoke_c61 && /tmp/smoke_c61
+```
+
+If either crashes or fails, your change (or a prior uncommitted change)
+introduced a regression. Fix it before proceeding.
 
 #### Integration Tests
 
