@@ -34,7 +34,7 @@ Pipeline: **repro-issue → create-mre → fix-mre**
 
 Before starting, confirm you have:
 
-- `lfortran` available on PATH (typically a locally-built `src/bin/lfortran`)
+- `lfortran` available on PATH (typically a symbolic link to a locally-built `src/bin/lfortran`)
 - `flang` available on PATH
 - `gh` CLI available on PATH and authenticated (`gh auth status`)
 - Working directory is the lfortran repository root (same dir as
