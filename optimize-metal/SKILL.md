@@ -10,9 +10,11 @@ description: >
   parallel SDPA, parallel argmax, 2-deep command-buffer pipeline,
   persistent + const param buffers, concurrent encoder with explicit
   barriers, fused residual epilogues, separate decode/prefill kernel
-  paths, MXFP4 dequant-in-register, and JIT-compiled metallib. After
-  each change validates end-to-end tokens against the previous commit
-  and the C reference; rolls back on regressions. Triggers: optimize
+  paths, MXFP4 dequant-in-register, JIT-compiled metallib, GPU "glue"
+  kernels for host-side breaks (often the biggest single decode win),
+  SG-per-(state_row, state_dim) for RNN/SSM recurrences. After each
+  change validates end-to-end tokens against the previous commit and
+  the C reference; rolls back on regressions. Triggers: optimize
   metal, speed up metal, match mlx speed, gpu optimization, metal
   performance, kernel tuning.
 ---
@@ -117,28 +119,40 @@ Single, repeating cycle:
 
 ## Setup — profiling infrastructure
 
-Add (or use, if already present in src-metal/) a per-kernel profiling mode:
+**Always track `g_gpu_time` per cmdbuf and print it alongside wall time:**
 
 ```c
-// main.c: if getenv("KPROF"), wrap every dispatch in its own
-// cmdbuf, time it, sum per kernel name; print a totals table at exit:
-//
-//   embed_gather  0.001 s  ( 0.1%)
-//   rmsnorm      0.006 s  ( 0.4%)
-//   linear-q     0.012 s  ( 0.8%)
-//   ...
-//   sdpa         0.480 s  (32.1%)
-//   gate_up      0.520 s  (34.8%)
-//   down         0.310 s  (20.7%)
+// metal_shim already sums (GPUEndTime - GPUStartTime) into g_gpu_time.
+// Reset before timing, then print BOTH wall and gpu_busy:
+g_gpu_time = 0.0;
+clock_gettime(...t0);
+// ... run prefill or decode loop ...
+clock_gettime(...t1);
+double wall = (t1 - t0);
+fprintf(stderr, "decode: %.2fs (%d toks; %.1f tok/s; gpu_busy=%.2fs)\n",
+        wall, n_gen, n_gen / wall, g_gpu_time);
 ```
 
-This idiom is what `src-metal/main.c` already has (see `KPROF`).
-Without it, all you know is "decode is slow". With it, you know
-exactly which kernel to attack.
+The `wall - gpu_busy` gap tells you whether to chase kernel speed or
+host-side scheduling:
+
+- `gpu_busy ≈ wall`  → you're GPU-bound; optimize kernels (B, C, D, E, F, I).
+- `gpu_busy << wall` → you're CPU-bound; optimize scheduling (A, H).
+
+The single biggest win in a typical naive port comes from eliminating
+host-side breaks (H1 / glue kernels) — you can see this immediately as
+`gpu_busy/wall` ratio jumping from ~30% to ~95%.
+
+KPROF (per-kernel timing) is OPTIONAL — see GOTCHAS #11. For a model
+whose architecture you already know (you wrote the C ref), you can
+predict the top hot kernels from first principles: largest GEMV
+(lm_head, expert weights) and the SSM step if present. Spend the
+KPROF effort only if your profile genuinely surprises you.
 
 For end-to-end timing, use `mlx_lm`-equivalent timing (`tps =
 (n-1) / decode_time`, exclude the first decode step) so you can compare
-apples to apples with MLX.
+apples to apples with MLX. AND use ≥64 tokens AND best-of-3 runs:
+short runs on busy machines have ±20% variance. See GOTCHAS #6.
 
 ## The Optimization Catalog
 
@@ -324,6 +338,12 @@ MLX's `qmv_fast`.
 
 **Original commits**: 9fce171 (gemv_bf16_4 — 4 outputs/SG), b7d7cf2
 (8 outputs/SG), b69d31b (register-cached X for mxfp4 qmv4).
+
+**Pitfall**: K_OUT has a sweet spot. For q8 affine dequant (4 bytes
+unpacked + 4 dot-products per inner iter), K_OUT=4 wins; K_OUT=8
+*hurts* (decode 41 → 31 tok/s in one port) because the inner loop
+exceeds the register budget and the compiler spills. Default to 4
+for q8/affine; revisit only after MMA has displaced GEMV.
 
 #### B4. Share X via threadgroup memory
 
@@ -579,6 +599,69 @@ less urgent, but still worth it for prefill).
 
 ---
 
+### H. Host/GPU boundary cleanup — often the biggest single win
+
+#### H1. Eliminate host-side breaks via "glue" kernels
+
+**What**: A naive port `commit_wait`s + opens a fresh cmdbuf every
+time the host does a small scratch op inside `forward()` — conv state
+shift, broadcast-multiply with a scalar gate, channel split, KV cache
+append, etc. Replace each one with a 5–10 line Metal kernel so the
+WHOLE `forward()` runs in ONE command buffer.
+
+**When**: ANY time you see `commit_wait` followed by a `for`-loop +
+`memcpy` on the host inside `forward()`. Audit aggressively.
+
+**Speedup**: 1.5–2.0× decode. In the Qwen3.6 port this was the
+SINGLE LARGEST optimization in the entire pipeline (decode
+19 → 34 tok/s, 1.79×). Each commit_wait costs 0.3–1.0 ms even for
+tiny cmdbufs; on a 40-layer model with 3 breaks per layer, that's
+40–120 ms / token of fixed overhead REGARDLESS of GPU kernel speed.
+
+**Signal that this is your bottleneck**: after batched dispatches
+(A1), `gpu_busy << wall`. The gap is host overhead.
+
+**Snippet**: `patterns/glue_kernels_no_host_break.metal`
+
+#### H2. Merge embed + forward + argmax into one cmdbuf per step
+
+**What**: Make `forward()` take `cb` as a parameter (don't own /
+commit it). Then the decode loop builds:
+```
+cb = new_cmdbuf()
+dispatch_embed(cb, ids_buf, ...)
+forward(cb, q_off, 1)
+dispatch_argmax(cb, logits, next_id_buf, ...)
+commit_wait(cb)
+```
+Was 3 commit_waits per token, now 1.
+
+**When**: Always, after H1.
+
+**Speedup**: 1.02–1.05× decode (a few ms saved per step).
+
+### I. Recurrent / state-update kernels
+
+#### I1. SG-per-(state_row, state_dim) for RNN/SSM steps
+
+**What**: For models with a per-token state recurrence (GatedDeltaNet,
+Mamba SSM), the naive port has 1 thread per `hv` (or per head). For
+Hv=32, that's 1 SIMD-group on the whole GPU — 2.5% utilization.
+
+Parallelize over BOTH state-row (`hv`) and state-dim (`dv`):
+one SG per `(hv, dv)`. Lanes inside the SG cover the inner `dk`
+dimension (Dk/32 elements per lane in registers); reductions are
+`simd_sum`. Saturates the GPU.
+
+**When**: First optimization for any RNN/SSM step.
+
+**Speedup**: 2–3× decode on models with such layers. In Qwen3.6:
+decode 5 → ~15 tok/s.
+
+**Snippet**: `patterns/recurrent_state_sg_per_row.metal`
+
+---
+
 ### G. Decode/Prefill split — only when techniques diverge
 
 Some optimizations are great for decode but bad for prefill (or vice
@@ -605,8 +688,10 @@ Each technique above points to a file in `patterns/`. These are
 
 ```
 patterns/
+├── GOTCHAS.md                              <-- READ THIS FIRST
 ├── cmdbuf_batch_dispatches.c
 ├── cmdbuf_pipeline_2deep.c
+├── cmdbuf_pipeline_2deep_id_swap.c         <-- pipeline + id swap
 ├── concurrent_encoder.c
 ├── param_buf_persistent.c
 ├── param_buf_const.c
@@ -616,6 +701,7 @@ patterns/
 ├── gemv_with_residual_epilogue.metal
 ├── gemm_simdgroup_matrix_mma.metal
 ├── sdpa_simd_softmax.metal
+├── sdpa_sg_per_head_decode.metal           <-- D1 worked example
 ├── sdpa_online_softmax.metal
 ├── sdpa_multi_sg.metal
 ├── sdpa_rotating_kv_cache.md
@@ -623,7 +709,10 @@ patterns/
 ├── mxfp4_gate_up_swiglu_fused.metal
 ├── moe_sorted_gather_glue.metal
 ├── moe_sorted_gather_qmm.metal
-└── argmax_parallel.metal
+├── argmax_parallel.metal
+├── glue_kernels_no_host_break.metal        <-- H1 (often biggest win)
+├── recurrent_state_sg_per_row.metal        <-- I1 for SSM/RNN
+└── decode_prefill_split.md
 ```
 
 Each pattern file contains:
@@ -662,7 +751,45 @@ prompt, you are done. Document the final tok/s and machine in a
 src-metal: optimization complete (prefill X.X tok/s vs MLX Y.Y, decode A.A vs B.B)
 ```
 
+## Empirical attack order — what to actually try first
+
+For a quantized MoE decoder LLM on Apple Silicon, this is the empirical
+order of biggest wins from a naive port (validated on Qwen3.6-35B-A3B
+on M4 Max, with the same patterns from gpt-oss work):
+
+1. **Parallel argmax** (F1). 1-thread argmax over 200k+ vocab is the
+   most common "why is decode capped at <5 tok/s" answer.
+2. **SIMD-group-per-output for ALL quantized GEMV** (B1). Affects
+   q/k/v/o_proj, lm_head, router, every MoE linear.
+3. **SG-per-row for the reduction kernels**: rmsnorm, softmax_topk,
+   embed_dequant_gather. Cheap.
+4. **SG-per-(hv, dv) for the recurrent state step** (I1) if the model
+   has GatedDelta / Mamba / SSM layers. 32 serial threads → 4096 SGs.
+5. **SDPA SG-per-(lq, hq) with TG-mem scores** (D1 worked example).
+   Necessary precursor to D2/D3.
+6. **ELIMINATE HOST-SIDE BREAKS** (H1, glue kernels). Usually the
+   single biggest jump in the whole pipeline. Often 1.5–2×.
+7. **Merge embed + forward + argmax into one cmdbuf** (H2). Small win.
+8. **2-deep cmdbuf pipeline with id-swap** (A4 variant). Closes the
+   last CPU-encode gap to MLX.
+
+This sequence took Qwen3.6-35B-A3B on M4 Max from 1.9 → 43.6 tok/s
+decode, matching MLX (40–48 tok/s) on the same prompt.
+
+Optimizations that *should* help but landed in the noise band on this
+model (don't skip but don't expect miracles):
+- bfloat4 vector loads in isolation (baked into B1 already).
+- qmv4 K_OUT=4 register tile.
+- Concurrent encoder.
+
+Optimizations to skip in this order for decode-only goals:
+- C1/C2/C3 (GEMM MMA for prefill) — only relevant if your goal is to
+  match prefill speed, not decode.
+
 ## Common pitfalls
+
+See `patterns/GOTCHAS.md` for the full set with concrete fixes.
+Highlights:
 
 - **Premature multi-SG SDPA**: if you split a head across SGs before
   fixing the dumb 1-thread-per-output SDPA, you'll measure a tiny gain
@@ -686,6 +813,30 @@ src-metal: optimization complete (prefill X.X tok/s vs MLX Y.Y, decode A.A vs B.
 - **Argmax over VOCAB=200k single-threaded**: this is by far the most
   common "why is decode capped at 40 tok/s" answer. Apply F1 immediately
   once decode is in the 40+ tok/s ballpark.
+- **`dispatchThreads:` takes TOTAL THREADS, not threadgroups**: passing
+  `grid_x = N` with `tg_x = 32` launches `ceil(N/32)` SGs, not N. For
+  SG-per-output kernels, you want `grid_x = 32 * N`. See GOTCHAS #2.
+- **KV cache `max_ctx` and SDPA `MAX_CTX` must agree AND be ≥ Lp +
+  max_tokens**: silent buffer overruns produce wrong tokens that look
+  like "numerical drift" past the first ~32 tokens. See GOTCHAS #3.
+- **`gpu_busy << wall` means CPU encode / host roundtrips are the
+  bottleneck**, not GPU work. Look for `commit_wait` inside `forward()`
+  and replace each host-side scratch op with a glue kernel (H1). This
+  is usually the single biggest win in the whole pipeline.
+- **The first generated token IS the prefill argmax**: when wiring up
+  a 2-deep pipeline that primes itself, it's easy to skip emitting
+  this token, shifting all output by 1. The "first N tokens match"
+  check then fails for purely off-by-one reasons. See GOTCHAS #10.
+- **K_OUT in qmv4 sweet spot is small** (4 for q8 affine dequant on
+  M4). Bigger values increase register pressure and may *slow* you
+  down — measure before scaling up. See GOTCHAS #8.
+- **Per-file `constant constexpr` collisions** when kernels are
+  concatenated into one library — prefix per-file (e.g.,
+  `LQ8_SIMD_WIDTH`, `ARGMAX_TG_SIZE`). See GOTCHAS #4.
+- **First cmdbuf wall ≠ first cmdbuf GPU time**: Metal warms up
+  pipeline state objects, residency, etc. lazily on first dispatch
+  (0.5–3s wall for nothing). Always report both wall and `gpu_busy`
+  so you can tell the difference. See GOTCHAS #5.
 
 ## Debugging recipes
 
