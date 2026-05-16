@@ -133,13 +133,25 @@ Customize:
 
 ### Phase 1: Set up the Metal infrastructure
 
-1. `mkdir -p src-metal/kernels`. Copy drop-ins: `metal_shim.{h,m}`,
-   `kernel_concat.{c,h}`.
+1. `mkdir -p src-metal/kernels src-metal/tests src-metal/utils`. Copy
+   drop-ins: `metal_shim.{h,m}`, `kernel_concat.{c,h}`.
 
-2. Copy/symlink `safetensors.{c,h}`, `tokenizer.{c,h}`, `tokenizer.bin`,
-   and your `<chattmpl>.{c,h}` from `src-cpu/`. (Symlinks keep the two
-   trees in sync. Copies are fine if you prefer fully-independent
-   directories.)
+2. Bring shared files in from src-cpu. **`cp -a` is easier than `ln -s`** —
+   symlinks have a relative-path gotcha (the path is relative to the
+   symlink's location, not the cwd you ran `ln` from). If you must use
+   symlinks, run them from inside `src-metal/`:
+
+   ```sh
+   cd src-metal
+   for f in safetensors.{c,h} tokenizer.{c,h} qwen_chat.{c,h} tokenizer.bin; do
+       ln -sf ../src-cpu/$f
+   done
+   cd utils
+   for f in ../../src-cpu/utils/*.{c,h}; do ln -sf "$f" $(basename "$f"); done
+   ```
+
+   (Verify with `head -1 src-metal/safetensors.h` — if you get "No such
+   file", the link is broken.)
 
 3. Author a minimal `src-metal/kernels/noop.metal` containing a 1-line kernel:
    ```metal
@@ -149,17 +161,61 @@ Customize:
    }
    ```
 
-4. Author a tiny `tests/test_shim.c` that:
-   - Reads `noop.metal` into a string (or uses `kernel_concat` to slurp
-     `src-metal/kernels/*.metal`).
-   - Calls `gpu_init(msl_source, &err)`.
-   - Allocates a small buffer, dispatches `noop_inc`, reads back, checks
-     each element incremented by 1.
+4. Author a `tests/test_shim.c` that **compiles every `.metal` file you
+   plan to write AND looks up every named kernel function**, in addition
+   to dispatching `noop_inc`. This catches MSL syntax errors and
+   `[[buffer(K)]]` index mistakes in <1s — *before* you spend 30s+
+   building main.c and waiting for a model load. As you add more kernels
+   in Phase 2, append them to the `paths[]` and `kernels[]` arrays in
+   this test; rerun before every commit.
 
 5. Build with the Metal frameworks and run the test. It must pass before
    you touch real kernels.
 
 6. **Commit**: `src-metal: metal shim + smoke test`.
+
+### Phase 1.5: Makefile — extend, don't replace
+
+If the repo already has a root Makefile (typical after `build-c-reference`),
+**add new metal targets to it** rather than creating a separate
+`src-metal/Makefile`. Both binaries should coexist (`qwen35-cpu` and
+`qwen35`, etc.). Pattern:
+
+```make
+# ---------- Apple-GPU Metal port (naive correctness build) ------------------
+METAL_BIN        := <BIN>
+METAL_CFLAGS     := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Isrc-metal
+METAL_OBJCFLAGS  := -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc -ObjC -Isrc-metal
+METAL_LDFLAGS    := -lm -framework Foundation -framework Metal -framework MetalKit
+
+METAL_C_SRCS := src-metal/main.c src-metal/kernel_concat.c \
+                src-metal/safetensors.c src-metal/tokenizer.c \
+                src-metal/<chattmpl>.c \
+                src-metal/utils/json.c src-metal/utils/iofile.c \
+                src-metal/utils/bytebuf.c src-metal/utils/utf8.c
+METAL_M_SRCS := src-metal/metal_shim.m
+METAL_OBJS   := $(METAL_C_SRCS:.c=.o) $(METAL_M_SRCS:.m=.o)
+
+metal: $(METAL_BIN)
+$(METAL_BIN): $(METAL_OBJS)
+	$(CC) $^ -o $@ $(METAL_LDFLAGS)
+src-metal/%.o: src-metal/%.c
+	$(CC) $(METAL_CFLAGS) -c $< -o $@
+src-metal/%.o: src-metal/%.m
+	$(CC) $(METAL_OBJCFLAGS) -c $< -o $@
+
+METAL_TEST_BINS := src-metal/tests/test_shim
+metal-tests: $(METAL_TEST_BINS)
+	@for t in $^; do echo "==> $$t" && ./$$t || exit 1; done
+src-metal/tests/test_%: src-metal/tests/test_%.c src-metal/metal_shim.o src-metal/kernel_concat.o
+	$(CC) $(METAL_CFLAGS) $^ -o $@ $(METAL_LDFLAGS)
+
+metal-run: $(METAL_BIN) src-cpu/tokenizer.bin
+	./$(METAL_BIN) --prompt "<validation_prompt>" --max-tokens N --model $(MODEL_DIR)
+```
+
+Remember to extend the existing `clean:` rule and `.gitignore` rather
+than introducing new ones.
 
 ### Phase 2: Port each C kernel 1:1 to MSL
 
@@ -173,24 +229,23 @@ write output. Pass scalar parameters via a small "dims" `device const`
 buffer (you can also use kernel function-constant attributes, but the
 buffer approach matches how the optimization phase will use it).
 
-Example (RMSNorm):
+Example (RMSNorm) — note how `eps` is bundled into the dims struct:
 
 ```metal
 // rmsnorm.metal
 #include <metal_stdlib>
 using namespace metal;
 
-struct rmsnorm_dims { uint M; uint D; };
+struct rmsnorm_params { uint M; uint D; float eps; };
 
-kernel void rmsnorm_bf16(device const bfloat*       X       [[buffer(0)]],
-                         device const bfloat*       W       [[buffer(1)]],
-                         device bfloat*             Y       [[buffer(2)]],
-                         constant rmsnorm_dims&     dims    [[buffer(3)]],
-                         constant float&            eps     [[buffer(4)]],
-                         uint                       m       [[thread_position_in_grid]])
+kernel void rmsnorm_bf16(device const bfloat*        X       [[buffer(0)]],
+                         device const bfloat*        W       [[buffer(1)]],
+                         device bfloat*              Y       [[buffer(2)]],
+                         constant rmsnorm_params&    p       [[buffer(3)]],
+                         uint                        m       [[thread_position_in_grid]])
 {
-    if (m >= dims.M) return;
-    uint D = dims.D;
+    if (m >= p.M) return;
+    uint D = p.D;
     const device bfloat* xp = X + m * D;
     device bfloat*       yp = Y + m * D;
 
@@ -199,7 +254,7 @@ kernel void rmsnorm_bf16(device const bfloat*       X       [[buffer(0)]],
         float v = float(xp[d]);
         sq += v * v;
     }
-    float rrms = rsqrt(sq / float(D) + eps);
+    float rrms = rsqrt(sq / float(D) + p.eps);
     for (uint d = 0; d < D; ++d) {
         yp[d] = bfloat(float(xp[d]) * rrms * float(W[d]));
     }
@@ -209,13 +264,18 @@ kernel void rmsnorm_bf16(device const bfloat*       X       [[buffer(0)]],
 **Style guidelines for the naive port:**
 - Match the C kernel's loop nest exactly.
 - Use `bfloat` (Apple's bf16 type) for storage, `float` for accumulators.
-- Pass dimensions in a `constant struct` buffer; pass scalars (eps,
-  scale, alpha, limit) in their own small buffers.
+- **Bundle all dims AND scalars (eps, scale, alpha, limit) into one
+  `constant struct` per kernel**, in a single `[[buffer(K)]]` slot.
+  Separate per-scalar buffers waste buffer slots and complicate the
+  dispatch site.
 - One thread per output row (or output element if outputs are scalar).
 - **Do not** use `threadgroup memory`, `simdgroup_*`, vector loads, or
   any tiling. Save those for `optimize-metal`.
 - **Do not** combine kernels. If C has `linear` and `swiglu` separately,
   Metal does too.
+- For trivially-sequential reductions (e.g. argmax over the whole vocab),
+  a single-thread kernel (`if (i != 0u) return;`) is fine for the naive
+  port. `optimize-metal` will parallelise.
 
 #### 2b. Wire the dispatch in main.c
 
@@ -223,10 +283,42 @@ For each Metal kernel, you need three things at the call site:
 
 1. A `gpu_pipeline*` looked up once at startup
    (`gpu_pipeline_for(ctx, "rmsnorm_bf16", &err)`).
-2. Small param buffers for `dims` / scalars (allocate once, refill in
-   place per call).
+2. A per-dispatch slice in a **params arena** Metal buffer (see below).
+   **Do NOT reuse a single param buffer across dispatches in the same
+   cmdbuf** — the GPU reads buffer contents at *execution* time
+   (post-commit), so all dispatches would see the last value written.
 3. A `gpu_cmdbuf_dispatch(...)` call with grid=`(M, 1, 1)`,
    threadgroup=`(1, 1, 1)` (naive — one thread per output row).
+
+**Params-arena pattern** (drop into your main.c):
+
+```c
+static gpu_buf* g_params_buf;
+static size_t   g_params_off, g_params_cap;
+
+static gpu_arg_buf push_params(const void* p, size_t n) {
+    size_t off = (g_params_off + 15u) & ~(size_t)15;   // 16-byte align
+    if (off + n > g_params_cap) { fprintf(stderr, "arena overflow\n"); exit(1); }
+    memcpy((char*)gpu_buf_contents(g_params_buf) + off, p, n);
+    g_params_off = off + n;
+    return (gpu_arg_buf){ g_params_buf, off };
+}
+static void reset_params(void) { g_params_off = 0; }
+
+// In alloc_buffers():
+g_params_cap = 4u << 20;   // 4 MB headroom
+g_params_buf = gpu_buf_new(ctx, g_params_cap);
+
+// At the top of forward():  reset_params();
+// At each dispatch site:
+//   struct { uint32_t M, D; float eps; } p = { Lq, H, rms_eps };
+//   gpu_arg_buf args[] = { WARG(x_buf), TARG("...weight"), WARG(h_buf), push_params(&p, sizeof p) };
+//   gpu_cmdbuf_dispatch(cb, pso_rmsnorm, args, 4, Lq, 1, 1, 1, 1, 1);
+```
+
+Budget: ~40 layers × ~30 dispatches × ~64 B ≈ 80 KB per forward(). 4 MB
+is comfortable headroom. If you commit_wait inside forward() you can
+reset the arena there too, but easier to just reset once per forward().
 
 #### 2c. Validate the kernel against the C reference
 
@@ -273,17 +365,34 @@ src-metal: <kernel_name> 1:1 metal port + test
    `src-cpu/main.c` but every C-function call becomes a
    `gpu_cmdbuf_dispatch(...)`.
 
-2. Allocate weights as Metal buffers via `gpu_buf_wrap_nocopy` on the
-   mmap'd safetensors regions (zero-copy on Apple Silicon — works as
-   long as the host pointer is page-aligned, which `mmap` guarantees).
+2. **Weights: allocate one Metal buffer per tensor** via
+   `gpu_buf_new_from(ctx, tensor.data, tensor.nbytes)` at load time.
+   See "Why per-tensor weight buffers (not wrap_nocopy)" below — zero-copy
+   shard wrapping is almost always blocked by Metal's offset-alignment
+   rule. Total RAM usage ≈ model size; on Apple Silicon unified memory
+   this is what `mmap` would page in anyway. After all tensors are copied,
+   you can `st_close(arch)` to free the mmap virtual range if you want.
+
+   Convenient pattern: index per-tensor buffers by `(t - st_at(arch, 0))`
+   so `T_arg(t)` returns `{ g_tensor_bufs[idx], 0 }` (always offset 0,
+   always naturally aligned).
 
 3. Allocate workspace buffers (`x_buf`, `h_buf`, KV caches, etc.) via
-   `gpu_buf_new(ctx, size)`.
+   `gpu_buf_new(ctx, size)`. They live in shared (unified) storage and
+   are directly host-readable via `gpu_buf_contents` — useful for the
+   host-side bookkeeping ops below.
 
 4. forward(q_off, Lq):
-   - Open a `gpu_cmdbuf`.
-   - For each kernel, dispatch with grid sized by `Lq * ...`.
+   - Open a `gpu_cmdbuf`. Reset the params arena.
+   - For each kernel, push params and dispatch.
    - Commit + wait at the end of forward.
+
+   For ops that mix GPU compute with **host-side scalar/bookkeeping work**
+   (e.g. KV-cache memcpy at the right offset, conv1d state shift,
+   one-off scalar broadcasts), the naive pattern is: commit_wait the
+   current cmdbuf, do the host work directly on `gpu_buf_contents(...)`
+   memory, open a fresh cmdbuf, continue. Don't try to make every
+   side-quest a kernel; the optimisation skill will tidy this up.
 
 5. AR loop:
    - Embed prompt → forward(0, Lp) → argmax → emit
@@ -306,19 +415,64 @@ src-metal: <kernel_name> 1:1 metal port + test
       the GPU (`metal device: <Apple ...>` printed at startup).
 - [ ] Generated N tokens match the C reference (`./src-cpu/<BIN>`)
       exactly.
-- [ ] Per-kernel tests in `tests/` pass.
+- [ ] Phase-1 smoke test (`metal-tests`) still passes (all kernels
+      compile + look up).
+- [ ] Per-kernel tests in `tests/` pass — **optional**. Skip them if
+      end-to-end token match passes and your iteration loop is < 2 min
+      (rebuild + run). Only worth adding when you actually need to bisect
+      a divergence.
 
-When all boxes are ticked, the skill is done.
+When all the required boxes are ticked, the skill is done.
 
 ## Tips
 
-### Zero-copy weights
+### Why per-tensor weight buffers (not `wrap_nocopy`)
 
-`gpu_buf_wrap_nocopy(ctx, host_ptr, bytes)` makes the mmap'd
-safetensors region directly accessible from the GPU on Apple Silicon
-(unified memory). This avoids a 14 GB copy at startup. The host pointer
-must be page-aligned and the size a multiple of the page size; `mmap`
-gives you both.
+`gpu_buf_wrap_nocopy` on an mmap'd safetensors shard *sounds* great
+(zero-copy unified memory) but **almost never works** for per-tensor
+access, because:
+
+- safetensors tightly packs tensor bytes: the `data_offsets` from the
+  JSON header place tensors at arbitrary byte boundaries (e.g. offset
+  2417203021 for a uint32 weight, 5118533389 for a bf16 scales tensor).
+- Metal `setBuffer:offset:atIndex:` requires the offset to be a multiple
+  of 4 bytes *and* naturally aligned to the kernel's pointer dtype. An
+  offset of 2417203021 (mod 4 = 1) fails silently with garbage reads —
+  symptom: embed output values around 1e35.
+
+Symptoms of this bug:
+- `./<BIN>` generates all-zero token IDs.
+- First layer of embed/RMSNorm outputs have nonsensical magnitudes
+  (~1e35 or all-identical values).
+
+**Solution: per-tensor `gpu_buf_new_from` at load time.** Each tensor
+becomes its own Metal buffer; every dispatch uses offset 0. Total RAM
+≈ model size; the copy takes a few seconds at memory-bandwidth speed
+(~5s for 35 GB on M4 Max). On Apple Silicon this is the same RAM
+`mmap` would have lazily faulted in anyway.
+
+If you absolutely need zero-copy weights for memory reasons, your
+alternatives are: (a) rewrite every weight-reading kernel to take a
+`device const uchar*` raw-byte pointer plus a 4-byte-aligned byte
+offset uniform, and reconstruct the typed pointer in-kernel; (b)
+pre-pass through the model and emit one Metal buffer per shard with
+tensors re-laid-out at dtype-aligned offsets. Both are
+optimisation-skill work — for the naive port, just copy.
+
+### Useful facts (not bugs but worth knowing)
+
+- **Apple Silicon page size is 16 KB** (not 4 KB). Matters if you do
+  page-alignment math.
+- **PROT_READ mmap is fine** for `newBufferWithBytesNoCopy` reads — the
+  GPU happily reads from read-only host memory. (Moot if you take the
+  per-tensor-copy advice above.)
+- **`tg=(1,1,1)` is accepted** by Apple GPUs (M1/M2/M3/M4). No need to
+  bump to a SIMD group for the naive port.
+- **Apple `bfloat` works out of the box** at `MTLLanguageVersion3_1` on
+  M2+; no need for the ushort emulation path on modern Xcode.
+- **JIT compile is fast** — all ~20 kernel functions in one MSL string
+  compile in <1s on M4 Max. Don't worry about persisting metallibs in
+  this skill.
 
 ### bf16 in MSL
 
@@ -367,6 +521,32 @@ kernel sequentially, then `commit_wait` at the end. Per-kernel barriers
 happen automatically with Metal's compute encoder unless you opt into
 concurrent encoding (don't do that yet).
 
+### Kernels that update state in place
+
+Some kernels (e.g. `conv1d_depthwise_causal_bf16`) both read input AND
+update a carried `state` buffer. A naive parallel kernel hits a
+write-after-read hazard across threads. Cleanest naive port: **split
+into "compute on GPU" + "update state on host"** (memcpy / memmove on
+`gpu_buf_contents(state)` between two cmdbufs). Optimisation skill can
+later replace the host shift with a dedicated kernel.
+
+### Host-side scalar broadcasts
+
+For one-off ops that don't decompose cleanly into a kernel — e.g.
+"sigmoid of a per-row scalar gate × a per-row vector", or "add two
+host-side intermediates" — just commit_wait, do them on the host with
+`gpu_buf_contents(...)`, and open a fresh cmdbuf. Naive is fine; the
+optimisation skill will reshape these as broadcast kernels.
+
+### MoE down_proj reshape trick
+
+The per-(token, expert) inner loop in src-cpu's MoE down_proj path
+collapses cleanly into a single `linear_q8_gather` dispatch by
+reshaping `(L, K_top)` → `(L' = L*K_top, K_top'=1)`. The same gather
+kernel handles both `gate_proj/up_proj` (real K_top) and `down_proj`
+(K_top'=1). One kernel, three call sites — no need for a separate
+"per-token-per-expert" kernel in the naive port.
+
 ### Per-kernel correctness tests
 
 A pattern that scales:
@@ -402,16 +582,22 @@ prefill fast path later.
 
 ## Common pitfalls
 
+- **Per-tensor offset alignment**: see "Why per-tensor weight buffers
+  (not `wrap_nocopy`)" above. This is the #1 silent-failure trap.
+- **Symlink relative paths**: `ln -sf` resolves the target relative to
+  the *symlink's* directory, not your cwd. Run `ln` from inside
+  `src-metal/` (or use `cp -a`).
+- **Param buffer reuse within a cmdbuf**: the GPU reads buffer
+  contents at execution time (post-commit), so reusing one param
+  buffer across dispatches in the same cmdbuf gives every dispatch
+  the *last* value written. Use the bump-arena pattern (one slice per
+  dispatch, reset per forward()).
 - **Buffer arg index mismatch**: `[[buffer(0)]]` in the .metal file
   must line up with `args[0]` in the dispatch. Missing one slot
-  silently shifts every following arg.
+  silently shifts every following arg. The Phase-1 smoke test catches
+  most of these by attempting to load every named pipeline.
 - **Stride confusion**: HF weights are `[N, K]` row-major. In MSL,
   `W[n*K + k]` reads row `n`. Easy to swap.
-- **Page alignment for wrap_nocopy**: if you compute a pointer that's
-  not page-aligned (e.g., into the middle of a safetensors blob), use
-  `gpu_buf_new_from` (copy) instead. Or use the buffer-and-offset
-  form: keep the whole shard as the buffer and pass `offset = tensor's
-  byte offset` in the `gpu_arg_buf`.
 - **bfloat type name**: older Metal had no native bf16 — emulate via
   `ushort` + `as_type` casts. Test on your Xcode version first.
 - **Forgot to barrier between dispatches**: Metal's compute encoder
@@ -420,6 +606,10 @@ prefill fast path later.
 - **KV cache offsets**: when writing K/V at position `q_off`, write to
   `k_cache[li] + q_off * Nkv * D`, not `q_off * Nq * D`. The K cache
   has Nkv heads, not Nq.
+- **SDPA scores need bounded thread-local storage**: declare
+  `float scores[MAX_CTX]` with `MAX_CTX` set well above your model's
+  `max_ctx`. Apple Metal allows fairly large per-thread arrays — for
+  the naive port this is simpler than threadgroup/global scratch.
 
 ## Commit strategy
 

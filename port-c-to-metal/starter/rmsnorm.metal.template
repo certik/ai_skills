@@ -3,7 +3,7 @@
 // Style for THIS skill (port-c-to-metal, correctness-first):
 //   - one thread per output row
 //   - bfloat storage, float accumulator
-//   - dims/scalars in small constant buffers
+//   - ALL dims + scalars in ONE constant struct (one [[buffer]] slot)
 //   - NO threadgroup memory, NO simdgroup ops, NO tiling, NO vector loads
 //
 // Save those for optimize-metal.
@@ -11,17 +11,16 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct rmsnorm_dims { uint M; uint D; };
+struct rmsnorm_params { uint M; uint D; float eps; };
 
 kernel void rmsnorm_bf16(device const bfloat*       X       [[buffer(0)]],
                          device const bfloat*       W       [[buffer(1)]],
                          device bfloat*             Y       [[buffer(2)]],
-                         constant rmsnorm_dims&     dims    [[buffer(3)]],
-                         constant float&            eps     [[buffer(4)]],
+                         constant rmsnorm_params&   p       [[buffer(3)]],
                          uint                       m       [[thread_position_in_grid]])
 {
-    if (m >= dims.M) return;
-    uint D = dims.D;
+    if (m >= p.M) return;
+    uint D = p.D;
     const device bfloat* xp = X + m * D;
     device bfloat*       yp = Y + m * D;
 
@@ -30,7 +29,7 @@ kernel void rmsnorm_bf16(device const bfloat*       X       [[buffer(0)]],
         float v = float(xp[d]);
         sq += v * v;
     }
-    float rrms = rsqrt(sq / float(D) + eps);
+    float rrms = rsqrt(sq / float(D) + p.eps);
     for (uint d = 0; d < D; ++d) {
         yp[d] = bfloat(float(xp[d]) * rrms * float(W[d]));
     }

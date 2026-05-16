@@ -47,7 +47,14 @@ gpu_ctx* gpu_init(const char* msl_source, char** err) {
             MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
             // Match Metal 3.0 features (Apple7+ / M1+).
             opts.languageVersion = MTLLanguageVersion3_1;
+            // mathMode was added in macOS 15 / iOS 18 and replaces the
+            // deprecated fastMathEnabled.  Use the new API on supported
+            // SDKs and fall back to the old one otherwise.
+#if defined(__MAC_15_0) && __MAC_OS_X_VERSION_MIN_REQUIRED >= __MAC_15_0
+            opts.mathMode = MTLMathModeFast;
+#else
             opts.fastMathEnabled = YES;
+#endif
             NSError* e = nil;
             lib = [dev newLibraryWithSource:src options:opts error:&e];
             if (!lib) {
