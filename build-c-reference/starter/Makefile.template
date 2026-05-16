@@ -1,0 +1,44 @@
+# Makefile.template — pure-C CPU reference build.
+#
+# Replace <BIN> with the binary name you want, e.g., `gptoss-cpu`.
+# Drop into the repo root; it expects sources in `csrc-cpu/`.
+
+CC      ?= clang
+CFLAGS  := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Icsrc-cpu
+
+BIN     := <BIN>
+
+# Add new kernel .c files as you author them.  Per-kernel correctness
+# tests live in `tests/` and are built by the `tests` target.
+SRCS    := csrc-cpu/main.c \
+           csrc-cpu/kernels.c \
+           csrc-cpu/safetensors.c \
+           csrc-cpu/tokenizer.c \
+           csrc-cpu/<chattmpl>.c
+
+OBJS    := $(SRCS:.c=.o)
+
+# Per-kernel correctness tests.  Add one entry per `tests/test_<kernel>.c`.
+TEST_BINS := tests/test_rmsnorm tests/test_linear
+
+.PHONY: all clean tests run
+
+all: $(BIN)
+
+$(BIN): $(OBJS)
+	$(CC) $^ -o $@ -lm
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+tests: $(TEST_BINS)
+	@for t in $(TEST_BINS); do echo "==> $$t" && ./$$t || exit 1; done
+
+tests/test_%: tests/test_%.c csrc-cpu/kernels.o
+	$(CC) $(CFLAGS) $^ -o $@ -lm
+
+run: $(BIN)
+	./$(BIN) --prompt "Hello, who are you?" --max-tokens 16
+
+clean:
+	rm -f csrc-cpu/*.o tests/*.o $(BIN) $(TEST_BINS)

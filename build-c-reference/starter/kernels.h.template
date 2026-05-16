@@ -1,0 +1,88 @@
+// kernels.h.template — one C function per distinct math op in the reference.
+// Customize the op set for your model; see the SKILL.md for the typical
+// transformer + MoE set.
+//
+// RULES
+// 1. Native model precision in storage (bf16 typical), fp32 accumulators.
+// 2. Plain C — no shim, no buffer wrapper, no pipeline objects.
+// 3. One function per distinct math op (not per call site).
+// 4. No fusion beyond what the reference itself does.
+// 5. No prefill / decode special paths.
+
+#ifndef KERNELS_H
+#define KERNELS_H
+
+#include <stdint.h>
+#include "bf16.h"
+
+// ---- Phase 3: embed, RMSNorm, dense linear ---------------------------------
+
+// Y[m,d] = E[ids[m], d]
+void embed_gather_bf16(const int32_t* ids, const bf16* E,
+                       bf16* Y, uint32_t M, uint32_t D);
+
+// y[m,d] = w[d] * x[m,d] / sqrt(eps + mean_d(x[m,d]^2))
+void rmsnorm_bf16(const bf16* X, const bf16* W, bf16* Y,
+                  uint32_t M, uint32_t D, float eps);
+
+// Y[m,n] = B[n] + Σ_k X[m,k] * W[n,k]    W layout: [N, K]
+void linear_bf16(const bf16* X, const bf16* W, const bf16* B,
+                 bf16* Y, uint32_t M, uint32_t K, uint32_t N);
+
+// ---- Phase 4: RoPE, attention ----------------------------------------------
+
+// Rotate X[l,h,d] in place using freqs[d/2] and per-position phase.
+// q_offset is the absolute position of X[0,*,*] in the KV cache.
+void rope_inplace_bf16(bf16* X, const float* inv_freqs,
+                       uint32_t L, uint32_t H, uint32_t D,
+                       uint32_t q_offset, float mscale /* yarn; else 1.0 */);
+
+// GQA SDPA with optional sliding window (window=0 -> full attention) and
+// optional per-head sink logit (sinks=NULL -> no sinks).
+// OUT layout: [Lq, Nq*D] (matches Q's per-token concat of all heads).
+void sdpa_bf16(const bf16* Q, const bf16* K, const bf16* V,
+               const bf16* sinks /* NULL ok */, bf16* OUT,
+               uint32_t Lq, uint32_t Lk,
+               uint32_t Nq, uint32_t Nkv, uint32_t D,
+               uint32_t window /* 0 = full */, uint32_t q_offset,
+               float scale);
+
+// ---- Phase 5: router -------------------------------------------------------
+
+// For each token, pick top-K experts and softmax their logits.
+void topk_softmax_bf16(const bf16* logits, int32_t* out_idx, float* out_w,
+                       uint32_t L, uint32_t E, uint32_t K);
+
+// ---- Phase 6: MoE quantized linear (model-specific quantization!) ----------
+
+// MXFP4 example: per-32-element e2m1 block + e8m0 scale byte.
+// Fused gather + dequant + matmul (no materialized bf16 weight buffer).
+// Replace with your model's quantization format.
+//
+// Y[l, kt, n] = bias[E_kt, n] + Σ_k dequant(W[E_kt, n, k]) * X[l, k]
+// where E_kt = expert_ids[l, kt].
+void mxfp4_linear_gather_bf16(const bf16* X,
+                              const uint8_t* blocks, const uint8_t* scales,
+                              const bf16* bias, const int32_t* expert_ids,
+                              bf16* Y,
+                              uint32_t L, uint32_t K_top,
+                              uint32_t K, uint32_t N);
+
+// ---- Phase 7: SwiGLU + expert mix + residual -------------------------------
+
+// out = (clamp(gate, _, limit) * sigmoid(alpha * gate)) * (clamp(up,-limit,limit) + 1)
+// (the +1 is gpt-oss-specific; match your reference)
+void swiglu_bf16(const bf16* gate, const bf16* up, bf16* out,
+                 uint32_t N, float alpha, float limit);
+
+// Weighted sum of K_top expert outputs.
+void expert_mix_bf16(const bf16* per_expert_out, const float* topk_w,
+                     bf16* out, uint32_t L, uint32_t K_top, uint32_t H);
+
+void residual_add_bf16(bf16* x, const bf16* d, uint32_t N);
+
+// ---- Phase 8: head ---------------------------------------------------------
+
+void argmax_bf16(const bf16* logits, int32_t* out_idx, uint32_t N);
+
+#endif

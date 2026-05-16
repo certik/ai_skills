@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""dump_ref.py.template — run the Python reference model on a fixed prompt
+and dump per-op intermediate tensors as f32 binaries readable by the C
+per-kernel correctness tests.
+
+Customize for your reference framework:
+  - MLX: register Module hooks via mx.eval and intermediate captures.
+  - PyTorch / HF: register forward_hooks on the modules you care about.
+
+Output layout (in --out dir, default csrc-cpu/refs/):
+    input_ids.bin                    int32  [L]
+    x_after_embed.bin                f32    [L, hidden]
+    x_after_rmsnorm_<i>.bin          f32    [L, hidden]
+    q_proj_<i>.bin                   f32    [L, n_qheads*head_dim]
+    ...
+    attn_out_<i>.bin                 f32    [L, n_qheads*head_dim]
+    logits.bin                       f32    [vocab]
+    next_id.bin                      int32  [1]
+
+Binary format (matches loader in tests/load_ref.h):
+    magic   : "GPTOSSF1"                 (8 bytes)
+    u32     : dtype code (0=f32, 1=i32)
+    u32     : ndim
+    i64[ndim]: shape
+    data    : ndim * elem_size * Π(shape) bytes, little-endian
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import struct
+import sys
+
+import numpy as np
+
+# [MODEL] Choose ONE backend.
+USE_MLX = True
+if USE_MLX:
+    import mlx.core as mx
+    from mlx_lm import load
+else:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+MAGIC = b"GPTOSSF1"
+DT_F32, DT_I32 = 0, 1
+
+
+def save_bin(path: str, arr, dtype: str) -> None:
+    if dtype == "f32":
+        a = np.array(arr, dtype=np.float32, copy=False)
+        code = DT_F32
+    elif dtype == "i32":
+        a = np.array(arr, dtype=np.int32, copy=False)
+        code = DT_I32
+    else:
+        raise ValueError(dtype)
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<II", code, a.ndim))
+        for s in a.shape:
+            f.write(struct.pack("<q", int(s)))
+        f.write(a.tobytes())
+    print(f"  wrote {path}: dtype={dtype} shape={list(a.shape)}")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True, help="HF model dir")
+    p.add_argument("--out", default="csrc-cpu/refs")
+    p.add_argument("--system", default="You are a helpful assistant.")
+    p.add_argument("--user", default="Hello, who are you?")
+    p.add_argument("--reasoning", default="low")   # [MODEL] drop if not used
+    p.add_argument("--max-new-tokens", type=int, default=4)
+    p.add_argument("--layers", default="0",
+                   help="comma-separated layer indices to dump (default 0)")
+    args = p.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    layers = sorted({int(x) for x in args.layers.split(",")})
+
+    if USE_MLX:
+        # [MODEL] MLX-LM path.
+        model, tokenizer = load(args.model)
+        messages = [
+            {"role": "system", "content": args.system},
+            {"role": "user",   "content": args.user},
+        ]
+        ids = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True,
+            reasoning_effort=args.reasoning,         # [MODEL] drop if not used
+        )
+        ids_arr = np.array(ids, dtype=np.int32)
+        save_bin(f"{args.out}/input_ids.bin", ids_arr, "i32")
+
+        # [MODEL] Register hooks at every op boundary you want to validate.
+        # MLX modules don't have forward_hooks like PyTorch; the simplest
+        # approach is to manually re-run the forward in Python and dump at
+        # each boundary by accessing module sub-results.
+        #
+        # See the gpt-oss tools/dump_mlx_ref.py for a working example.
+        raise NotImplementedError(
+            "Customize the per-op dump for your MLX model — see SKILL.md")
+    else:
+        # [MODEL] PyTorch / HF path.
+        tok = AutoTokenizer.from_pretrained(args.model)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=torch.bfloat16, device_map="cpu")
+        model.eval()
+        messages = [
+            {"role": "system", "content": args.system},
+            {"role": "user",   "content": args.user},
+        ]
+        ids = tok.apply_chat_template(messages, add_generation_prompt=True,
+                                      return_tensors="pt")
+        save_bin(f"{args.out}/input_ids.bin", ids[0].numpy(), "i32")
+
+        # Register forward_hooks on the modules of interest.
+        captures = {}
+        def hook(name):
+            def f(_mod, _inp, out):
+                captures[name] = (out[0] if isinstance(out, tuple) else out).detach().float().cpu().numpy()
+            return f
+
+        for li in layers:
+            layer = model.model.layers[li]
+            layer.input_layernorm.register_forward_hook(hook(f"x_after_rmsnorm_{li}"))
+            layer.self_attn.q_proj.register_forward_hook(hook(f"q_proj_{li}"))
+            layer.self_attn.k_proj.register_forward_hook(hook(f"k_proj_{li}"))
+            layer.self_attn.v_proj.register_forward_hook(hook(f"v_proj_{li}"))
+            # [MODEL] add more hooks for o_proj, router, gate_up, swiglu, down, etc.
+
+        with torch.inference_mode():
+            out = model.generate(ids, max_new_tokens=args.max_new_tokens,
+                                 do_sample=False)
+        save_bin(f"{args.out}/next_id.bin",
+                 np.array([out[0, ids.shape[1]].item()], dtype=np.int32), "i32")
+        for k, v in captures.items():
+            save_bin(f"{args.out}/{k}.bin", v, "f32")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

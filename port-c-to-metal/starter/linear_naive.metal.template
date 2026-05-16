@@ -1,0 +1,31 @@
+// kernels/linear_naive.metal.template — example naive 1:1 Metal port of linear_bf16.
+//
+// One thread per output element y[m,n].  Inner loop reads K elements
+// of X and one row of W (N rows total).  Awful memory access pattern —
+// fine for correctness, terrible for performance.  Optimize later.
+
+#include <metal_stdlib>
+using namespace metal;
+
+struct linear_dims { uint M; uint K; uint N; };
+
+kernel void linear_bf16(device const bfloat*    X       [[buffer(0)]],
+                        device const bfloat*    W       [[buffer(1)]],
+                        device const bfloat*    B       [[buffer(2)]],     // may be all-zeros if no bias
+                        device bfloat*          Y       [[buffer(3)]],
+                        constant linear_dims&   dims    [[buffer(4)]],
+                        uint2                   gid     [[thread_position_in_grid]])
+{
+    uint m = gid.y;
+    uint n = gid.x;
+    if (m >= dims.M || n >= dims.N) return;
+
+    const device bfloat* xrow = X + m * dims.K;
+    const device bfloat* wrow = W + n * dims.K;
+
+    float acc = float(B[n]);
+    for (uint k = 0; k < dims.K; ++k) {
+        acc += float(xrow[k]) * float(wrow[k]);
+    }
+    Y[m * dims.N + n] = bfloat(acc);
+}

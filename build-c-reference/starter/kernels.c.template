@@ -1,0 +1,81 @@
+// kernels.c.template — example kernel implementations.
+// Shows the style (naive scalar, fp32 accumulator).  Customize / extend
+// for your model.  See SKILL.md for the full op list.
+
+#include "kernels.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+// ---- embed_gather ----------------------------------------------------------
+
+void embed_gather_bf16(const int32_t* ids, const bf16* E,
+                       bf16* Y, uint32_t M, uint32_t D) {
+    for (uint32_t m = 0; m < M; m++) {
+        memcpy(Y + (size_t)m * D, E + (size_t)ids[m] * D, (size_t)D * sizeof(bf16));
+    }
+}
+
+// ---- rmsnorm ---------------------------------------------------------------
+
+void rmsnorm_bf16(const bf16* X, const bf16* W, bf16* Y,
+                  uint32_t M, uint32_t D, float eps) {
+    for (uint32_t m = 0; m < M; m++) {
+        const bf16* x = X + (size_t)m * D;
+        bf16*       y = Y + (size_t)m * D;
+        float sq = 0.0f;
+        for (uint32_t d = 0; d < D; d++) {
+            float v = bf16_to_f32(x[d]);
+            sq += v * v;
+        }
+        float rrms = 1.0f / sqrtf(sq / (float)D + eps);
+        for (uint32_t d = 0; d < D; d++) {
+            float v = bf16_to_f32(x[d]) * rrms * bf16_to_f32(W[d]);
+            y[d] = f32_to_bf16(v);
+        }
+    }
+}
+
+// ---- linear ----------------------------------------------------------------
+
+void linear_bf16(const bf16* X, const bf16* W, const bf16* B,
+                 bf16* Y, uint32_t M, uint32_t K, uint32_t N) {
+    for (uint32_t m = 0; m < M; m++) {
+        const bf16* xrow = X + (size_t)m * K;
+        bf16*       yrow = Y + (size_t)m * N;
+        for (uint32_t n = 0; n < N; n++) {
+            const bf16* wrow = W + (size_t)n * K;
+            float acc = B ? bf16_to_f32(B[n]) : 0.0f;
+            for (uint32_t k = 0; k < K; k++) {
+                acc += bf16_to_f32(xrow[k]) * bf16_to_f32(wrow[k]);
+            }
+            yrow[n] = f32_to_bf16(acc);
+        }
+    }
+}
+
+// ---- residual_add ----------------------------------------------------------
+
+void residual_add_bf16(bf16* x, const bf16* d, uint32_t N) {
+    for (uint32_t i = 0; i < N; i++) {
+        x[i] = f32_to_bf16(bf16_to_f32(x[i]) + bf16_to_f32(d[i]));
+    }
+}
+
+// ---- argmax ----------------------------------------------------------------
+
+void argmax_bf16(const bf16* logits, int32_t* out_idx, uint32_t N) {
+    int32_t best_i = 0;
+    float   best_v = bf16_to_f32(logits[0]);
+    for (uint32_t i = 1; i < N; i++) {
+        float v = bf16_to_f32(logits[i]);
+        if (v > best_v) { best_v = v; best_i = (int32_t)i; }
+    }
+    out_idx[0] = best_i;
+}
+
+// ---- TODO: rope_inplace_bf16, sdpa_bf16, topk_softmax_bf16, ----------------
+// ---- TODO: mxfp4_linear_gather_bf16, swiglu_bf16, expert_mix_bf16. ---------
+//
+// Implement each, then add tests/test_<kernel>.c that loads inputs from
+// refs/*.bin and compares against the reference output.

@@ -1,0 +1,272 @@
+// main.c.template — pure-C CPU reference CLI for an LLM.
+//
+// Customize the parts marked [MODEL]: weight tensor names, the forward()
+// schedule (which kernels in which order), the chat-template builder, and
+// the config fields you load from config.json.
+//
+// Build: see Makefile.template.
+//
+// Usage:
+//   ./gptoss-cpu --prompt "Hello, who are you?" --max-tokens 16
+//   ./gptoss-cpu --prompt "..." --system "You are a pirate." --model PATH
+
+#include "kernels.h"
+#include "safetensors.h"
+#include "tokenizer.h"
+#include "<chattmpl>.h"     // [MODEL] chat-template builder (e.g., harmony.h)
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+// ---- [MODEL] config struct, populated from config.json --------------------
+typedef struct {
+    int n_layers;
+    int hidden;
+    int n_qheads;
+    int n_kvheads;
+    int head_dim;
+    int inter;
+    int n_experts;
+    int k_top;
+    int vocab;
+    int window;
+    int max_ctx;        // hardcoded for now; set conservatively
+    float rms_eps;
+    float swiglu_alpha;
+    float swiglu_limit;
+} cfg_t;
+
+static int parse_json_int(const char* json, const char* key);
+static float parse_json_float(const char* json, const char* key);
+
+static void load_config(const char* model_dir, cfg_t* c) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    FILE* f = fopen(path, "rb");
+    if (!f) { perror(path); exit(1); }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* j = malloc((size_t)n + 1);
+    fread(j, 1, (size_t)n, f);
+    j[n] = '\0';
+    fclose(f);
+
+    // [MODEL] adjust keys to match your config.json schema.
+    c->n_layers   = parse_json_int(j, "num_hidden_layers");
+    c->hidden     = parse_json_int(j, "hidden_size");
+    c->n_qheads   = parse_json_int(j, "num_attention_heads");
+    c->n_kvheads  = parse_json_int(j, "num_key_value_heads");
+    c->head_dim   = parse_json_int(j, "head_dim");
+    c->inter      = parse_json_int(j, "intermediate_size");
+    c->n_experts  = parse_json_int(j, "num_local_experts");
+    c->k_top      = parse_json_int(j, "num_experts_per_tok");
+    c->vocab      = parse_json_int(j, "vocab_size");
+    c->window     = parse_json_int(j, "sliding_window");
+    c->max_ctx    = 1024;
+    c->rms_eps    = 1e-5f;            // [MODEL] check config
+    c->swiglu_alpha = 1.702f;          // [MODEL] gpt-oss-style
+    c->swiglu_limit = 7.0f;            // [MODEL] gpt-oss-style
+    free(j);
+}
+
+// Minimal JSON value extractors (good enough for HF config.json).
+static int parse_json_int(const char* j, const char* key) {
+    char needle[128]; snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(j, needle);
+    if (!p) { fprintf(stderr, "config: missing key %s\n", key); exit(1); }
+    p = strchr(p, ':'); if (!p) exit(1);
+    return atoi(p + 1);
+}
+static float parse_json_float(const char* j, const char* key) {
+    char needle[128]; snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(j, needle);
+    if (!p) return 0.0f;
+    p = strchr(p, ':'); if (!p) return 0.0f;
+    return (float)atof(p + 1);
+}
+
+// ---- Globals: weights archive, tokenizer, workspace -----------------------
+static st_archive* g_arch;
+static cfg_t g_cfg;
+
+// Per-layer KV caches.
+static bf16** g_k_cache;  // [n_layers][max_ctx * n_kvheads * head_dim]
+static bf16** g_v_cache;
+
+// Workspace buffers, sized for worst-case Lq = max_ctx.
+static bf16 *x_buf, *h_buf, *q_buf, *attn_buf, *o_buf;
+static bf16 *router_buf, *mid_buf, *down_buf, *mlp_buf;
+static int32_t *tk_idx_buf;
+static float   *tk_w_buf;
+static bf16    *logits_buf;
+
+static void* tensor_ptr(const char* name, size_t* nbytes) {
+    const st_tensor* t = st_find(g_arch, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (nbytes) *nbytes = t->nbytes;
+    return t->data;
+}
+
+// ---- forward() ------------------------------------------------------------
+// [MODEL] customize this for your model. Call the kernels in the SAME order
+// the reference's forward() calls its ops.
+static void forward(int q_off, int Lq) {
+    char nm[256];
+    int Lk = q_off + Lq;
+    (void)Lk;
+
+    // Example structure (gpt-oss-shaped) — replace per your model:
+    for (int li = 0; li < g_cfg.n_layers; li++) {
+        // rmsnorm(in)
+        snprintf(nm, sizeof(nm), "model.layers.%d.input_layernorm.weight", li);
+        rmsnorm_bf16(x_buf, (const bf16*)tensor_ptr(nm, NULL), h_buf,
+                     (uint32_t)Lq, (uint32_t)g_cfg.hidden, g_cfg.rms_eps);
+
+        // q_proj, k_proj, v_proj
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_proj.weight", li);
+        const bf16* Wq = tensor_ptr(nm, NULL);
+        snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.q_proj.bias", li);
+        const bf16* Bq = tensor_ptr(nm, NULL);
+        linear_bf16(h_buf, Wq, Bq, q_buf,
+                    (uint32_t)Lq, (uint32_t)g_cfg.hidden,
+                    (uint32_t)(g_cfg.n_qheads * g_cfg.head_dim));
+
+        // ... k_proj into k_cache[li] at q_off, v_proj into v_cache[li] at q_off
+        // ... rope(q), rope(k)
+        // ... sdpa(q, k_cache[li][0..Lk], v_cache[li][0..Lk]) -> attn_buf
+        // ... o_proj(attn_buf) -> o_buf
+        // ... residual_add(x_buf, o_buf)
+        // ... rmsnorm(post)
+        // ... router_linear, topk_softmax
+        // ... mxfp4_linear_gather(h, gate_up_W) -> gate_up
+        // ... swiglu(gate, up) -> mid
+        // ... mxfp4_linear_gather(mid, down_W) -> down
+        // ... expert_mix(down, tk_w) -> mlp_buf
+        // ... residual_add(x_buf, mlp_buf)
+    }
+
+    // final rmsnorm + lm_head
+    rmsnorm_bf16(x_buf + (size_t)(Lq - 1) * g_cfg.hidden,
+                 (const bf16*)tensor_ptr("model.norm.weight", NULL),
+                 h_buf, 1, (uint32_t)g_cfg.hidden, g_cfg.rms_eps);
+    linear_bf16(h_buf, (const bf16*)tensor_ptr("lm_head.weight", NULL),
+                NULL, logits_buf, 1, (uint32_t)g_cfg.hidden,
+                (uint32_t)g_cfg.vocab);
+}
+
+// ---- main -----------------------------------------------------------------
+int main(int argc, char** argv) {
+    const char* prompt   = NULL;
+    const char* sysmsg   = "You are a helpful assistant.";
+    const char* reasoning = "low";
+    const char* model_dir = NULL;
+    int max_tokens = 16;
+
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i],"--prompt")     && i+1<argc) prompt    = argv[++i];
+        else if (!strcmp(argv[i],"--system")     && i+1<argc) sysmsg    = argv[++i];
+        else if (!strcmp(argv[i],"--reasoning")  && i+1<argc) reasoning = argv[++i];
+        else if (!strcmp(argv[i],"--model")      && i+1<argc) model_dir = argv[++i];
+        else if (!strcmp(argv[i],"--max-tokens") && i+1<argc) max_tokens = atoi(argv[++i]);
+        else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
+    }
+    if (!prompt || !model_dir) {
+        fprintf(stderr,
+            "usage: %s --prompt TEXT --model PATH [--system TEXT]"
+            " [--reasoning low|medium|high] [--max-tokens N]\n", argv[0]);
+        return 2;
+    }
+
+    // ---- Load tokenizer + build prompt ----
+    char* err = NULL;
+    gptoss_tokenizer* tk = tk_load("csrc-cpu/tokenizer.bin", &err);
+    if (!tk) { fprintf(stderr, "tokenizer load: %s\n", err); return 1; }
+    int prompt_ids[1024];
+    // [MODEL] adjust to your chat-template builder's signature
+    int Lp = <chattmpl>_build_prompt(tk, sysmsg, prompt, reasoning,
+                                     prompt_ids, 1024);
+    if (Lp < 0) { fprintf(stderr, "prompt too long\n"); return 1; }
+
+    // ---- Load weights + config ----
+    load_config(model_dir, &g_cfg);
+    fprintf(stderr,
+        "config: n_layers=%d hidden=%d n_qheads=%d n_kvheads=%d head_dim=%d "
+        "inter=%d n_experts=%d k_top=%d vocab=%d window=%d\n",
+        g_cfg.n_layers, g_cfg.hidden, g_cfg.n_qheads, g_cfg.n_kvheads,
+        g_cfg.head_dim, g_cfg.inter, g_cfg.n_experts, g_cfg.k_top,
+        g_cfg.vocab, g_cfg.window);
+
+    fprintf(stderr, "loading weights from %s ...\n", model_dir);
+    g_arch = st_open(model_dir, &err);
+    if (!g_arch) { fprintf(stderr, "weights: %s\n", err); return 1; }
+
+    // ---- Allocate KV caches + workspace ----
+    g_k_cache = calloc((size_t)g_cfg.n_layers, sizeof(bf16*));
+    g_v_cache = calloc((size_t)g_cfg.n_layers, sizeof(bf16*));
+    size_t kv_per = (size_t)g_cfg.max_ctx * g_cfg.n_kvheads * g_cfg.head_dim;
+    for (int li = 0; li < g_cfg.n_layers; li++) {
+        g_k_cache[li] = calloc(kv_per, sizeof(bf16));
+        g_v_cache[li] = calloc(kv_per, sizeof(bf16));
+    }
+    size_t cap = (size_t)g_cfg.max_ctx;
+    x_buf      = calloc(cap * g_cfg.hidden, sizeof(bf16));
+    h_buf      = calloc(cap * g_cfg.hidden, sizeof(bf16));
+    q_buf      = calloc(cap * g_cfg.n_qheads * g_cfg.head_dim, sizeof(bf16));
+    attn_buf   = calloc(cap * g_cfg.n_qheads * g_cfg.head_dim, sizeof(bf16));
+    o_buf      = calloc(cap * g_cfg.hidden, sizeof(bf16));
+    router_buf = calloc(cap * g_cfg.n_experts, sizeof(bf16));
+    mid_buf    = calloc(cap * g_cfg.k_top * g_cfg.inter, sizeof(bf16));
+    down_buf   = calloc(cap * g_cfg.k_top * g_cfg.hidden, sizeof(bf16));
+    mlp_buf    = calloc(cap * g_cfg.hidden, sizeof(bf16));
+    tk_idx_buf = calloc(cap * g_cfg.k_top, sizeof(int32_t));
+    tk_w_buf   = calloc(cap * g_cfg.k_top, sizeof(float));
+    logits_buf = calloc((size_t)g_cfg.vocab, sizeof(bf16));
+
+    // ---- Prefill ----
+    embed_gather_bf16(prompt_ids,
+                      (const bf16*)tensor_ptr("model.embed_tokens.weight", NULL),
+                      x_buf, (uint32_t)Lp, (uint32_t)g_cfg.hidden);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    forward(0, Lp);
+    int32_t next_id;
+    argmax_bf16(logits_buf, &next_id, (uint32_t)g_cfg.vocab);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double sec_pf = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+
+    // ---- Decode loop ----
+    int stop_id = tk_special(tk, "<|return|>");   // [MODEL] adjust
+    int n_gen = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (n_gen < max_tokens) {
+        n_gen++;
+        if (next_id == stop_id) break;
+        int blen = 0;
+        const char* bytes = tk_token_bytes(tk, next_id, &blen);
+        if (bytes) fwrite(bytes, 1, (size_t)blen, stdout);
+        fflush(stdout);
+
+        embed_gather_bf16(&next_id,
+                          (const bf16*)tensor_ptr("model.embed_tokens.weight", NULL),
+                          x_buf, 1, (uint32_t)g_cfg.hidden);
+        forward(Lp + n_gen - 1, 1);
+        argmax_bf16(logits_buf, &next_id, (uint32_t)g_cfg.vocab);
+    }
+    fputc('\n', stdout);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double sec_dec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+
+    fprintf(stderr,
+        "[stats] prompt=%d tokens, generated=%d tokens\n"
+        "        prefill: %.2f s (%.1f tok/s)\n"
+        "        decode:  %.2f s (%.1f tok/s)\n",
+        Lp, n_gen, sec_pf, Lp/sec_pf, sec_dec, n_gen/sec_dec);
+
+    tk_free(tk);
+    return 0;
+}
