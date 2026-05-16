@@ -11,6 +11,10 @@
 // SPEEDUP: 1.05–1.10× depending on overlap opportunity.
 // CAVEAT: You become responsible for inserting all real dependencies as
 //         explicit barriers.  Get one wrong → garbage output.
+// SEE ALSO: parallel_independent_chains.md (A8) — the late-stage
+//           extension where you overlap entire SUBGRAPHS (e.g., MoE main
+//           chain + shared-expert chain), not just pairs of dispatches.
+//           A8 is usually the last 3-5% to MLX parity.
 // COMMIT:  d08def0 — "Concurrent encoder w/ explicit barriers; q/k/v +
 //                    gate/up may overlap"
 

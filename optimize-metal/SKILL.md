@@ -848,6 +848,42 @@ Optimizations to skip in this order for decode-only goals:
 - C1/C2/C3 (GEMM MMA for prefill) — only relevant if your goal is to
   match prefill speed, not decode.
 
+## Late-stage barrier-removal checklist
+
+When you're at ~95% of MLX and decode is GPU-bound (`gpu_busy ≈ wall`),
+the remaining gap is almost always serialized concurrency. Walk through
+this checklist for each layer type in your model:
+
+**Attention layer**:
+- [ ] `q_proj || k_proj || v_proj` (read same H; disjoint outputs)
+- [ ] `q_norm || k_norm` (disjoint inputs and outputs)
+- [ ] `rope_q || rope_k` (disjoint inputs and outputs)
+
+**Linear-attention / SSM layer** (if present):
+- [ ] `in_proj_qkv || in_proj_z || in_proj_b || in_proj_a` (fan-out)
+- [ ] `silu_inplace(conv_out) || conv_state_update` (different buffers)
+- [ ] `rmsnorm_scale_q || rmsnorm_scale_k || sigmoid(beta) || compute_g`
+      (4-way concurrent, all different inputs/outputs)
+
+**MoE layer (BIGGEST WIN ZONE)**:
+- [ ] `moe.gate_proj || moe.up_proj` (read same H; disjoint outputs)
+- [ ] `shared.gate || shared.up || shared_expert_gate` (same H, disjoint)
+- [ ] **MoE main chain || shared-expert chain** end-to-end (A8) — this
+      is usually the last 3-5% to MLX parity.
+
+**Across-layer fusions**:
+- [ ] Residual fused into `o_proj` epilogue (B5)
+- [ ] Residual fused into `out_proj` epilogue (linear-attn B5)
+- [ ] Residual fused into `shared_expert_combine` (B5 variant)
+
+**Elemwise fusions**:
+- [ ] `copy + sigmoid_inplace` → `sigmoid_bf16` (out-of-place)
+- [ ] Any "init buffer; then modify in-place" pair → single oop kernel
+
+For each item, verify with a token-id match against the prior commit
+(`--max-tokens 16`). For each commit, run 5 times and use median to
+distinguish a real 1-2% win from noise.
+
 ## Common pitfalls
 
 See `patterns/GOTCHAS.md` for the full set with concrete fixes.

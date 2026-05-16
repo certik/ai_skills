@@ -285,3 +285,126 @@ The fusion is still WORTH doing because:
 But don't expect huge numbers when concurrent encoder is on; the win
 shows up cumulatively, not per-fusion.
 
+# 22. Common barrier-removable groups in transformer-LLMs
+
+Late-stage optimization is largely about finding pairs / groups of
+dispatches that have NO data hazard, so they can run concurrently.
+This is the checklist that pays off in practice (validated on
+Qwen3.6-35B-A3B and similar models):
+
+WITHIN one attention layer:
+  * QKV: q_proj || k_proj || v_proj  (all read post-rmsnorm H)
+  * post-projection norms: q_norm || k_norm  (different inputs)
+  * RoPE: rope_q || rope_k  (different inputs)
+  * For RMSNorm + dim-scale fused: rmsnorm_scale_q || rmsnorm_scale_k
+
+WITHIN one linear-attention/SSM layer:
+  * silu_inplace(conv_out) || conv_state_update  (different buffers)
+  * rmsnorm_scale_q || rmsnorm_scale_k || sigmoid(beta) || compute_g
+    (4-way, all different inputs/outputs)
+  * QKV gates: in_proj_qkv || in_proj_z || in_proj_b || in_proj_a
+    (4-way, all read same H, write disjoint outputs)
+
+WITHIN one MoE layer (the BIG win):
+  * MoE chain (gate_gather + up_gather + silu_mul + down_gather +
+    expert_mix) || shared-expert chain (gate_proj + up_proj +
+    silu_mul + down_proj + shared_expert_gate)
+  * Within MoE: moe.gate_proj || moe.up_proj  (both read h_buf)
+  * Within shared: shared.gate || shared.up || shared_expert_gate
+
+PATTERN: any dispatch group with the property "shared input(s),
+disjoint outputs" is barrier-removable. The fan-out points (post-
+rmsnorm) and fan-in points (o_proj + residual, shared_combine_add)
+are where you still need barriers.
+
+When in doubt, list every dispatch's buffer reads and writes; group
+the ones with no overlap.
+
+# 23. KPROF inflates total runtime ~30% but is the right tool
+
+KPROF mode wraps each dispatch in its own cmdbuf with commit+wait,
+which adds ~30% to total runtime (each commit/wait costs 0.3-1ms,
+and we're now doing ~340 commits/token).
+
+DO NOT use KPROF tok/s as a real performance number. KPROF gives:
+  * Correct RELATIVE ordering of which kernels are hot.
+  * Correct ABSOLUTE per-kernel GPU time.
+  * INFLATED total wall time.
+
+The procedure:
+  1. Run normally to get real tok/s.
+  2. Run with KPROF=1 to get the breakdown.
+  3. Attack the top-1 kernel by GPU time, OR look for opportunities
+     to overlap the top-N kernels (per-kernel time + concurrency).
+
+In late-stage optimization, look at KPROF total time vs real wall
+time: if KPROF total ≈ wall, you're NOT overlapping (apply A5/A8).
+If KPROF total >> wall (e.g., 1.4×), the concurrent encoder is
+overlapping work successfully.
+
+# 24. Fuse out-of-place elemwise pairs into one kernel
+
+A common pattern from the naive port:
+  1. copy_bf16(src, dst)         — N writes
+  2. sigmoid_inplace_bf16(dst)   — N reads + N writes
+
+Fuse into a single out-of-place kernel:
+  sigmoid_bf16(src, dst)         — N reads + N writes (no inplace)
+
+Eliminates one dispatch (~50us launch overhead) AND drops a
+buffer-to-buffer copy. Generalizes to any pair where the first
+kernel writes and the second reads/writes the same buffer.
+
+Examples from Qwen3.6:
+  copy + sigmoid_inplace → sigmoid_bf16 (out-of-place)
+  copy + silu_inplace    → could similarly be silu_bf16
+  copy + scale_by_alpha  → fused_scale_bf16
+
+Even more general: any "init buffer; then modify it" pair is fusable.
+
+# 25. tok/s differences < 2% are noise — run 5 times
+
+Single-run decode tok/s on a quiet machine still has ~1-2% variance
+from:
+  * Metal command-queue scheduling jitter
+  * Other processes on the GPU
+  * Thermal state
+  * Memory pressure
+
+When a commit claims a 1-2% speedup, verify with 5 runs and take
+median or best-of-3. Anything below 2% is in the noise band.
+
+Conversely: if a 5-run median is +3% or better, the win is real
+(in our session 66.0 → 66.9 was a 5-run-confirmed real +1.4% win,
+just barely).
+
+# 26. Two different "barriers" — don't confuse them
+
+Metal has TWO barrier mechanisms; they are NOT interchangeable:
+
+  (a) `threadgroup_barrier(mem_flags::mem_threadgroup)` — synchronize
+      threads within ONE threadgroup. Used INSIDE a kernel to
+      coordinate phases (e.g., write TG-mem then read).
+
+  (b) `memoryBarrierWithScope:MTLBarrierScopeBuffers` — synchronize
+      dispatches within ONE cmdbuf when concurrent encoder is in use.
+      Used BETWEEN dispatches in main.c.
+
+When porting from serial encoder (which auto-emits (b) after every
+dispatch) to concurrent encoder, you only need (b). (a) is unaffected.
+
+If you see "first 16 tokens match, then garbage", check (b) — a
+missing inter-dispatch barrier.
+If you see "every token is garbage", check (a) — a missing intra-
+kernel barrier (often introduced when refactoring multi-phase kernels
+like SDPA).
+
+# 27. forward() should ACCEPT a cmdbuf, not own one
+
+(See also GOTCHA #11.) Specifically: with 2-deep pipeline AND with
+the embed+forward+argmax merge, forward() must take `gpu_cmdbuf*
+cb` as a parameter and only append dispatches. The caller decides
+when to commit. The naive port (one commit_wait at end of forward())
+caps decode at the ~110-tok/s ceiling determined by per-cmdbuf
+overhead — even if your kernels are infinitely fast.
+
