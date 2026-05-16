@@ -157,3 +157,46 @@ were noise-band in this model (and may differ on others):
   - K_OUT register tile (qmv4) — only +0% to +5% for q8 dequant on M4.
   - bfloat4 vector loads (already baked into the SIMD-group-per-output
     kernels — separating them out doesn't add much).
+
+# 13. Metal queue ordering = free RAW correctness between cmdbufs
+
+Cmdbufs committed to the same `MTLCommandQueue` execute in commit
+order. This is what makes the 2-deep pipeline's id_io_buf swap correct
+WITHOUT explicit fences/events: argmax in cb[k] writes id_io_buf[1-s];
+embed in cb[k+1] reads it. Even though both are in-flight, Metal
+guarantees cb[k] finishes (and its GPU stores are visible) before
+cb[k+1] starts.
+
+If you ever introduce a SECOND queue (e.g. for async loading), you
+lose this guarantee and need `MTLSharedEvent` signalling.
+
+# 14. Use commit() (async) for pipelining, commit_wait() (sync) only at boundary
+
+The shim has two committers:
+  * gpu_cmdbuf_commit(cb)         — kick off, return immediately
+  * gpu_cmdbuf_commit_wait(cb, e) — kick off, BLOCK until done
+                                    (== commit() then waitUntilCompleted)
+
+The 2-deep pipeline MUST use the async `commit()` + later `wait()`,
+not `commit_wait()`. Mixing them up reduces the pipeline back to
+serial.
+
+# 15. Port-c-to-metal often leaves max_ctx at the smoke-test value
+
+The naive port from port-c-to-metal validates with --max-tokens 8 and
+hardcodes c->max_ctx accordingly (e.g., 64). The first thing the
+optimize-metal skill should do is bump max_ctx to a real benchmark
+size (1024+) AND match it in the SDPA TG-mem MAX_CTX. Skipping this
+produces silent buffer overruns that "first N tokens match" tests
+won't catch.
+
+# 16. Two id buffers, NOT one shared id buffer for the 2-deep pipeline
+
+You might think: "the CPU only reads next_id after wait, and Metal
+serializes cmdbufs, so one shared id buffer should work". It does
+NOT, for a subtle reason: the moment cb[k] finishes (releasing wait),
+cb[k+1] is already RUNNING (it was committed first), and its argmax
+is going to OVERWRITE the same buffer before the CPU has time to
+fread it. Use two buffers, with step at slot s writing to
+id_io_buf[1-s], so the CPU read of id_io_buf[1-s] (the buffer cb[k]
+wrote) is safe because cb[k+1] is writing to id_io_buf[s] instead.
