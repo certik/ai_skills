@@ -112,7 +112,8 @@ Ask the user for (if not already provided / discoverable):
 │   ├── x_after_rmsnorm_0.bin
 │   ├── ...
 └── tests/
-    └── test_kernel_*.c  # per-kernel correctness tests vs refs/
+    ├── load_ref.h         # .bin loader + bf16-aware err_check
+    └── test_kernels.c     # one test fn per kernel; CLI-selectable
 ```
 
 Plus:
@@ -146,10 +147,17 @@ Templates (read, then customize):
 - `main.c.template` — CLI skeleton: argparse, config.json loader, weight
   load, tokenizer load, prompt encode, prefill, AR decode, stats.
 - `kernels.h.template` — kernel signature pattern (one C function per
-  distinct math op).
+  distinct math op). Includes a checklist of common modern-architecture
+  ops (output gate, partial RoPE, q/k_norm, SSM step, etc.).
+- `kernels.c.template` — naive scalar reference kernels plus commented
+  snippets for two common quantization formats (MXFP4 and MLX 8-bit affine).
 - `Makefile.template` — `make src-cpu` builds `./<BIN>`.
-- `tools/dump_ref.py.template` — Python oracle dumper using `MAGIC` +
-  `dtype` + `shape` header format readable from C tests.
+- `tools/dump_ref.py.template` — Python oracle dumper. Includes both a
+  PyTorch / HF path (using `forward_hook`s) and an MLX path (manual
+  forward walk, since MLX has no hook mechanism).
+- `tests/test_kernels.c.template` — consolidated test harness with a
+  `TESTS[]` table and a bf16-aware (`abs + rel * |want|`) tolerance
+  helper. Run a single kernel with `./test_kernels rmsnorm` etc.
 
 ## Procedure
 
@@ -527,6 +535,198 @@ static inline float e8m0_scale(uint8_t b) {
 The format details (group size, packing, exponent bias) are all model-
 specific — check the reference's loader.
 
+### Quantization (MLX-style affine — 4-bit and 8-bit)
+
+MLX uses a different family of quantization formats. For a Linear of
+shape `(N, K)` quantized affinely at `B` bits with `group_size` `G`,
+the safetensors stores **three** tensors:
+
+```
+<base>.weight  : uint32  [N, K * B / 32]   -- packs (32 / B) elements per uint32
+<base>.scales  : <model dtype>  [N, K / G]
+<base>.biases  : <model dtype>  [N, K / G]
+```
+
+For `B = 8`, `G = 64`:
+- `weight` is `[N, K / 4]` uint32 — each `uint32` packs 4 little-endian
+  `uint8`s (low byte = first element).
+- `scales`, `biases` are `[N, K / 64]` in the model's native dtype
+  (`bfloat16` for bf16 models, `float32` for fp32 models — **not always
+  fp32**; check the actual safetensors!).
+
+Dequant for element `[n, k]`:
+
+```c
+uint8_t  q = (W[n, k/4] >> (8 * (k % 4))) & 0xff;
+float    x = (float)q * scale[n, k/64] + bias[n, k/64];
+```
+
+For `B = 4`, `G = 64`: same layout, but `weight` is `[N, K/8]` uint32
+packing 8 nibbles per uint32 (low nibble = first element). The 4-bit
+unsigned value `q ∈ [0, 15]` then dequants identically.
+
+Quirks worth remembering:
+- Even small linears (e.g., outputs of 1 or 32) are quantized in MLX
+  models. Don't assume "1-dim outputs" means f32.
+- MLX's `mx.quantized_matmul` and `mx.gather_qmm` dequant inline; never
+  materialize a dequantized weight buffer in the C reference.
+- `Embedding.weight` is quantized too in MLX-quantized models — use the
+  same dequant in your `embed_gather` kernel.
+- The MLX inference code may force certain weights to a specific quant
+  (`quant_predicate` in `mlx_lm/models/<name>.py`). Read it.
+
+### Modern-architecture patterns you'll likely encounter
+
+The basic transformer "decoder block" (RMSNorm → QKV linear → RoPE →
+SDPA → o_proj → residual → RMSNorm → SwiGLU → residual) is increasingly
+just the *starting* template. Newer models add:
+
+- **Grouped-query attention (GQA)**: `num_kv_heads << num_attention_heads`.
+  In the C reference, just one SDPA kernel that maps q-head `h` to kv-head
+  `h / (Nq / Nkv)`.
+- **Attention output gate** (Qwen 3.5, gpt-oss-mini, ...): `q_proj`
+  outputs `2 * num_heads * head_dim`; half is Q, half is a per-head
+  output gate. After SDPA: `out = sigmoid(gate) * out` before `o_proj`.
+- **Partial RoPE** (`partial_rotary_factor < 1.0`): rotate only the
+  first `D_rot = head_dim * partial_rotary_factor` dims of each head;
+  leave the rest untouched. Common in long-context models.
+- **Per-head q_norm / k_norm**: Qwen-style RMSNorm applied to each
+  attention head independently after the projections. Reuse the
+  standard `rmsnorm` kernel with `M = L * H, D = head_dim`.
+- **Sliding-window attention** on some layers: pass a `window` parameter
+  to SDPA; clamp the lower bound on the key index per query.
+- **Attention sinks**: an extra per-head logit that contributes only to
+  the softmax denominator (no V). Pass a `sinks` pointer to SDPA.
+- **MoE with shared expert**: in addition to top-K experts, every token
+  also passes through a shared expert and (optionally) a scalar
+  shared-expert gate `sigmoid(gate1) * shared_out`. Total `y = mix(experts)
+  + shared_gate * shared_out`.
+- **`norm_topk_prob`**: some models renormalize the top-K router scores
+  to sum to 1 after argpartition; others don't. Check the reference.
+- **Tied vs untied lm_head**: `tie_word_embeddings: true` means
+  `logits = embed_tokens.as_linear(x)`. Otherwise it's a separate
+  `lm_head` weight.
+
+#### Hybrid linear-attention / SSM models
+
+Many recent small-but-capable models (Mamba, Jamba, Falcon-Mamba,
+Qwen 3.5, RWKV, ...) interleave standard softmax attention with one of
+several "linear attention" variants:
+
+- **Mamba / Mamba-2**: selective state-space model with `A`, `B`, `C`,
+  `Δ` and a state matrix `h ∈ R[hidden, d_state]` per layer.
+- **GatedDeltaNet** (Qwen 3.5): a delta-rule recurrence with state
+  `S ∈ R[Hv, Dv, Dk]`; per step `S ← S * g + k ⊗ ((v - S k) * β)`,
+  output `y = S q`. Plus an in-projection conv1d, q/k normalize-and-scale,
+  and a gated RMSNorm.
+- **RWKV**: time-mix + channel-mix with a carried `wkv` state.
+
+What they have in common (and what the C reference needs to handle):
+
+1. **Per-layer state buffers persisted across forward() calls**:
+   - depthwise conv1d state (`(kernel-1) * conv_dim` per layer)
+   - SSM state (`O(Hv * Dv * Dk)` or `O(hidden * d_state)` per layer)
+   Allocate once; reset to zero between independent generations.
+2. **A causal recurrence per token** that's awkward to vectorize. Just
+   loop over `Lq` tokens in C; the optimized GPU port will rewrite this.
+3. **A "compute_g" or similar nonlinearity** wrapping `A_log`, `dt_bias`,
+   `softplus`, etc. Promote to fp32 inside this kernel; the reference
+   usually does.
+4. **Output normalization gated by an input projection** (e.g.,
+   `silu(z) * rms_norm(y, weight)`): two kernels, not fused.
+
+### MLX-specific gotchas
+
+MLX is the preferred Python reference for this skill because the
+codebase is small and easy to read. But it has a few footguns:
+
+1. **No `forward_hook` mechanism**. To dump per-op intermediates you
+   must manually walk the forward pass in Python, mirroring the
+   reference module's `__call__`. See `tools/dump_ref.py.template` for
+   a worked example.
+2. **`mx.eval(...)`**. MLX is lazy; without `mx.eval` (or `np.array(...)`,
+   which forces evaluation) you'll OOM on big models. After each layer
+   in the manual walk, call `mx.eval(x)`.
+3. **`scales` / `biases` dtype matches the model's compute dtype**, not
+   necessarily `float32`. If you experiment with `mx.quantize(x, ...)`
+   on an `f32` array, scales come back `f32`; but a serialized bf16
+   model's `scales` are `bf16`. Always inspect the safetensors header
+   to confirm.
+4. **`mx.argpartition` doesn't sort**. The top-K indices from a router
+   come back in implementation-defined order. When comparing top-K
+   between C and MLX, compare **sets**, not sequences. Order only
+   matters if the downstream op is non-commutative.
+5. **`mx.softmax(..., precise=True)`** forces fp32 reduction. Default
+   may be lower precision. Match in C with fp32 accumulators.
+6. **`cast_predicate`** (`mlx_lm/models/<name>.py`): lists parameters
+   that should *not* be cast to the model's compute dtype (e.g.,
+   `A_log` in SSMs is sometimes excluded). In the safetensors archive
+   the dtype may still be bf16; the cast happens at use-time inside
+   the Python code (e.g., `A_log.astype(mx.float32)`). Mirror this in
+   your C kernel.
+7. **`quant_predicate`**: lists which parameters get which quantization
+   settings. May force certain weights to a different bit-width than
+   the model default.
+8. **`Model.sanitize(weights)`**: applied at load time. May rename keys
+   (e.g., `model.*` → `language_model.model.*` for multi-modal wrappers),
+   transpose `conv1d.weight` axes, or add `+1.0` to RMSNorm weights.
+   When loading directly from safetensors in C, you must replicate the
+   effects of `sanitize`. **Read the model's `sanitize` carefully.**
+9. **`mx.fast.rope`** with `freqs=...` uses an explicit per-half-dim
+   frequency table, not the implicit `1 / base^(2k/D)` form. The two
+   are equivalent, but the C side needs to precompute the same table:
+   `inv_freqs[k] = 1 / base ** (2k / D_rot)`.
+
+### Multi-modal config.json parsing
+
+For multi-modal models the relevant LM dimensions live inside a
+nested object:
+
+```json
+{
+  "model_type": "qwen3_5_moe",
+  "text_config":   { "num_hidden_layers": 40, "hidden_size": 2048, ... },
+  "vision_config": { "num_hidden_layers": 27, "hidden_size": 1152, ... }
+}
+```
+
+If you grep flatly for `num_hidden_layers` you'll get the wrong block.
+Implement a scoped JSON walker that descends into `text_config` first.
+The starter `main.c.template` shows the pattern (`find_section` +
+`find_key_in_section`).
+
+Some models also place the architecture-defining keys (e.g.,
+`rope_parameters`, `quantization`) at multiple levels of nesting.
+Always confirm by `print(json.load(open('config.json')))` first.
+
+### Tolerance setting for bf16
+
+bf16 has 7 mantissa bits + an implicit leading 1, so its **relative
+precision** is roughly `2^-7 ≈ 7.8e-3`. Absolute error scales with
+magnitude:
+
+| `|x|` range       | bf16 ULP (approx)  |
+|-------------------|--------------------|
+| `[0.125, 0.25)`   | `0.001`            |
+| `[0.5, 1)`        | `0.004`            |
+| `[1, 2)`          | `0.008`            |
+| `[4, 8)`          | `0.03`             |
+| `[16, 32)`        | `0.125`            |
+| `[64, 128)`       | `0.5`              |
+
+A flat absolute tolerance of `1e-2` is fine for outputs whose magnitude
+stays under ~1, but it'll spuriously fail on RMSNorm outputs in the
+tens. Use `tol_eff = abs_tol + rel_tol * |want|` in your tester (the
+`test_kernels.c.template` does this). Recommended `tol`:
+
+- `0.005` for elementwise ops on inputs `|x| <= 1` (one bf16 ULP).
+- `0.02 – 0.05` after a single matmul with K in the thousands.
+- `0.05 – 0.1` after several composed ops (e.g., SDPA + gate + o_proj).
+- `1e-5` for fp32 paths.
+
+If a test fails by a small margin and the values are large, suspect
+the *tolerance*, not the kernel.
+
 ## Common pitfalls
 
 - **W transpose**: HF safetensors typically stores Linear weights as
@@ -542,11 +742,55 @@ specific — check the reference's loader.
   `bf16.h`).
 - **RoPE yarn scaling**: yarn has an extra `mscale` multiplier on top of
   the rotation — easy to miss. Match the reference exactly.
+- **RoPE freq formula**: `inv_freqs[k] = 1 / (base ** (2k / D))` for
+  `k ∈ [0, D/2)`. With `partial_rotary_factor < 1.0` use `D = D_rot =
+  head_dim * partial_rotary_factor`, NOT `head_dim`.
 - **Tokenizer special tokens**: HF `tokenizer.json` has special tokens in
   `added_tokens` — make sure `build_tokenizer.py` includes them.
+- **Tokenizer `MAGIC` length**: the C reader expects 12 bytes; if the
+  Python writes only 11 you'll silently load garbage. The fixed
+  template now writes 12.
 - **Stop token**: pick the right stop token from the reference's
   generation config. For gpt-oss it's `<|return|>` (id 200002), not
-  `<|endoftext|>`.
+  `<|endoftext|>`. For Qwen it's `<|im_end|>` (or `<|endoftext|>`,
+  depending on the chat template).
+- **Chat template token IDs**: the chat-template scaffolding is part of
+  the *input* to the model. Before debugging anything, dump the prompt
+  IDs from both the Python reference and your C builder and assert
+  byte-for-byte equality. Many problems are actually tokenization
+  mismatches.
+- **`vocab_size > tokenizer vocab`**: many models pad the embedding to
+  a power of 2 or a multiple of 64/128. The extra rows are unused; the
+  C `argmax` over the full `vocab_size` is correct as long as you never
+  emit a row index past the tokenizer's known set during decode.
+- **Pre-tokenizer regex** varies per tokenizer family. The starter
+  `tokenizer.c` is tuned for o200k_harmony; for llama / qwen / mistral
+  the alternations are different (notably digit handling and how
+  `\p{L}\p{M}+` is split). Swap `pretokenize()` per `tokenizer.json`'s
+  `pre_tokenizer.pattern`.
+- **`safetensors.c` `__metadata__` key**: `__metadata__` is 12 chars,
+  not 11. The fixed template has this corrected.
+- **Skipping vision tower / MTP heads**: multi-modal and "multi-token-
+  prediction" checkpoints have many unused tensors. The Python
+  reference's `sanitize` drops them; the C side may have to walk the
+  archive but ignore them. Filter by name prefix (`vision_tower.`,
+  `mtp.`, etc.).
+- **`sanitize` adds `+1.0` to RMSNorm weights**: some `sanitize` paths
+  shift all RMSNorm weights by +1 when MTP weights are present in the
+  archive (Qwen 3.5 family). The C loader must replicate this.
+- **`conv1d.weight` axis order**: HF stores Conv1d weights as
+  `[C_out, C_in/groups, kernel]`. MLX `sanitize` may `moveaxis(2, 1)`
+  to put the kernel dim in the middle. Confirm via the safetensors
+  header shape.
+- **SSM state across forward calls**: prefill leaves the state with
+  prompt content; the AR decode loop continues from there. Don't reset
+  state between prefill and decode.
+- **Final norm + lm_head**: only the last position's logits are needed
+  for sampling. Apply `model.norm` and `lm_head` to just `x[-1, :]` to
+  save `(L-1)/L` of the work. The starter `main.c.template` does this.
+- **`-Wall -Wextra` clean**: hidden bugs love to live in `int`/`size_t`
+  width mismatches and missing-prototype warnings. Get a clean build
+  before declaring a kernel "validated".
 
 ## Commit strategy
 

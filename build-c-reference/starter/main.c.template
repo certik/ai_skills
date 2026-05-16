@@ -244,16 +244,32 @@ int main(int argc, char** argv) {
     double sec_pf = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 
     // ---- Decode loop ----
+    // For byte-level BPE tokenizers (Qwen, Llama 3, GPT-2 family, ...),
+    // each token's stored bytes are already the UTF-8 fragment to emit.
+    // Concatenating fragments produces valid UTF-8 even across multi-byte
+    // character boundaries, so we can safely `fwrite` each token's bytes
+    // as soon as they're produced. We also buffer the full text for a
+    // final summary print at the end.
     int stop_id = tk_special(tk, "<|return|>");   // [MODEL] adjust
     int n_gen = 0;
+    size_t out_cap = 4096, out_len = 0;
+    char*  out_buf = (char*)malloc(out_cap);
     clock_gettime(CLOCK_MONOTONIC, &t0);
     while (n_gen < max_tokens) {
         n_gen++;
         if (next_id == stop_id) break;
         int blen = 0;
         const char* bytes = tk_token_bytes(tk, next_id, &blen);
-        if (bytes) fwrite(bytes, 1, (size_t)blen, stdout);
-        fflush(stdout);
+        if (bytes && blen > 0) {
+            fwrite(bytes, 1, (size_t)blen, stdout);
+            fflush(stdout);
+            if (out_len + (size_t)blen + 1 > out_cap) {
+                while (out_len + (size_t)blen + 1 > out_cap) out_cap *= 2;
+                out_buf = (char*)realloc(out_buf, out_cap);
+            }
+            memcpy(out_buf + out_len, bytes, (size_t)blen);
+            out_len += (size_t)blen;
+        }
 
         embed_gather_bf16(&next_id,
                           (const bf16*)tensor_ptr("model.embed_tokens.weight", NULL),
@@ -265,11 +281,14 @@ int main(int argc, char** argv) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double sec_dec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 
+    out_buf[out_len] = '\0';
     fprintf(stderr,
+        "\n----- generated -----\n%s\n"
         "[stats] prompt=%d tokens, generated=%d tokens\n"
         "        prefill: %.2f s (%.1f tok/s)\n"
         "        decode:  %.2f s (%.1f tok/s)\n",
-        Lp, n_gen, sec_pf, Lp/sec_pf, sec_dec, n_gen/sec_dec);
+        out_buf, Lp, n_gen, sec_pf, Lp/sec_pf, sec_dec, n_gen/sec_dec);
+    free(out_buf);
 
     tk_free(tk);
     return 0;

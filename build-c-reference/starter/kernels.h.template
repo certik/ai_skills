@@ -1,6 +1,6 @@
 // kernels.h.template — one C function per distinct math op in the reference.
 // Customize the op set for your model; see the SKILL.md for the typical
-// transformer + MoE set.
+// transformer + MoE set as well as hybrid SSM / linear-attention models.
 //
 // RULES
 // 1. Native model precision in storage (bf16 typical), fp32 accumulators.
@@ -8,6 +8,19 @@
 // 3. One function per distinct math op (not per call site).
 // 4. No fusion beyond what the reference itself does.
 // 5. No prefill / decode special paths.
+//
+// MODERN ARCHITECTURE CHECKLIST (each may add a few ops to the list below):
+//   - GQA attention (Nq != Nkv): just one SDPA kernel with broadcast.
+//   - Output gate (q_proj outputs 2*Nq*Dh; sigmoid(gate) * attn_out): add
+//     elemwise_sigmoid_mul.
+//   - Partial RoPE (rotate first D_rot < head_dim dims): add D_rot param to
+//     RoPE kernel.
+//   - q_norm / k_norm per-head RMSNorm: reuse rmsnorm with M=L*H, D=Dh.
+//   - Sliding window per-layer: extra param to SDPA.
+//   - Attention sinks: extra `sinks` input to SDPA.
+//   - Shared expert + scalar gate (MoE): regular linear with N=1.
+//   - Hybrid linear-attention (Mamba / GatedDelta / RWKV-like): add SSM
+//     state buffers + a per-token recurrence kernel.
 
 #ifndef KERNELS_H
 #define KERNELS_H
@@ -84,5 +97,26 @@ void residual_add_bf16(bf16* x, const bf16* d, uint32_t N);
 // ---- Phase 8: head ---------------------------------------------------------
 
 void argmax_bf16(const bf16* logits, int32_t* out_idx, uint32_t N);
+
+// ---- Optional: hybrid linear-attention (Mamba / GatedDelta / RWKV-like) ----
+//
+// If your model has SSM / "fast weights" / linear-attention layers, you'll
+// need at least:
+//
+//   - depthwise causal Conv1d with carried state (kernel=K, channels=C):
+// void conv1d_depthwise_causal_bf16(const bf16* X, bf16* state,
+//                                   const bf16* W, bf16* Y,
+//                                   uint32_t L, uint32_t C, uint32_t K);
+//
+//   - one recurrent SSM step per token (carries state across calls):
+// void ssm_step_bf16(const bf16* /*per-step inputs...*/,
+//                    float* state /*[Hv, Dv, Dk] or similar*/,
+//                    bf16* y, /*...*/);
+//
+//   - any extra elementwise transforms the reference applies on the inputs
+//     (e.g., for GatedDelta: compute_g = exp(-exp(A_log) * softplus(a + dt_bias))).
+//
+// The state buffers persist across forward() calls — allocate one set per
+// layer at start-up; reset to zero between independent generations.
 
 #endif

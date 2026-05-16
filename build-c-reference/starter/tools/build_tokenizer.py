@@ -21,7 +21,7 @@ import sys
 from typing import Dict
 
 
-MAGIC = b"LLMBPETK\x01\x00\x00"
+MAGIC = b"LLMBPETK\x01\x00\x00\x00"  # 12 bytes total (matches tokenizer.c reader)
 
 
 def bytes_to_unicode() -> Dict[int, str]:

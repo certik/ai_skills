@@ -1,11 +1,21 @@
 // kernels.c.template — example kernel implementations.
 // Shows the style (naive scalar, fp32 accumulator).  Customize / extend
 // for your model.  See SKILL.md for the full op list.
+//
+// Two example quantization formats are shown:
+//   1. MXFP4 (openai-style, e2m1 + e8m0 per-32 block scale)
+//   2. MLX 8-bit affine (group_size=64, uint32-packed bytes + bf16 scale/bias)
+// Replace / extend per your model's storage layout.
 
 #include "kernels.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+// ---- helpers ---------------------------------------------------------------
+
+static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
+static inline float siluf_(float x)    { return x * sigmoidf_(x); }
 
 // ---- embed_gather ----------------------------------------------------------
 
@@ -77,5 +87,38 @@ void argmax_bf16(const bf16* logits, int32_t* out_idx, uint32_t N) {
 // ---- TODO: rope_inplace_bf16, sdpa_bf16, topk_softmax_bf16, ----------------
 // ---- TODO: mxfp4_linear_gather_bf16, swiglu_bf16, expert_mix_bf16. ---------
 //
-// Implement each, then add tests/test_<kernel>.c that loads inputs from
-// refs/*.bin and compares against the reference output.
+// Implement each, then add a test in tests/test_kernels.c (see template).
+
+// ===========================================================================
+//   Example quantization-helper snippets
+// ===========================================================================
+//
+// (1) MLX 8-bit affine (group_size = 64).  Storage:
+//       weight : uint32  [N, K/4]   -- packs 4 uint8 little-endian per uint32
+//       scales : <model_dtype>  [N, K/64]
+//       biases : <model_dtype>  [N, K/64]
+//     Dequant for element [n, k]:
+//       byte = (uint8)(W[n, k/4] >> (8 * (k%4)))
+//       x    = (float)byte * scale[n, k/64] + bias[n, k/64]
+//
+// static inline uint8_t q8_byte(const uint32_t* row, uint32_t k) {
+//     uint32_t w = row[k >> 2];
+//     return (uint8_t)((w >> (8 * (k & 3))) & 0xffu);
+// }
+//
+// (2) MXFP4 (openai-style).  Storage:
+//       blocks : uint8   [N, K/2]   -- packs 2 fp4 nibbles per byte (low nibble first)
+//       scales : uint8   [N, K/32]  -- e8m0 exponent per 32-element block
+//
+// static const float fp4_lut[16] = {
+//     0,  0.5,  1,  1.5,  2,  3,  4,  6,
+//    -0, -0.5, -1, -1.5, -2, -3, -4, -6 };
+// static inline float e8m0_scale(uint8_t b) {
+//     return b == 0xFF ? 0.0f : ldexpf(1.0f, (int)b - 127);
+// }
+//
+// Both formats share the same "linear" kernel shape:
+//       Y[m, n] = bias[n] + Σ_k dequant(W[n, k]) * X[m, k]
+// — only the dequant function differs.  Don't materialise a dequantised
+// weight buffer; dequant inside the inner loop.  The Metal port will later
+// vectorise this.

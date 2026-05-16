@@ -18,8 +18,8 @@ SRCS    := src-cpu/main.c \
 
 OBJS    := $(SRCS:.c=.o)
 
-# Per-kernel correctness tests.  Add one entry per `tests/test_<kernel>.c`.
-TEST_BINS := tests/test_rmsnorm tests/test_linear
+# Consolidated per-kernel correctness tests (see tests/test_kernels.c).
+TEST_BINS := src-cpu/tests/test_kernels
 
 .PHONY: all clean tests run
 
@@ -32,13 +32,17 @@ $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 tests: $(TEST_BINS)
-	@for t in $(TEST_BINS); do echo "==> $$t" && ./$$t || exit 1; done
+	@for t in $(TEST_BINS); do echo "==> $$t" && $$t --model $(MODEL_DIR) || exit 1; done
 
-tests/test_%: tests/test_%.c src-cpu/kernels.o
+# Each test_*.c links against all kernel objects so it can run any subset.
+src-cpu/tests/test_%: src-cpu/tests/test_%.c src-cpu/kernels.o src-cpu/safetensors.o
 	$(CC) $(CFLAGS) $^ -o $@ -lm
+
+# [MODEL] override on the command line: `make tests MODEL_DIR=/path/to/model`
+MODEL_DIR ?= /path/to/your/model
 
 run: $(BIN)
 	./$(BIN) --prompt "Hello, who are you?" --max-tokens 16
 
 clean:
-	rm -f src-cpu/*.o tests/*.o $(BIN) $(TEST_BINS)
+	rm -f src-cpu/*.o src-cpu/tests/*.o $(BIN) $(TEST_BINS)

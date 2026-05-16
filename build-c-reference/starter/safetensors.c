@@ -210,7 +210,7 @@ static bool parse_shard_header(st_archive* a, st_shard* sh, char** err) {
         const char* ks; size_t kl;
         if (!j_string(&c, &ks, &kl)) goto fail;
         if (!j_eat(&c,':')) { j_fail(&c,"expected ':'"); goto fail; }
-        if (kl == 11 && memcmp(ks, "__metadata__", 11) == 0) {
+        if (kl == 12 && memcmp(ks, "__metadata__", 12) == 0) {
             j_skip(&c);
         } else {
             parse_tensor_info(&c, ks, kl, a, sh);

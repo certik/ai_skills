@@ -1,0 +1,165 @@
+// tests/test_kernels.c.template — consolidated per-kernel validation harness.
+//
+// Pattern: one source file with a TESTS[] table; each entry implements one
+// kernel check by loading inputs from refs/*.bin (dumped by tools/dump_ref.py),
+// running the C kernel, and comparing element-wise against the oracle output.
+//
+// Why one file instead of one per kernel:
+//   - Single link of the C kernels + safetensors archive (loaded once).
+//   - Easy to add a new test: append an entry to TESTS[] and a function.
+//   - Easy to run a single kernel: `./test_kernels rmsnorm` etc.
+//
+// Build (from your Makefile): link with kernels.o, safetensors.o, etc.
+
+#include "../kernels.h"
+#include "../safetensors.h"
+#include "../bf16.h"
+#include "load_ref.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// ---------- helpers --------------------------------------------------------
+
+static st_archive* g_arch = NULL;
+
+// Look up a tensor by name and assert its dtype.
+static const void* tens(const char* name, st_dtype want, size_t* nelem) {
+    const st_tensor* t = st_find(g_arch, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->dtype != want) {
+        fprintf(stderr, "tensor %s dtype mismatch: want %s got %s\n",
+                name, st_dtype_name(want), st_dtype_name(t->dtype));
+        exit(1);
+    }
+    if (nelem) {
+        size_t n = 1;
+        for (int i = 0; i < t->rank; i++) n *= (size_t)t->shape[i];
+        *nelem = n;
+    }
+    return t->data;
+}
+
+// bf16-aware tolerance: abs_tol + rel_tol * |want|.  bf16 has ~7 mantissa
+// bits, so absolute error scales with the magnitude of the value.
+//
+// Recommended `tol` argument values (interpreted as both abs and rel):
+//   - 0.005       : elementwise (no reduction) at |x| <= 1 (1 bf16 ULP)
+//   - 0.02 - 0.05 : after one matmul (K up to a few thousand)
+//   - 0.05 - 0.1  : after several composed ops (e.g. SDPA end-to-end)
+// Tighten for fp32 paths (e.g. 1e-5).
+static int err_check(const bf16* got, const float* want, size_t n,
+                     double tol, const char* label)
+{
+    double max_d = 0.0;
+    size_t worst = 0;
+    int    fail_at = -1;
+    for (size_t i = 0; i < n; i++) {
+        double g = (double)bf16_to_f32(got[i]);
+        double w = (double)want[i];
+        double aw = w < 0 ? -w : w;
+        double d  = g > w ? g - w : w - g;
+        double t  = tol + tol * aw;
+        if (d > max_d) { max_d = d; worst = i; }
+        if (d > t && fail_at < 0) fail_at = (int)i;
+    }
+    int ok = (fail_at < 0);
+    printf("  %-32s max|d|=%.4g  (n=%zu)  %s\n",
+           label, max_d, n, ok ? "OK" : "FAIL");
+    if (!ok) {
+        printf("    first FAIL at %zu: got=%g want=%g\n",
+               (size_t)fail_at,
+               (double)bf16_to_f32(got[fail_at]),
+               (double)((const float*)want)[fail_at]);
+        printf("    worst-by-abs at %zu: got=%g want=%g\n",
+               worst,
+               (double)bf16_to_f32(got[worst]),
+               (double)((const float*)want)[worst]);
+    }
+    return ok ? 0 : 1;
+}
+
+// Convenience: load an f32 ref tensor, convert to bf16 in a malloc'd buffer.
+static bf16* f32ref_to_bf16(const ref_t* r) {
+    bf16* x = (bf16*)malloc(r->n_elem * sizeof(bf16));
+    const float* f = (const float*)r->data;
+    for (size_t i = 0; i < r->n_elem; i++) x[i] = f32_to_bf16(f[i]);
+    return x;
+}
+
+// ---------- example test ---------------------------------------------------
+
+static int test_rmsnorm(void) {
+    printf("[rmsnorm]\n");
+    // [MODEL] Adjust ref filenames + weight tensor name for your model.
+    ref_t* xin  = ref_load("src-cpu/refs/x_in_0.bin");
+    ref_t* hout = ref_load("src-cpu/refs/h_after_input_norm_0.bin");
+    size_t L = (size_t)xin->shape[0], D = (size_t)xin->shape[1];
+
+    const bf16* W = tens("model.layers.0.input_layernorm.weight",
+                        ST_DTYPE_BF16, NULL);
+
+    bf16* X = f32ref_to_bf16(xin);
+    bf16* Y = (bf16*)calloc(L * D, sizeof(bf16));
+
+    rmsnorm_bf16(X, W, Y, (uint32_t)L, (uint32_t)D, 1e-6f);
+    int fail = err_check(Y, (const float*)hout->data, L * D, 0.01,
+                         "rmsnorm_bf16 (layer 0 input)");
+    free(X); free(Y); ref_free(xin); ref_free(hout);
+    return fail;
+}
+
+// [MODEL] Add one function per kernel. Each must:
+//   1. Load the required inputs / outputs from refs/.
+//   2. Run the C kernel (with model weights pulled via tens(...)).
+//   3. err_check(...) against the oracle.
+//   4. Free buffers; return 0 on pass, 1 on fail.
+
+// ---------- harness --------------------------------------------------------
+
+typedef int (*test_fn)(void);
+typedef struct { const char* name; test_fn fn; } test_entry;
+
+static const test_entry TESTS[] = {
+    {"rmsnorm", test_rmsnorm},
+    // [MODEL] {"embed", test_embed}, {"linear", test_linear}, ...
+};
+
+int main(int argc, char** argv) {
+    const char* model_dir = NULL;
+    int picked[64] = {0};
+    int n_picked = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--model") && i+1 < argc) { model_dir = argv[++i]; continue; }
+        int found = 0;
+        for (size_t j = 0; j < sizeof(TESTS)/sizeof(*TESTS); j++) {
+            if (!strcmp(argv[i], TESTS[j].name)) {
+                picked[n_picked++] = (int)j; found = 1; break;
+            }
+        }
+        if (!found) { fprintf(stderr, "unknown test: %s\n", argv[i]); return 2; }
+    }
+    if (!model_dir) {
+        fprintf(stderr, "usage: %s --model PATH [test ...]\n", argv[0]);
+        return 2;
+    }
+    if (n_picked == 0) {
+        for (size_t j = 0; j < sizeof(TESTS)/sizeof(*TESTS); j++) picked[n_picked++] = (int)j;
+    }
+
+    char* err = NULL;
+    fprintf(stderr, "loading weights from %s ...\n", model_dir);
+    g_arch = st_open(model_dir, &err);
+    if (!g_arch) { fprintf(stderr, "weights: %s\n", err); return 1; }
+    fprintf(stderr, "  loaded %zu tensors\n", st_count(g_arch));
+
+    int fails = 0;
+    for (int i = 0; i < n_picked; i++) fails += TESTS[picked[i]].fn();
+    st_close(g_arch);
+    if (fails) { fprintf(stderr, "%d FAILED\n", fails); return 1; }
+    fprintf(stderr, "all tests passed\n");
+    return 0;
+}
