@@ -16,9 +16,9 @@
 //   3fce46d — qmm_t_gather_rhs MMA + multi-expert correctness
 //   6316747 — BM=16 BN=32 WM=1 WN=2 — match MLX non-NAX tile sizes (+26%)
 //
-// This is a SKETCH — the actual gpt-oss csrc uses MLX's `steel` matmul
-// headers (vendored from MLX 0.31.2).  See csrc/kernels/phase6_mma.metal
-// and csrc/kernels/mlx_steel/ in the gpt-oss repo for a working version.
+// This is a SKETCH — the actual gpt-oss reference impl uses MLX's `steel` matmul
+// headers (vendored from MLX 0.31.2).  See src-metal/kernels/phase6_mma.metal
+// and src-metal/kernels/mlx_steel/ in the gpt-oss repo for a working version.
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -93,6 +93,6 @@ kernel void gemm_bf16_mma(device const bfloat*   X       [[buffer(0)]],   // [M,
 }
 
 // FOR REAL USE: see MLX 0.31.2's `mlx/backend/metal/kernels/steel/gemm/*.h`
-// or the gpt-oss repo's `csrc/kernels/mlx_steel/` directory.  Those handle
+// or the gpt-oss repo's `src-metal/kernels/mlx_steel/` directory.  Those handle
 // the boundary conditions (M, N, K not multiples of tile), masking,
 // SoftMax fusion, transposed-LHS variants, and the qmm (quantized) variant.

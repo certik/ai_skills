@@ -1,20 +1,20 @@
 # Makefile.template — pure-C CPU reference build.
 #
-# Replace <BIN> with the binary name you want, e.g., `gptoss-cpu`.
-# Drop into the repo root; it expects sources in `csrc-cpu/`.
+# Replace <BIN> with the binary name you want. Choose a model-specific name (e.g., `llama3-cpu`, `qwen2-cpu`) or a generic one (e.g., `llm-cpu`, `infer-cpu`).
+# Drop into the repo root; it expects sources in `src-cpu/`.
 
 CC      ?= clang
-CFLAGS  := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Icsrc-cpu
+CFLAGS  := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Isrc-cpu
 
 BIN     := <BIN>
 
 # Add new kernel .c files as you author them.  Per-kernel correctness
 # tests live in `tests/` and are built by the `tests` target.
-SRCS    := csrc-cpu/main.c \
-           csrc-cpu/kernels.c \
-           csrc-cpu/safetensors.c \
-           csrc-cpu/tokenizer.c \
-           csrc-cpu/<chattmpl>.c
+SRCS    := src-cpu/main.c \
+           src-cpu/kernels.c \
+           src-cpu/safetensors.c \
+           src-cpu/tokenizer.c \
+           src-cpu/<chattmpl>.c
 
 OBJS    := $(SRCS:.c=.o)
 
@@ -34,11 +34,11 @@ $(BIN): $(OBJS)
 tests: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "==> $$t" && ./$$t || exit 1; done
 
-tests/test_%: tests/test_%.c csrc-cpu/kernels.o
+tests/test_%: tests/test_%.c src-cpu/kernels.o
 	$(CC) $(CFLAGS) $^ -o $@ -lm
 
 run: $(BIN)
 	./$(BIN) --prompt "Hello, who are you?" --max-tokens 16
 
 clean:
-	rm -f csrc-cpu/*.o tests/*.o $(BIN) $(TEST_BINS)
+	rm -f src-cpu/*.o tests/*.o $(BIN) $(TEST_BINS)

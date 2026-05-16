@@ -4,5 +4,5 @@
 // `#include "..."` directives so vendored headers under mlx_steel/ get
 // inlined. System `<...>` includes pass through unchanged. Honors
 // `#pragma once` via path-based dedup. Returns a malloc'd string.
-char* gptoss_concat_kernels(int n, const char** paths);
+char* concat_kernels(int n, const char** paths);
 #endif

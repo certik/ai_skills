@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 // ---------- file format ----------
-//   magic  : "GPTOSSTOK\1\0\0\0"           (12 bytes)
+//   magic  : "LLMBPETK\1\0\0\0"           (12 bytes)
 //   u32    n_vocab
 //   u32    n_special
 //   u32    bytes_blob_size
@@ -30,7 +30,7 @@ typedef struct {
     uint32_t len;
 } sp_rec;
 
-struct gptoss_tokenizer {
+struct tokenizer_t {
     void*    map;
     size_t   map_size;
     uint32_t n_vocab;
@@ -61,7 +61,7 @@ static inline int bytes_eq(const uint8_t* a, size_t na, const uint8_t* b, size_t
     return na == nb && (na == 0 || memcmp(a, b, na) == 0);
 }
 
-static inline int tk_lookup(const gptoss_tokenizer* tk, const uint8_t* p, size_t n) {
+static inline int tk_lookup(const tokenizer_t* tk, const uint8_t* p, size_t n) {
     if (n == 0) return -1;
     uint32_t mask = tk->ht_mask;
     uint32_t i = hash_bytes(p, n) & mask;
@@ -75,7 +75,7 @@ static inline int tk_lookup(const gptoss_tokenizer* tk, const uint8_t* p, size_t
     }
 }
 
-gptoss_tokenizer* tk_load(const char* path, char** err) {
+tokenizer_t* tk_load(const char* path, char** err) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { set_err(err, strerror(errno)); return NULL; }
     struct stat st;
@@ -85,7 +85,7 @@ gptoss_tokenizer* tk_load(const char* path, char** err) {
     if (m == MAP_FAILED) { set_err(err, "mmap"); return NULL; }
 
     const uint8_t* p = (const uint8_t*)m;
-    if (st.st_size < 12 + 16 || memcmp(p, "GPTOSSTOK\x01\x00\x00", 12) != 0) {
+    if (st.st_size < 12 + 16 || memcmp(p, "LLMBPETK\x01\x00\x00", 12) != 0) {
         munmap(m, (size_t)st.st_size); set_err(err, "bad magic"); return NULL;
     }
     p += 12;
@@ -119,7 +119,7 @@ gptoss_tokenizer* tk_load(const char* path, char** err) {
         ht[i] = (int32_t)id;
     }
 
-    gptoss_tokenizer* tk = (gptoss_tokenizer*)calloc(1, sizeof(*tk));
+    tokenizer_t* tk = (tokenizer_t*)calloc(1, sizeof(*tk));
     tk->map        = m;
     tk->map_size   = (size_t)st.st_size;
     tk->n_vocab    = n_vocab;
@@ -133,14 +133,14 @@ gptoss_tokenizer* tk_load(const char* path, char** err) {
     return tk;
 }
 
-void tk_free(gptoss_tokenizer* tk) {
+void tk_free(tokenizer_t* tk) {
     if (!tk) return;
     free(tk->ht);
     munmap(tk->map, tk->map_size);
     free(tk);
 }
 
-int tk_special(const gptoss_tokenizer* tk, const char* name) {
+int tk_special(const tokenizer_t* tk, const char* name) {
     size_t nl = strlen(name);
     for (uint32_t i = 0; i < tk->n_special; i++) {
         const sp_rec* r = &tk->sp_recs[i];
@@ -149,9 +149,9 @@ int tk_special(const gptoss_tokenizer* tk, const char* name) {
     return -1;
 }
 
-int tk_n_vocab(const gptoss_tokenizer* tk) { return (int)tk->n_vocab; }
+int tk_n_vocab(const tokenizer_t* tk) { return (int)tk->n_vocab; }
 
-const char* tk_token_bytes(const gptoss_tokenizer* tk, int id, int* out_len) {
+const char* tk_token_bytes(const tokenizer_t* tk, int id, int* out_len) {
     if (id < 0) return NULL;
     if ((uint32_t)id < tk->n_vocab) {
         uint32_t off = tk->vocab_off[id];
@@ -171,7 +171,7 @@ const char* tk_token_bytes(const gptoss_tokenizer* tk, int id, int* out_len) {
     return NULL;
 }
 
-int tk_decode(const gptoss_tokenizer* tk, const int* ids, int n_ids,
+int tk_decode(const tokenizer_t* tk, const int* ids, int n_ids,
               char* out, int max_bytes)
 {
     int w = 0;
@@ -190,7 +190,7 @@ int tk_decode(const gptoss_tokenizer* tk, const int* ids, int n_ids,
 
 // Returns rank of the bytes [start, end) in the encoder, or UINT32_MAX if
 // not present.
-static inline uint32_t lookup_rank(const gptoss_tokenizer* tk,
+static inline uint32_t lookup_rank(const tokenizer_t* tk,
                                    const uint8_t* piece, size_t s, size_t e)
 {
     int id = tk_lookup(tk, piece + s, e - s);
@@ -199,7 +199,7 @@ static inline uint32_t lookup_rank(const gptoss_tokenizer* tk,
 
 // Apply BPE to a single pre-token chunk. Writes ids to out, returns count.
 // Capacity of out must be >= n.
-static int bpe_byte_pair_encode(const gptoss_tokenizer* tk,
+static int bpe_byte_pair_encode(const tokenizer_t* tk,
                                 const uint8_t* piece, size_t n,
                                 int* out)
 {
@@ -415,7 +415,7 @@ static int pretokenize(const uint8_t* text, size_t n,
 // ---------- public encode ----------
 
 typedef struct {
-    const gptoss_tokenizer* tk;
+    const tokenizer_t* tk;
     int* out;
     int  cap;
     int  n;
@@ -437,7 +437,7 @@ static int enc_emit(const uint8_t* p, size_t n, void* ud) {
     return 0;
 }
 
-int tk_encode_ordinary(const gptoss_tokenizer* tk,
+int tk_encode_ordinary(const tokenizer_t* tk,
                        const char* text, size_t n_bytes,
                        int* out_ids, int max_ids)
 {

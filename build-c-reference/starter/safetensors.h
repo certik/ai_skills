@@ -4,8 +4,8 @@
 // produces (objects, arrays, strings, integers, "null" values, no escapes
 // inside tensor-name keys beyond plain ASCII).
 
-#ifndef GPTOSS_SAFETENSORS_H
-#define GPTOSS_SAFETENSORS_H
+#ifndef SAFETENSORS_H
+#define SAFETENSORS_H
 
 #include <stddef.h>
 #include <stdint.h>

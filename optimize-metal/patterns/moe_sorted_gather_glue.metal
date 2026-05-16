@@ -18,7 +18,7 @@
 //
 // WHEN: Prefill MoE with Lq * K_top > N_experts (almost always when
 //       Lq > 4 in a 32-expert / k_top=4 model).  This single restructuring
-//       was the biggest prefill MoE win in csrc (+24–32%).
+//       was the biggest prefill MoE win in the gpt-oss reference impl (+24–32%).
 // SPEEDUP: 1.30–1.60× prefill.
 // COMMITS:
 //   1c4ddfd — MoE: grouped expert GEMM for prefill (264→348 tok/s, +32%)
@@ -156,5 +156,5 @@ kernel void moe_combine_scatter(device const bfloat* down_out [[buffer(0)]], // 
 // `qmm_t_gather_rhs_bf16_g32_b4` — one dense MXFP4 GEMM per layer, with
 // per-row expert indirection (each row r selects expert e = flat[r]>>somewhere
 // or use prefix[]/counts[] to know which contiguous range belongs to each
-// expert).  See csrc/kernels/phase6_mma.metal in the gpt-oss repo for the
+// expert).  See src-metal/kernels/phase6_mma.metal in the gpt-oss repo for the
 // real implementation (uses MLX `steel` MMA tile primitives).

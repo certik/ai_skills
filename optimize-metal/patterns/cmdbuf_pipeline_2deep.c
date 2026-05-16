@@ -20,13 +20,13 @@
 
 #define PIPELINE_DEPTH 2
 
-static gptoss_cmdbuf* g_cmdbufs[PIPELINE_DEPTH];
+static gpu_cmdbuf* g_cmdbufs[PIPELINE_DEPTH];
 
 // Per-slot persistent param buffers.
 #define PARAM_BUF_SLOT(name, sz) \
-    static gptoss_buf* name##_buf[PIPELINE_DEPTH] = {0}; \
-    if (!name##_buf[slot]) name##_buf[slot] = gptoss_buf_new(g_ctx, (sz)); \
-    void* name##_dst = gptoss_buf_contents(name##_buf[slot])
+    static gpu_buf* name##_buf[PIPELINE_DEPTH] = {0}; \
+    if (!name##_buf[slot]) name##_buf[slot] = gpu_buf_new(g_ctx, (sz)); \
+    void* name##_dst = gpu_buf_contents(name##_buf[slot])
 
 void forward_decode(int q_off, int slot) {
     uint32_t dimsRq[4] = { 1u, N_QHEADS, HEAD_DIM, (uint32_t)q_off };
@@ -43,20 +43,20 @@ void decode_loop(int Lp, int max_tokens, int* gen_ids) {
 
     // Prime the pipeline: encode + commit step 0.
     int slot = 0;
-    g_cmdbufs[slot] = gptoss_cmdbuf_new(g_ctx);
+    g_cmdbufs[slot] = gpu_cmdbuf_new(g_ctx);
     /* set input id, dispatch embed + forward + argmax into g_cmdbufs[slot] */
-    gptoss_cmdbuf_commit(g_cmdbufs[slot]);   // ASYNC commit
+    gpu_cmdbuf_commit(g_cmdbufs[slot]);   // ASYNC commit
 
     while (n_gen < max_tokens) {
         int slot_next = (slot + 1) % PIPELINE_DEPTH;
 
         // While step `slot` runs on GPU, encode step `slot_next` on CPU.
-        g_cmdbufs[slot_next] = gptoss_cmdbuf_new(g_ctx);
+        g_cmdbufs[slot_next] = gpu_cmdbuf_new(g_ctx);
         /* dispatch step k+1 into g_cmdbufs[slot_next], using buffers in slot_next */
-        gptoss_cmdbuf_commit(g_cmdbufs[slot_next]);
+        gpu_cmdbuf_commit(g_cmdbufs[slot_next]);
 
         // Now wait for step `slot` to finish — its output (next_id) is ready.
-        gptoss_cmdbuf_wait(g_cmdbufs[slot], NULL);
+        gpu_cmdbuf_wait(g_cmdbufs[slot], NULL);
         /* read next_id from host-visible buffer */;
         gen_ids[n_gen++] = next_id;
 

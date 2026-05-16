@@ -8,25 +8,25 @@
 // WHEN: After param_buf_persistent.c.  Tiny GPU win but real CPU-encode
 //       win when the 2-deep pipeline is in play.
 // SPEEDUP: ~1.01× decode; CPU encode time materially lower.
-// COMMIT:  8001db6 — "csrc: lift call-invariant constants out of
+// COMMIT:  8001db6 — "[gpt-oss ref impl]  lift call-invariant constants out of
 //                     PARAM_BUF ring (CONST_PARAM_BUF)"
 
 #include "metal_shim.h"
 
 // Allocated and filled once at startup.
 #define CONST_PARAM_BUF(name, sz, fill_expr) \
-    static gptoss_buf* name##_buf = NULL; \
+    static gpu_buf* name##_buf = NULL; \
     if (!name##_buf) { \
-        name##_buf = gptoss_buf_new(g_ctx, (sz)); \
-        void* dst = gptoss_buf_contents(name##_buf); \
+        name##_buf = gpu_buf_new(g_ctx, (sz)); \
+        void* dst = gpu_buf_contents(name##_buf); \
         fill_expr; \
     }
 
 // Same as PARAM_BUF but caller passes a memcpy-style filler.
 #define PARAM_BUF(name, sz) \
-    static gptoss_buf* name##_buf = NULL; \
-    if (!name##_buf) name##_buf = gptoss_buf_new(g_ctx, (sz)); \
-    void* name##_dst = gptoss_buf_contents(name##_buf)
+    static gpu_buf* name##_buf = NULL; \
+    if (!name##_buf) name##_buf = gpu_buf_new(g_ctx, (sz)); \
+    void* name##_dst = gpu_buf_contents(name##_buf)
 
 void forward_decode(int q_off) {        // Lq = 1 always
     // Constants for decode: Lq, HIDDEN, etc. NEVER change.

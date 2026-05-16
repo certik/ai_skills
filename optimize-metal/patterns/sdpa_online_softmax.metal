@@ -70,7 +70,7 @@ kernel void sdpa_with_sinks_bf16(device const bfloat*       Q     [[buffer(0)]],
     // Iterate over key positions.  Each lane handles a 1-lane subset of D
     // for the score dot-product (here: each thread does the FULL D dot;
     // SIMD-parallelism is over keys via lane).  For better performance,
-    // split D across lanes (see real csrc kernel).
+    // split D across lanes (see real gpt-oss reference kernel).
     for (int lk = win_lo; lk <= lk_hi; ++lk) {
         const device bfloat* krow = K + ((size_t)lk * P.Nkv + hkv) * P.D;
         const device bfloat* vrow = V + ((size_t)lk * P.Nkv + hkv) * P.D;

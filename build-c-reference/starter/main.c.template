@@ -7,8 +7,8 @@
 // Build: see Makefile.template.
 //
 // Usage:
-//   ./gptoss-cpu --prompt "Hello, who are you?" --max-tokens 16
-//   ./gptoss-cpu --prompt "..." --system "You are a pirate." --model PATH
+//   ./<BIN> --prompt "Hello, who are you?" --max-tokens 16
+//   ./<BIN> --prompt "..." --system "You are a pirate." --model PATH
 
 #include "kernels.h"
 #include "safetensors.h"
@@ -161,34 +161,38 @@ static void forward(int q_off, int Lq) {
 
 // ---- main -----------------------------------------------------------------
 int main(int argc, char** argv) {
-    const char* prompt   = NULL;
-    const char* sysmsg   = "You are a helpful assistant.";
-    const char* reasoning = "low";
+    const char* prompt    = NULL;
+    const char* sysmsg    = "You are a helpful assistant.";
     const char* model_dir = NULL;
     int max_tokens = 16;
+    // [MODEL] Add model-specific args here (e.g., --reasoning for gpt-oss).
+    const char* chattmpl_extra = NULL;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i],"--prompt")     && i+1<argc) prompt    = argv[++i];
         else if (!strcmp(argv[i],"--system")     && i+1<argc) sysmsg    = argv[++i];
-        else if (!strcmp(argv[i],"--reasoning")  && i+1<argc) reasoning = argv[++i];
         else if (!strcmp(argv[i],"--model")      && i+1<argc) model_dir = argv[++i];
         else if (!strcmp(argv[i],"--max-tokens") && i+1<argc) max_tokens = atoi(argv[++i]);
+        // [MODEL] e.g., --reasoning low|medium|high for gpt-oss harmony
+        else if (!strcmp(argv[i],"--chat-extra") && i+1<argc) chattmpl_extra = argv[++i];
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (!prompt || !model_dir) {
         fprintf(stderr,
             "usage: %s --prompt TEXT --model PATH [--system TEXT]"
-            " [--reasoning low|medium|high] [--max-tokens N]\n", argv[0]);
+            " [--max-tokens N] [--chat-extra TEXT]\n", argv[0]);
         return 2;
     }
 
     // ---- Load tokenizer + build prompt ----
     char* err = NULL;
-    gptoss_tokenizer* tk = tk_load("csrc-cpu/tokenizer.bin", &err);
+    tokenizer_t* tk = tk_load("src-cpu/tokenizer.bin", &err);
     if (!tk) { fprintf(stderr, "tokenizer load: %s\n", err); return 1; }
     int prompt_ids[1024];
-    // [MODEL] adjust to your chat-template builder's signature
-    int Lp = <chattmpl>_build_prompt(tk, sysmsg, prompt, reasoning,
+    // [MODEL] adjust to your chat-template builder's signature.  The example
+    // below passes a chattmpl_extra string; for gpt-oss this is the reasoning
+    // level ("low"/"medium"/"high"); for llama3 it might be unused.
+    int Lp = <chattmpl>_build_prompt(tk, sysmsg, prompt, chattmpl_extra,
                                      prompt_ids, 1024);
     if (Lp < 0) { fprintf(stderr, "prompt too long\n"); return 1; }
 

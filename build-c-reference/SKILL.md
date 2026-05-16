@@ -7,12 +7,12 @@ description: >
   (no SIMD, no threads), uses the model's native precision (bf16 / fp8 /
   mxfp4 / etc.) with fp32 accumulators, mirrors the reference's kernels
   1:1 (no fusion), and is validated kernel-by-kernel against the Python
-  oracle. The output is a standalone `./csrc-cpu/` directory that loads
+  oracle. The output is a standalone `./src-cpu/` directory that loads
   HF safetensors directly, includes its own BPE tokenizer + chat template,
   and produces the same generated tokens as the reference for a fixed
   prompt under greedy decoding. The output is meant to be the starting
   point for `port-c-to-metal` (and later `optimize-metal`).
-  Triggers: build c reference, c reference, csrc-cpu, port to c, pure-c
+  Triggers: build c reference, c reference, src-cpu, port to c, pure-c
   port, c inference reference, c llm port, cpu reference, slow reference.
 ---
 
@@ -20,7 +20,7 @@ description: >
 
 Take a working Python reference of an LLM (MLX, HF transformers, PyTorch,
 etc.) and a HF-safetensors weight directory, and produce a standalone
-`./csrc-cpu/` that runs the same model in plain C99 on a single CPU core,
+`./src-cpu/` that runs the same model in plain C99 on a single CPU core,
 with **bit-equivalent-or-very-close** output for the same prompt under
 greedy decoding.
 
@@ -77,16 +77,23 @@ Ask the user for (if not already provided / discoverable):
    working directory).
 2. **Model directory** (HF safetensors layout); used both by the Python
    oracle and the C binary at runtime.
-3. **Sample prompt** for end-to-end validation (default:
+3. **Binary name** for the resulting C executable. Choose a
+   model-specific name (e.g., `llama3-cpu`, `qwen2-cpu`) so multiple
+   model ports can coexist in the same workspace, or a generic name
+   (e.g., `llm-cpu`, `infer-cpu`) if you prefer. Avoid naming it after
+   the reference model (`gpt-oss`, `llama3`) — keep it project-/binary-
+   specific.
+4. **Sample prompt** for end-to-end validation (default:
    `"Hello, who are you?"` with greedy decoding, max 16 tokens).
-4. **System / chat-template metadata** if not obvious from the reference
-   (e.g., harmony reasoning level for gpt-oss).
-5. **Output directory** (default: `./csrc-cpu/` in the repo root).
+5. **System / chat-template metadata** if not obvious from the reference
+   (e.g., harmony reasoning level for gpt-oss, llama3 instruct format
+   for llama3, etc.).
+6. **Output directory** (default: `./src-cpu/` in the repo root).
 
 ## Output layout
 
 ```
-./csrc-cpu/
+./src-cpu/
 ├── main.c             # CLI; reads config.json; calls forward() per token
 ├── kernels.h          # one C function per distinct math op
 ├── kernels.c          # naive scalar implementations
@@ -140,7 +147,7 @@ Templates (read, then customize):
   load, tokenizer load, prompt encode, prefill, AR decode, stats.
 - `kernels.h.template` — kernel signature pattern (one C function per
   distinct math op).
-- `Makefile.template` — `make csrc-cpu` builds `./gptoss-cpu`.
+- `Makefile.template` — `make src-cpu` builds `./<BIN>`.
 - `tools/dump_ref.py.template` — Python oracle dumper using `MAGIC` +
   `dtype` + `shape` header format readable from C tests.
 
@@ -194,14 +201,14 @@ Templates (read, then customize):
 5. Identify the **safetensors tensor names** for each weight by reading
    the reference's `__init__` / `state_dict` keys.
 
-6. Commit a `csrc-cpu/README.md` capturing this reconnaissance.
+6. Commit a `src-cpu/README.md` capturing this reconnaissance.
 
 ### Phase 2: Scaffold — get loader + tokenizer + CLI working
 
-1. Create `csrc-cpu/`. Copy drop-in starters: `safetensors.{c,h}`,
+1. Create `src-cpu/`. Copy drop-in starters: `safetensors.{c,h}`,
    `tokenizer.{c,h}`, `bf16.h`. Customize `tools/build_tokenizer.py`'s
    special-token list for your model and run it to produce
-   `csrc-cpu/tokenizer.bin`.
+   `src-cpu/tokenizer.bin`.
 
 2. Author `<chattmpl>.{c,h}` (e.g., `harmony.{c,h}`) that builds the
    prompt token sequence. **Tip**: have the Python reference output the
@@ -217,15 +224,23 @@ Templates (read, then customize):
    - Stub `forward()` that just returns argmax of a zero vector
    - Stub AR loop
 
-4. Author `Makefile` from `Makefile.template`. Build and run:
+4. Author `Makefile` from `Makefile.template` (replace `<BIN>` with
+   your chosen executable name from Inputs). Build and run:
    ```
-   make csrc-cpu
-   ./csrc-cpu/gptoss-cpu --prompt "Hello" --max-tokens 1
+   make
+   ./<BIN> --prompt "Hello" --max-tokens 1 --model /path/to/model
    ```
-   At this point the program should load weights and tokenize the
-   prompt without crashing (output garbage is OK).
+   **Smoke-test checklist** (all must pass before moving to Phase 3):
+   - [ ] Build succeeds with `-Wall -Wextra` clean.
+   - [ ] Program prints the model dims read from `config.json`.
+   - [ ] Program prints the list of tensors found in safetensors and
+         their dtypes (add a `--list-tensors` debug flag if helpful).
+   - [ ] Program prints the prompt token IDs from the chat-template
+         builder and they match what the Python reference produces for
+         the same `(system, user)`.
+   - [ ] No segfault.
 
-5. **Commit**: `csrc-cpu: scaffold loader + tokenizer + CLI`.
+5. **Commit**: `src-cpu: scaffold loader + tokenizer + CLI`.
 
 ### Phase 3: Build the Python oracle
 
@@ -238,9 +253,9 @@ Author `tools/dump_ref.py` (start from
    intermediate tensors at every op boundary. Use a small binary format
    with a magic header:
    ```
-   "GPTOSSF1" (8 bytes) | u32 dtype | u32 ndim | i64[ndim] shape | data
+   "LLMTNSR1" (8 bytes) | u32 dtype | u32 ndim | i64[ndim] shape | data
    ```
-4. Dump to `csrc-cpu/refs/`:
+4. Dump to `src-cpu/refs/`:
    ```
    input_ids.bin
    x_after_embed.bin
@@ -379,7 +394,7 @@ If the test fails:
 #### 4e. Commit per-kernel
 
 ```
-csrc-cpu: <kernel_name> + test (max|d|=<tol> vs ref)
+src-cpu: <kernel_name> + test (max|d|=<tol> vs ref)
 ```
 
 This makes rollback trivial and gives you a clear log of progress.
@@ -406,7 +421,7 @@ chain dumps later: layer 0 input → layer 0 output → layer 1 input → ...
 
 3. End-to-end run with the same prompt as the Python reference:
    ```
-   ./gptoss-cpu --prompt "Hello, who are you?" --max-tokens 16
+   ./<BIN> --prompt "Hello, who are you?" --max-tokens 16
    ```
    Compare generated token IDs against the reference. They must match.
 
@@ -415,15 +430,15 @@ chain dumps later: layer 0 input → layer 0 output → layer 1 input → ...
    Python oracle does), and binary-diff against the Python refs. The
    first divergence localizes the bug.
 
-5. **Commit**: `csrc-cpu: end-to-end forward + AR decode (N/N tokens match ref)`.
+5. **Commit**: `src-cpu: end-to-end forward + AR decode (N/N tokens match ref)`.
 
 ### Phase 6: Acceptance
 
-- [ ] `./gptoss-cpu --prompt "<validation_prompt>" --max-tokens N` produces
+- [ ] `./<BIN> --prompt "<validation_prompt>" --max-tokens N` produces
       the **same N token IDs** as the Python reference under greedy decoding.
 - [ ] All per-kernel tests in `tests/` pass.
-- [ ] Build is `make csrc-cpu` with no warnings (`-Wall -Wextra`).
-- [ ] `csrc-cpu/` is standalone (no link to the Python reference or to
+- [ ] Build is `make src-cpu` with no warnings (`-Wall -Wextra`).
+- [ ] `src-cpu/` is standalone (no link to the Python reference or to
       any external runtime besides libc and libm).
 
 When all boxes are ticked, the skill is done.
@@ -537,12 +552,12 @@ specific — check the reference's loader.
 
 Make one commit per phase and per kernel:
 
-- `csrc-cpu: scaffold loader + tokenizer + CLI` (Phase 2)
+- `src-cpu: scaffold loader + tokenizer + CLI` (Phase 2)
 - `tools/dump_ref.py + initial oracle dump` (Phase 3)
-- `csrc-cpu: embed_gather_bf16 + test` (Phase 4 per kernel)
-- `csrc-cpu: rmsnorm_bf16 + test` ...
+- `src-cpu: embed_gather_bf16 + test` (Phase 4 per kernel)
+- `src-cpu: rmsnorm_bf16 + test` ...
 - ...
-- `csrc-cpu: forward() + AR decode (N/N tokens match ref)` (Phase 5)
+- `src-cpu: forward() + AR decode (N/N tokens match ref)` (Phase 5)
 
 This lets the next skill (`port-c-to-metal`) consult the per-kernel
 boundaries when porting and roll back surgically if anything regresses.
@@ -551,12 +566,12 @@ boundaries when porting and roll back surgically if anything regresses.
 
 The hand-off contract:
 
-1. `./csrc-cpu/` exists and builds with `make csrc-cpu`.
-2. `./csrc-cpu/gptoss-cpu --prompt "<validation_prompt>" --max-tokens N`
+1. `./src-cpu/` exists and builds with `make src-cpu`.
+2. `./src-cpu/<BIN> --prompt "<validation_prompt>" --max-tokens N`
    produces the same N tokens as the Python reference.
 3. Every kernel is a plain C function in `kernels.{c,h}` with clear
    pointer-arity inputs / outputs.
-4. `csrc-cpu/refs/` contains per-op oracle dumps usable by the Metal
+4. `src-cpu/refs/` contains per-op oracle dumps usable by the Metal
    port for kernel correctness tests.
 5. Tokenizer and chat-template are model-agnostic infrastructure that the
    Metal port can copy/symlink rather than re-author.

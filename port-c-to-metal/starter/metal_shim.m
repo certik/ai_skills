@@ -6,23 +6,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct gptoss_ctx {
+struct gpu_ctx {
     id<MTLDevice>       device;
     id<MTLCommandQueue> queue;
     id<MTLLibrary>      library;
     char                name[256];
 };
 
-struct gptoss_buf {
+struct gpu_buf {
     id<MTLBuffer> mtl;
 };
 
-struct gptoss_pipeline {
+struct gpu_pipeline {
     id<MTLComputePipelineState> pso;
     NSUInteger                  max_threads_per_group;
 };
 
-struct gptoss_cmdbuf {
+struct gpu_cmdbuf {
     id<MTLCommandBuffer>         cb;
     id<MTLComputeCommandEncoder> enc;
 };
@@ -33,7 +33,7 @@ static char* dup_nserr(NSError* e) {
     return strdup([s UTF8String]);
 }
 
-gptoss_ctx* gptoss_init(const char* msl_source, char** err) {
+gpu_ctx* gpu_init(const char* msl_source, char** err) {
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         if (!dev) { if (err) *err = strdup("no Metal device"); return NULL; }
@@ -56,7 +56,7 @@ gptoss_ctx* gptoss_init(const char* msl_source, char** err) {
             }
         }
 
-        gptoss_ctx* ctx = (gptoss_ctx*)calloc(1, sizeof(*ctx));
+        gpu_ctx* ctx = (gpu_ctx*)calloc(1, sizeof(*ctx));
         ctx->device  = dev;
         ctx->queue   = q;
         ctx->library = lib;
@@ -67,30 +67,30 @@ gptoss_ctx* gptoss_init(const char* msl_source, char** err) {
     }
 }
 
-const char* gptoss_device_name(gptoss_ctx* ctx) {
+const char* gpu_device_name(gpu_ctx* ctx) {
     return ctx ? ctx->name : "";
 }
 
-gptoss_buf* gptoss_buf_new(gptoss_ctx* ctx, size_t bytes) {
+gpu_buf* gpu_buf_new(gpu_ctx* ctx, size_t bytes) {
     if (!ctx) return NULL;
     @autoreleasepool {
         id<MTLBuffer> b = [ctx->device newBufferWithLength:bytes
                                                   options:MTLResourceStorageModeShared];
         if (!b) return NULL;
-        gptoss_buf* out = (gptoss_buf*)calloc(1, sizeof(*out));
+        gpu_buf* out = (gpu_buf*)calloc(1, sizeof(*out));
         out->mtl = b;
         return out;
     }
 }
 
-gptoss_buf* gptoss_buf_new_from(gptoss_ctx* ctx, const void* src, size_t bytes) {
-    gptoss_buf* b = gptoss_buf_new(ctx, bytes);
+gpu_buf* gpu_buf_new_from(gpu_ctx* ctx, const void* src, size_t bytes) {
+    gpu_buf* b = gpu_buf_new(ctx, bytes);
     if (!b) return NULL;
     memcpy([b->mtl contents], src, bytes);
     return b;
 }
 
-gptoss_buf* gptoss_buf_wrap_nocopy(gptoss_ctx* ctx, void* host_ptr, size_t bytes) {
+gpu_buf* gpu_buf_wrap_nocopy(gpu_ctx* ctx, void* host_ptr, size_t bytes) {
     if (!ctx) return NULL;
     @autoreleasepool {
         // No deallocator: caller (the safetensors archive / mmap) owns memory.
@@ -99,16 +99,16 @@ gptoss_buf* gptoss_buf_wrap_nocopy(gptoss_ctx* ctx, void* host_ptr, size_t bytes
                                                        options:MTLResourceStorageModeShared
                                                    deallocator:nil];
         if (!b) return NULL;
-        gptoss_buf* out = (gptoss_buf*)calloc(1, sizeof(*out));
+        gpu_buf* out = (gpu_buf*)calloc(1, sizeof(*out));
         out->mtl = b;
         return out;
     }
 }
 
-void* gptoss_buf_contents(gptoss_buf* b) {
+void* gpu_buf_contents(gpu_buf* b) {
     return b ? [b->mtl contents] : NULL;
 }
-gptoss_pipeline* gptoss_pipeline_for(gptoss_ctx* ctx, const char* fn_name, char** err) {
+gpu_pipeline* gpu_pipeline_for(gpu_ctx* ctx, const char* fn_name, char** err) {
     if (!ctx || !ctx->library) {
         if (err) *err = strdup("no library");
         return NULL;
@@ -127,24 +127,24 @@ gptoss_pipeline* gptoss_pipeline_for(gptoss_ctx* ctx, const char* fn_name, char*
         NSError* e = nil;
         id<MTLComputePipelineState> pso = [ctx->device newComputePipelineStateWithFunction:fn error:&e];
         if (!pso) { if (err) *err = dup_nserr(e); return NULL; }
-        gptoss_pipeline* p = (gptoss_pipeline*)calloc(1, sizeof(*p));
+        gpu_pipeline* p = (gpu_pipeline*)calloc(1, sizeof(*p));
         p->pso = pso;
         p->max_threads_per_group = [pso maxTotalThreadsPerThreadgroup];
         return p;
     }
 }
 
-gptoss_cmdbuf* gptoss_cmdbuf_new(gptoss_ctx* ctx) {
+gpu_cmdbuf* gpu_cmdbuf_new(gpu_ctx* ctx) {
     if (!ctx) return NULL;
-    gptoss_cmdbuf* c = (gptoss_cmdbuf*)calloc(1, sizeof(*c));
+    gpu_cmdbuf* c = (gpu_cmdbuf*)calloc(1, sizeof(*c));
     c->cb  = [ctx->queue commandBuffer];
     c->enc = [c->cb computeCommandEncoder];
     return c;
 }
 
-void gptoss_cmdbuf_dispatch(gptoss_cmdbuf* c,
-                            gptoss_pipeline* p,
-                            const gptoss_arg_buf* buffers, size_t n_buffers,
+void gpu_cmdbuf_dispatch(gpu_cmdbuf* c,
+                            gpu_pipeline* p,
+                            const gpu_arg_buf* buffers, size_t n_buffers,
                             size_t grid_x, size_t grid_y, size_t grid_z,
                             size_t tg_x,   size_t tg_y,   size_t tg_z)
 {
@@ -158,23 +158,23 @@ void gptoss_cmdbuf_dispatch(gptoss_cmdbuf* c,
       threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, tg_z)];
 }
 
-double g_gptoss_gpu_time = 0.0;
+double g_gpu_time = 0.0;
 
-bool gptoss_cmdbuf_commit_wait(gptoss_cmdbuf* c, char** err) {
+bool gpu_cmdbuf_commit_wait(gpu_cmdbuf* c, char** err) {
     if (!c) return false;
     [c->enc endEncoding];
     [c->cb commit];
     [c->cb waitUntilCompleted];
     bool ok = (c->cb.error == nil);
     if (!ok && err) *err = dup_nserr(c->cb.error);
-    extern double g_gptoss_gpu_time;
-    g_gptoss_gpu_time += (c->cb.GPUEndTime - c->cb.GPUStartTime);
+    extern double g_gpu_time;
+    g_gpu_time += (c->cb.GPUEndTime - c->cb.GPUStartTime);
     c->enc = nil; c->cb = nil;
     free(c);
     return ok;
 }
 
-void gptoss_cmdbuf_commit(gptoss_cmdbuf* c) {
+void gpu_cmdbuf_commit(gpu_cmdbuf* c) {
     if (!c) return;
     [c->enc endEncoding];
     [c->cb commit];
@@ -182,13 +182,13 @@ void gptoss_cmdbuf_commit(gptoss_cmdbuf* c) {
     // Keep c->cb alive for waitUntilCompleted later.
 }
 
-bool gptoss_cmdbuf_wait(gptoss_cmdbuf* c, char** err) {
+bool gpu_cmdbuf_wait(gpu_cmdbuf* c, char** err) {
     if (!c) return false;
     [c->cb waitUntilCompleted];
     bool ok = (c->cb.error == nil);
     if (!ok && err) *err = dup_nserr(c->cb.error);
-    extern double g_gptoss_gpu_time;
-    g_gptoss_gpu_time += (c->cb.GPUEndTime - c->cb.GPUStartTime);
+    extern double g_gpu_time;
+    g_gpu_time += (c->cb.GPUEndTime - c->cb.GPUStartTime);
     c->cb = nil;
     free(c);
     return ok;

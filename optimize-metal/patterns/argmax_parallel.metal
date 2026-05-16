@@ -6,7 +6,7 @@
 //         (1) per-thread strided pass to find local (max, idx)
 //         (2) simdgroup reduction via simd_max + indirection
 //         (3) threadgroup-level reduction across SGs via threadgroup mem
-// WHEN: Apply EARLY in optimization.  This single change took csrc from
+// WHEN: Apply EARLY in optimization.  This single change took the gpt-oss reference impl from
 //       40 → 84 tok/s decode (+110%).
 // SPEEDUP: 1.5–2.0× decode.
 // COMMIT: e34bf80 — "Parallel argmax (single-thread bottleneck): 40→84 tok/s"

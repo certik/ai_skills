@@ -7,16 +7,16 @@
 // CAVEAT: forward() MUST end with commit+wait so the GPU is idle before
 //         the next call refills the same buffers.  If you do the 2-deep
 //         pipeline (cmdbuf_pipeline_2deep.c), duplicate the ring per slot.
-// SPEEDUP: ~1.01–1.02× decode (88→89 tok/s in csrc, commit 2b1d6ef).
+// SPEEDUP: ~1.01–1.02× decode (88→89 tok/s in the gpt-oss reference impl, commit 2b1d6ef).
 
 #include "metal_shim.h"
 
-// One static gptoss_buf per param.  Allocated lazily on first call.
-// dst pointer for memcpy is acquired via gptoss_buf_contents().
+// One static gpu_buf per param.  Allocated lazily on first call.
+// dst pointer for memcpy is acquired via gpu_buf_contents().
 #define PARAM_BUF(name, sz) \
-    static gptoss_buf* name##_buf = NULL; \
-    if (!name##_buf) name##_buf = gptoss_buf_new(g_ctx, (sz)); \
-    void* name##_dst = gptoss_buf_contents(name##_buf)
+    static gpu_buf* name##_buf = NULL; \
+    if (!name##_buf) name##_buf = gpu_buf_new(g_ctx, (sz)); \
+    void* name##_dst = gpu_buf_contents(name##_buf)
 
 void forward(int q_off, int Lq) {
     // dimsRMS = {Lq, HIDDEN}.  Allocate once, refill in place each call.

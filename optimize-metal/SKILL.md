@@ -2,7 +2,7 @@
 name: optimize-metal
 description: >
   Optimize a working but naive Apple-GPU Metal LLM implementation
-  (produced by the port-c-to-metal skill, living in ./csrc/) to match
+  (produced by the port-c-to-metal skill, living in ./src-metal/) to match
   the speed of the MLX reference (within ±5%). Applies a named catalog
   of Metal-specific optimization techniques: SIMD-group-per-output GEMV,
   bfloat4 vector loads, qmv4 register tiling, simdgroup_matrix MMA for
@@ -19,7 +19,7 @@ description: >
 
 # optimize-metal — make the Metal port fast (match MLX ±5%)
 
-Take a working but slow Metal LLM implementation (`./csrc/`, produced by
+Take a working but slow Metal LLM implementation (`./src-metal/`, produced by
 `port-c-to-metal`) and iteratively optimize it until decode and prefill
 throughput are within ±5% of the MLX-equivalent reference on the same
 machine.
@@ -31,7 +31,7 @@ the C reference, commit. Repeat.
 
 ## When to use
 
-After `port-c-to-metal` has produced a correct-but-slow `./csrc/`. Use
+After `port-c-to-metal` has produced a correct-but-slow `./src-metal/`. Use
 this skill to:
 
 - Profile the Metal kernels and identify per-kernel bottlenecks.
@@ -51,8 +51,8 @@ build-c-reference  →  port-c-to-metal  →  optimize-metal
 
 ## Prerequisites
 
-- `./csrc/` exists, builds, and produces tokens that match `./csrc-cpu/`.
-- `./csrc-cpu/` (the C reference) is **kept untouched** — it remains the
+- `./src-metal/` exists, builds, and produces tokens that match `./src-cpu/`.
+- `./src-cpu/` (the C reference) is **kept untouched** — it remains the
   ground truth for correctness.
 - A way to run the MLX reference (`infer_mlx.py` or `mlx_lm`) for tok/s
   comparison.
@@ -60,7 +60,7 @@ build-c-reference  →  port-c-to-metal  →  optimize-metal
 
 ## Inputs to gather
 
-1. Path to `./csrc/` (default: sibling of this skill's working dir).
+1. Path to `./src-metal/` (default: sibling of this skill's working dir).
 2. The MLX reference command to compare against, e.g.
    `uv run python infer_mlx.py --prompt "<P>" --max-tokens 256`.
 3. Target machine spec (M1/M2/M3/M4/Pro/Max/Ultra) — affects tile sizes
@@ -85,7 +85,7 @@ Single, repeating cycle:
 ┌─────────────────────────────────────────────────────────────────┐
 │ 1. Profile current build                                        │
 │    - measure decode + prefill tok/s                              │
-│    - per-kernel GPU time (GPTOSS_KPROF=1 idiom — one cmdbuf      │
+│    - per-kernel GPU time (KPROF=1 idiom — one cmdbuf      │
 │      per dispatch + timestamps)                                  │
 │    - identify hottest kernel (typically: GEMV for decode,        │
 │      GEMM for prefill, MoE for both)                              │
@@ -117,10 +117,10 @@ Single, repeating cycle:
 
 ## Setup — profiling infrastructure
 
-Add (or use, if already present in csrc/) a per-kernel profiling mode:
+Add (or use, if already present in src-metal/) a per-kernel profiling mode:
 
 ```c
-// main.c: if getenv("GPTOSS_KPROF"), wrap every dispatch in its own
+// main.c: if getenv("KPROF"), wrap every dispatch in its own
 // cmdbuf, time it, sum per kernel name; print a totals table at exit:
 //
 //   embed_gather  0.001 s  ( 0.1%)
@@ -132,7 +132,7 @@ Add (or use, if already present in csrc/) a per-kernel profiling mode:
 //   down         0.310 s  (20.7%)
 ```
 
-This idiom is what `csrc/main.c` already has (see `GPTOSS_KPROF`).
+This idiom is what `src-metal/main.c` already has (see `KPROF`).
 Without it, all you know is "decode is slow". With it, you know
 exactly which kernel to attack.
 
@@ -182,9 +182,9 @@ GPU is idle).
 
 ```c
 #define PARAM_BUF(name, sz) \
-    static gptoss_buf* name##_buf = NULL; \
-    if (!name##_buf) name##_buf = gptoss_buf_new(g_ctx, (sz)); \
-    void* name##_dst = gptoss_buf_contents(name##_buf)
+    static gpu_buf* name##_buf = NULL; \
+    if (!name##_buf) name##_buf = gpu_buf_new(g_ctx, (sz)); \
+    void* name##_dst = gpu_buf_contents(name##_buf)
 
 uint32_t dimsRMS[2] = {(uint32_t)Lq, HIDDEN};
 PARAM_BUF(dimsRMS, sizeof(dimsRMS));
@@ -193,7 +193,7 @@ memcpy(dimsRMS_dst, dimsRMS, sizeof(dimsRMS));
 
 **When**: After A1. Easy win.
 
-**Speedup**: 1.01–1.02× decode (88→89 tok/s in csrc).
+**Speedup**: 1.01–1.02× decode (88→89 tok/s in the gpt-oss reference impl).
 
 **Snippet**: `patterns/param_buf_persistent.c`
 
@@ -381,7 +381,7 @@ SIMD group computes a `BM × BN` output tile via these primitives.
 **What**: With `simdgroup_matrix`, you tile across two axes — across
 threadgroups (BM × BN), and within threadgroup across warps (WM × WN
 SIMD-groups). Best tile size depends on the matmul shape and the
-hardware. csrc found `BM=16 BN=32 WM=1 WN=2` matches MLX's "non-NAX"
+hardware. the gpt-oss reference impl found `BM=16 BN=32 WM=1 WN=2` matches MLX's "non-NAX"
 tile sizes for the gpt-oss MoE shapes.
 
 **When**: After C1. Sweep `(BM, BN, WM, WN) ∈ {(8,16,1,1), (16,16,1,2),
@@ -530,7 +530,7 @@ loop). The flow is:
 **When**: When prefill is dominated by per-token expert gather (almost
 always in MoE models with `Lq > 4`).
 
-**Speedup**: 1.30–1.60× prefill (264→608 tok/s in mlx-cpp; +32% in csrc
+**Speedup**: 1.30–1.60× prefill (264→608 tok/s in mlx-cpp; +32% in src-metal
 at first wire-up, more with MMA).
 
 **Snippet**: `patterns/moe_sorted_gather_glue.metal` +
@@ -594,7 +594,7 @@ and dispatch the correct one based on `Lq`:
 
 **Pattern**: `if (Lq > 1) dispatch(prefill_kernel); else dispatch(decode_kernel);`
 
-**Original commits**: most of the csrc optimization series builds on this.
+**Original commits**: most of the gpt-oss reference impl optimization series builds on this.
 
 ---
 
@@ -637,7 +637,7 @@ Each pattern file contains:
 **After every change**, run the same validation suite:
 
 1. Per-kernel correctness: the test for the touched kernel must pass
-   against the C reference (`csrc-cpu`) within tolerance.
+   against the C reference (`src-cpu`) within tolerance.
 2. End-to-end token match against the previous Metal commit on the same
    prompt. First N tokens (N ≥ 16 ideally) MUST match. If they don't,
    investigate before committing.
@@ -656,10 +656,10 @@ is purely numerical and acceptable. If no, you have a bug — revert.
 
 When both prefill and decode are within ±5% of MLX on the validation
 prompt, you are done. Document the final tok/s and machine in a
-`csrc/PERF.md` and write a summary commit:
+`src-metal/PERF.md` and write a summary commit:
 
 ```
-csrc: optimization complete (prefill X.X tok/s vs MLX Y.Y, decode A.A vs B.B)
+src-metal: optimization complete (prefill X.X tok/s vs MLX Y.Y, decode A.A vs B.B)
 ```
 
 ## Common pitfalls
@@ -687,12 +687,62 @@ csrc: optimization complete (prefill X.X tok/s vs MLX Y.Y, decode A.A vs B.B)
   common "why is decode capped at 40 tok/s" answer. Apply F1 immediately
   once decode is in the 40+ tok/s ballpark.
 
+## Debugging recipes
+
+### "Tokens diverged after change X — how do I localize?"
+
+1. Make sure the C reference (`./src-cpu/`) is still committed and
+   produces the same tokens it always did.
+2. Add a `--dump <dir>` flag to BOTH `./src-cpu/<BIN_CPU>` and
+   `./src-metal/<BIN>` that writes every per-kernel input + output to
+   `<dir>/<kernel>_L<layer>.bin` (using the same .bin format as
+   `tools/dump_ref.py`).
+3. Run both with the same prompt:
+   ```
+   ./src-cpu/<BIN_CPU>  --prompt "..." --dump src-cpu/refs
+   ./src-metal/<BIN>    --prompt "..." --dump src-metal/refs
+   ```
+4. Binary-diff per kernel:
+   ```
+   for f in src-cpu/refs/*.bin; do
+       name=$(basename "$f")
+       cmp -l "$f" "src-metal/refs/$name" | wc -l
+   done | sort -nr | head
+   ```
+   The first non-zero kernel in forward order is the culprit.
+
+### "Decode is fast, prefill is slow"
+
+You probably have not yet implemented the **prefill GEMM path** (MMA
+tile) or the **sorted-gather MoE** for prefill (E3). Apply C1+C2 and E3.
+
+### "Prefill is fast, decode is slow"
+
+You probably have not yet applied **qmv4 register tile** (B3), **fused
+gate+up+swiglu** (E2), or **parallel argmax** (F1).
+
+### "Tok/s drops every few tokens"
+
+Memory pressure / paging. Check `wired_limit` (A7) and verify weights are
+zero-copy mmap'd (`gpu_buf_wrap_nocopy`).
+
+### "Performance is bursty"
+
+CPU encode is becoming the bottleneck. Apply 2-deep cmdbuf pipeline (A4)
++ persistent / const param buffers (A2 + A3).
+
+### "Validated kernel-by-kernel but end-to-end tokens still diverge"
+
+Check `barrier()` / cmdbuf ordering. With concurrent encoder (A5), a
+missing barrier produces non-deterministic divergence that often passes
+per-kernel tests (which serialize one kernel at a time).
+
 ## Commit strategy
 
 One commit per technique. Each commit message should include:
 
 ```
-csrc: <technique short name> (decode +X.X%, prefill +Y.Y%)
+src-metal: <technique short name> (decode +X.X%, prefill +Y.Y%)
 
 - describe the change in 1-3 lines
 - mention the bottleneck-before kernel
@@ -703,12 +753,12 @@ csrc: <technique short name> (decode +X.X%, prefill +Y.Y%)
 Examples (from this repo):
 
 ```
-csrc: gemv_bf16_4 — 4 outputs/simdgroup, 64 threads/TG (mlx qmv_fast pattern)
+src-metal: gemv_bf16_4 — 4 outputs/simdgroup, 64 threads/TG (mlx qmv_fast pattern)
 SDPA: simdgroup-per-(head,token) parallelism (1.96x decode)
-csrc: BM=16 BN=32 WM=1 WN=2 — match MLX non-NAX tile sizes (+26%)
-csrc: pipeline decode (depth=2) — overlap CPU encode with GPU compute
+src-metal: BM=16 BN=32 WM=1 WN=2 — match MLX non-NAX tile sizes (+26%)
+src-metal: pipeline decode (depth=2) — overlap CPU encode with GPU compute
 decode: 8-X register tile in bf16 GEMV (q/k/v/o/router/lm_head)
-csrc: fuse res_attn into gemm_bf16 (template DO_ADD); drop residual_add kernel
+src-metal: fuse res_attn into gemm_bf16 (template DO_ADD); drop residual_add kernel
 ```
 
 These commit messages tell you exactly what was changed AND give the
@@ -719,16 +769,16 @@ fast.
 
 When the skill is done:
 
-1. `./csrc/PERF.md` documents final tok/s vs MLX on the target machine.
-2. The optimized `./csrc/` still passes per-kernel correctness against
-   `./csrc-cpu/` within tolerance.
-3. End-to-end tokens match `./csrc-cpu/` for the validation prompt for
+1. `./src-metal/PERF.md` documents final tok/s vs MLX on the target machine.
+2. The optimized `./src-metal/` still passes per-kernel correctness against
+   `./src-cpu/` within tolerance.
+3. End-to-end tokens match `./src-cpu/` for the validation prompt for
    at least the first 16 tokens.
 4. Each optimization is its own commit, individually revertable.
 
 Optional follow-ups (out of scope for this skill):
 
-- Port the optimized csrc/ to CUDA / ROCm / Vulkan / TPU (each its own
+- Port the optimized src-metal/ to CUDA / ROCm / Vulkan / TPU (each its own
   future skill, starting from the C reference, not from this Metal
   implementation).
 - Add batch>1 support.

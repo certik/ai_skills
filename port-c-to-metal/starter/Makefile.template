@@ -1,21 +1,21 @@
 # Makefile.template — C + Metal build for the naive Apple-GPU port.
 #
-# Replace <BIN> with your binary name, e.g., `gptoss`.
+# Replace <BIN> with your binary name. Choose a model-specific name (e.g., `llama3`, `qwen2`) or a generic one (e.g., `llm`, `infer`).
 
 CC      ?= clang
 OBJC    ?= clang
-CFLAGS    := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -Icsrc
-OBJCFLAGS := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc -ObjC -Icsrc
+CFLAGS    := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -Isrc-metal
+OBJCFLAGS := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -fobjc-arc -ObjC -Isrc-metal
 LDFLAGS   := -framework Foundation -framework Metal -framework MetalKit
 
 BIN     := <BIN>
 
-C_SRCS  := csrc/main.c \
-           csrc/kernel_concat.c \
-           csrc/safetensors.c \
-           csrc/tokenizer.c \
-           csrc/<chattmpl>.c
-M_SRCS  := csrc/metal_shim.m
+C_SRCS  := src-metal/main.c \
+           src-metal/kernel_concat.c \
+           src-metal/safetensors.c \
+           src-metal/tokenizer.c \
+           src-metal/<chattmpl>.c
+M_SRCS  := src-metal/metal_shim.m
 OBJS    := $(C_SRCS:.c=.o) $(M_SRCS:.m=.o)
 
 .PHONY: all clean run
@@ -25,14 +25,14 @@ all: $(BIN)
 $(BIN): $(OBJS)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
-csrc/%.o: csrc/%.c
+src-metal/%.o: src-metal/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-csrc/%.o: csrc/%.m
+src-metal/%.o: src-metal/%.m
 	$(OBJC) $(OBJCFLAGS) -c $< -o $@
 
 run: $(BIN)
 	./$(BIN) --prompt "Hello, who are you?" --max-tokens 16
 
 clean:
-	rm -f csrc/*.o $(BIN)
+	rm -f src-metal/*.o $(BIN)

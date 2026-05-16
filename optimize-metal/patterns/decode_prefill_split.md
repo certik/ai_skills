@@ -9,9 +9,9 @@ based on `Lq`:
 
 ```c
 if (Lq > 1) {
-    gptoss_cmdbuf_dispatch(cb, pso_gemm,        ...);   // MMA tile path
+    gpu_cmdbuf_dispatch(cb, pso_gemm,        ...);   // MMA tile path
 } else {
-    gptoss_cmdbuf_dispatch(cb, pso_gemv_qmv4_8, ...);   // qmv4 register-tile path
+    gpu_cmdbuf_dispatch(cb, pso_gemv_qmv4_8, ...);   // qmv4 register-tile path
 }
 ```
 
@@ -51,10 +51,10 @@ Don't split prematurely. Order of operations:
 ## Pattern in main.c
 
 ```c
-static gptoss_pipeline* gemvm = (Lq > 1) ? pso_gemm : pso_gemv;
+static gpu_pipeline* gemvm = (Lq > 1) ? pso_gemm : pso_gemv;
 size_t MTILE = (Lq > 1) ? 2 : 1;
 size_t Mblk  = (Lq + MTILE - 1) / MTILE;
-gptoss_arg_buf args[] = { ABUF(H), abQw, abQb, ABUF(Q), ABUF(dimsQp) };
+gpu_arg_buf args[] = { ABUF(H), abQw, abQb, ABUF(Q), ABUF(dimsQp) };
 must_dispatch(gemvm, args, 5, (size_t)(N_QHEADS*HEAD_DIM*32), Mblk, 1,
               256, 1, 1, "q_proj");
 ```
@@ -63,7 +63,7 @@ The grid/threadgroup sizes also differ — match what each kernel needs.
 
 ## Commits
 
-The full sweep of decode/prefill split work is spread across many csrc
+The full sweep of decode/prefill split work is spread across many src-metal
 commits:
 
 - 1c4ddfd — MoE: grouped expert GEMM for prefill

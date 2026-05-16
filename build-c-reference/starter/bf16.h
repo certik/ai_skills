@@ -6,8 +6,8 @@
 //
 // Drop-in. Include in kernels.c and tests.
 
-#ifndef GPTOSS_BF16_H
-#define GPTOSS_BF16_H
+#ifndef BF16_H
+#define BF16_H
 
 #include <stdint.h>
 

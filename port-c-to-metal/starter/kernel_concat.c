@@ -84,7 +84,7 @@ static void inline_file(sbuf* out, const char* path, seen_node_t** seen) {
     free(src);
 }
 
-char* gptoss_concat_kernels(int n, const char** paths) {
+char* concat_kernels(int n, const char** paths) {
     sbuf out = {0};
     seen_node_t* seen = NULL;
     for (int i = 0; i < n; i++) inline_file(&out, paths[i], &seen);

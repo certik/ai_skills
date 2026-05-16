@@ -9,8 +9,8 @@
 //          full pass over the residual buffer).
 // COMMITS:
 //   130075a — decode: fuse residual add into o_proj and mix epilogues
-//   4e3bb14 — csrc: fuse res_attn into gemm_bf16 (template DO_ADD); drop residual_add kernel
-//   ba83808 — csrc: fuse res_mlp into combine_scatter; drop unused metal_shim API
+//   4e3bb14 — src-metal: fuse res_attn into gemm_bf16 (template DO_ADD); drop residual_add kernel
+//   ba83808 — src-metal: fuse res_mlp into combine_scatter; drop unused metal_shim API
 
 #include <metal_stdlib>
 using namespace metal;

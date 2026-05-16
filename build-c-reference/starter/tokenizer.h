@@ -17,8 +17,8 @@
 // (>= 0x80) are treated as "other" (rule 4 territory) which is benign for
 // our use case (the entire harmony scaffolding is ASCII).
 
-#ifndef GPTOSS_TOKENIZER_H
-#define GPTOSS_TOKENIZER_H
+#ifndef TOKENIZER_H
+#define TOKENIZER_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -27,32 +27,32 @@
 extern "C" {
 #endif
 
-typedef struct gptoss_tokenizer gptoss_tokenizer;
+typedef struct tokenizer_t tokenizer_t;
 
-gptoss_tokenizer* tk_load(const char* path, char** err);
-void              tk_free(gptoss_tokenizer*);
+tokenizer_t* tk_load(const char* path, char** err);
+void              tk_free(tokenizer_t*);
 
 // Encode UTF-8 text without recognising special tokens (special tokens, if
 // any, must be tokenised separately via tk_special).  Output capacity must
 // be at least `n_bytes + 1` to handle the worst case (each byte its own
 // token).  Returns number of tokens written, or -1 on error.
-int tk_encode_ordinary(const gptoss_tokenizer* tk,
+int tk_encode_ordinary(const tokenizer_t* tk,
                        const char* text, size_t n_bytes,
                        int* out_ids, int max_ids);
 
 // Look up the id of a special token by its surface form (e.g. "<|start|>").
 // Returns -1 if not found.
-int tk_special(const gptoss_tokenizer* tk, const char* name);
+int tk_special(const tokenizer_t* tk, const char* name);
 
 // Decode a sequence of ids into raw bytes (no UTF-8 validation).  Returns
 // number of bytes written; out is NOT null-terminated.
-int tk_decode(const gptoss_tokenizer* tk,
+int tk_decode(const tokenizer_t* tk,
               const int* ids, int n_ids,
               char* out, int max_bytes);
 
 // Diagnostics.
-int  tk_n_vocab(const gptoss_tokenizer*);
-const char* tk_token_bytes(const gptoss_tokenizer*, int id, int* out_len);
+int  tk_n_vocab(const tokenizer_t*);
+const char* tk_token_bytes(const tokenizer_t*, int id, int* out_len);
 
 #ifdef __cplusplus
 }

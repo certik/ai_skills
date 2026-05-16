@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Convert HF tokenizer.json to a compact binary blob used by csrc/tokenizer.c.
+"""Convert HF tokenizer.json to a compact binary blob used by src-metal/tokenizer.c.
 
 Output format (little-endian):
-  magic  : "GPTOSSTOK\1\0\0\0"        (12 bytes)
+  magic  : "LLMBPETK\1\0\0\0"        (12 bytes)
   u32    n_vocab                      (199998 BPE entries; rank == id)
   u32    n_special                    (named special tokens)
   u32    bytes_blob_size
@@ -21,7 +21,7 @@ import sys
 from typing import Dict
 
 
-MAGIC = b"GPTOSSTOK\x01\x00\x00"
+MAGIC = b"LLMBPETK\x01\x00\x00"
 
 
 def bytes_to_unicode() -> Dict[int, str]:
@@ -41,33 +41,32 @@ def bytes_to_unicode() -> Dict[int, str]:
     return dict(zip(bs, [chr(c) for c in cs]))
 
 
-# Hard-coded specials from openai/harmony src/tiktoken_ext/public_encodings.rs.
-HARMONY_SPECIALS = [
-    ("<|startoftext|>", 199998),
-    ("<|endoftext|>", 199999),
-    ("<|reserved_200000|>", 200000),
-    ("<|reserved_200001|>", 200001),
-    ("<|return|>", 200002),
-    ("<|constrain|>", 200003),
-    ("<|reserved_200004|>", 200004),
-    ("<|channel|>", 200005),
-    ("<|start|>", 200006),
-    ("<|end|>", 200007),
-    ("<|message|>", 200008),
-    ("<|reserved_200009|>", 200009),
-    ("<|reserved_200010|>", 200010),
-    ("<|reserved_200011|>", 200011),
-    ("<|call|>", 200012),
-    ("<|reserved_200013|>", 200013),
-    # Named specials that appear in HF tokenizer.json beyond the harmony core set:
-    ("<|refusal|>", 200013),  # alias used by harmony FormattingToken::Refusal -> placeholder
-]
+# [MODEL] Optional: hard-coded special tokens to include in the .bin even
+# if they don't appear in tokenizer.json's added_tokens.  Useful only when
+# the reference framework uses special tokens that aren't declared in HF
+# tokenizer.json (rare; gpt-oss/harmony is the typical example).
+#
+# Default: empty.  The script will derive specials from
+# tokenizer.json["added_tokens"] automatically.
+#
+# Example for gpt-oss (uncomment to use):
+# EXTRA_SPECIALS = [
+#     ("<|startoftext|>", 199998),
+#     ("<|endoftext|>", 199999),
+#     ("<|return|>", 200002),
+#     ("<|channel|>", 200005),
+#     ("<|start|>", 200006),
+#     ("<|end|>", 200007),
+#     ("<|message|>", 200008),
+#     ("<|call|>", 200012),
+# ]
+EXTRA_SPECIALS: list = []
 
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--tokenizer-json", default="/Users/ondrej/repos/models/gpt-oss-20b/tokenizer.json")
-    p.add_argument("--out", default="csrc/tokenizer.bin")
+    p.add_argument("--tokenizer-json", default="/path/to/model/tokenizer.json")
+    p.add_argument("--out", default="src-cpu/tokenizer.bin")
     args = p.parse_args()
 
     print(f"loading {args.tokenizer_json}", flush=True)
@@ -108,15 +107,16 @@ def main() -> int:
         blob.extend(by_id[i])
     offsets.append(len(blob))  # sentinel
 
-    # Specials list: dedup by id, prefer harmony names.
+    # Specials list: pull from tokenizer.json's added_tokens.  Add any
+    # EXTRA_SPECIALS the user configured (rare; useful when the reference
+    # uses tokens that aren't declared in HF tokenizer.json).
     specials = {}
-    for name, sid in HARMONY_SPECIALS:
-        specials[sid] = name
-    # Pull in any extra named specials from added_tokens that aren't covered.
     for tok in added:
         sid = int(tok["id"])
         name = tok["content"]
-        if sid not in specials and name.startswith("<|") and name.endswith("|>"):
+        specials[sid] = name
+    for name, sid in EXTRA_SPECIALS:
+        if sid not in specials:
             specials[sid] = name
     spec_items = sorted(specials.items())
 

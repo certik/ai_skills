@@ -7,7 +7,7 @@ Customize for your reference framework:
   - MLX: register Module hooks via mx.eval and intermediate captures.
   - PyTorch / HF: register forward_hooks on the modules you care about.
 
-Output layout (in --out dir, default csrc-cpu/refs/):
+Output layout (in --out dir, default src-cpu/refs/):
     input_ids.bin                    int32  [L]
     x_after_embed.bin                f32    [L, hidden]
     x_after_rmsnorm_<i>.bin          f32    [L, hidden]
@@ -18,7 +18,7 @@ Output layout (in --out dir, default csrc-cpu/refs/):
     next_id.bin                      int32  [1]
 
 Binary format (matches loader in tests/load_ref.h):
-    magic   : "GPTOSSF1"                 (8 bytes)
+    magic   : "LLMTNSR1"                 (8 bytes)
     u32     : dtype code (0=f32, 1=i32)
     u32     : ndim
     i64[ndim]: shape
@@ -43,7 +43,7 @@ else:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-MAGIC = b"GPTOSSF1"
+MAGIC = b"LLMTNSR1"
 DT_F32, DT_I32 = 0, 1
 
 
@@ -68,7 +68,7 @@ def save_bin(path: str, arr, dtype: str) -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="HF model dir")
-    p.add_argument("--out", default="csrc-cpu/refs")
+    p.add_argument("--out", default="src-cpu/refs")
     p.add_argument("--system", default="You are a helpful assistant.")
     p.add_argument("--user", default="Hello, who are you?")
     p.add_argument("--reasoning", default="low")   # [MODEL] drop if not used
