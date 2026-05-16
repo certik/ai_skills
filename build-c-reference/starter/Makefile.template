@@ -1,48 +1,80 @@
 # Makefile.template — pure-C CPU reference build.
 #
-# Replace <BIN> with the binary name you want. Choose a model-specific name (e.g., `llama3-cpu`, `qwen2-cpu`) or a generic one (e.g., `llm-cpu`, `infer-cpu`).
-# Drop into the repo root; it expects sources in `src-cpu/`.
+# Replace <BIN> with the binary name you want. Choose a model-specific name
+# (e.g., `llama3-cpu`, `qwen2-cpu`) or a generic one (e.g., `llm-cpu`,
+# `infer-cpu`). Drop into the repo root; it expects sources in `src-cpu/`.
+#
+# Targets:
+#   make             - build <BIN>
+#   make tokenizer   - build src-cpu/tokenizer.bin (runs ./build_tokenizer)
+#   make tests       - build & run per-kernel correctness checks
+#   make run         - run on the validation prompt
+#   make clean
 
 CC      ?= clang
 CFLAGS  := -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Isrc-cpu
+LDFLAGS := -lm
 
 BIN     := <BIN>
 
-# Add new kernel .c files as you author them.  Per-kernel correctness
-# tests live in `tests/` and are built by the `tests` target.
+# Model-specific code in src-cpu/. Add `<chattmpl>.c` for your chat-template
+# builder and any model-specific helpers.
 SRCS    := src-cpu/main.c \
            src-cpu/kernels.c \
            src-cpu/safetensors.c \
            src-cpu/tokenizer.c \
-           src-cpu/<chattmpl>.c
+           src-cpu/<chattmpl>.c \
+           src-cpu/utils/json.c \
+           src-cpu/utils/iofile.c \
+           src-cpu/utils/bytebuf.c \
+           src-cpu/utils/utf8.c
 
-OBJS    := $(SRCS:.c=.o)
+OBJS := $(SRCS:.c=.o)
 
-# Consolidated per-kernel correctness tests (see tests/test_kernels.c).
+UTIL_OBJS := src-cpu/utils/json.o src-cpu/utils/iofile.o \
+             src-cpu/utils/bytebuf.o src-cpu/utils/utf8.o
+UTIL_HDRS := src-cpu/utils/json.h src-cpu/utils/jsmn.h \
+             src-cpu/utils/iofile.h src-cpu/utils/bytebuf.h \
+             src-cpu/utils/utf8.h src-cpu/utils/bf16.h
+
+# Per-kernel correctness tests (one C source with a TESTS[] table).
 TEST_BINS := src-cpu/tests/test_kernels
 
-.PHONY: all clean tests run
+BUILD_TOK := src-cpu/build_tokenizer
+
+# Override on the command line: `make tests MODEL_DIR=/path/to/model`.
+MODEL_DIR ?= /path/to/your/model
+
+.PHONY: all clean tests run tokenizer
 
 all: $(BIN)
 
 $(BIN): $(OBJS)
-	$(CC) $^ -o $@ -lm
+	$(CC) $^ -o $@ $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# tokenizer.bin builder (pure C — no Python in the inference build path).
+tokenizer: src-cpu/tokenizer.bin
+
+$(BUILD_TOK): src-cpu/build_tokenizer.c $(UTIL_OBJS) $(UTIL_HDRS)
+	$(CC) $(CFLAGS) src-cpu/build_tokenizer.c $(UTIL_OBJS) -o $@ $(LDFLAGS)
+
+src-cpu/tokenizer.bin: $(BUILD_TOK)
+	./$(BUILD_TOK) --tokenizer-json $(MODEL_DIR)/tokenizer.json \
+	               --out             src-cpu/tokenizer.bin
+
 tests: $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "==> $$t" && $$t --model $(MODEL_DIR) || exit 1; done
 
-# Each test_*.c links against all kernel objects so it can run any subset.
-src-cpu/tests/test_%: src-cpu/tests/test_%.c src-cpu/kernels.o src-cpu/safetensors.o
-	$(CC) $(CFLAGS) $^ -o $@ -lm
+src-cpu/tests/test_%: src-cpu/tests/test_%.c src-cpu/kernels.o \
+                      src-cpu/safetensors.o src-cpu/tokenizer.o \
+                      src-cpu/<chattmpl>.o $(UTIL_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# [MODEL] override on the command line: `make tests MODEL_DIR=/path/to/model`
-MODEL_DIR ?= /path/to/your/model
-
-run: $(BIN)
-	./$(BIN) --prompt "Hello, who are you?" --max-tokens 16
+run: $(BIN) src-cpu/tokenizer.bin
+	./$(BIN) --prompt "Hello, who are you?" --max-tokens 16 --model $(MODEL_DIR)
 
 clean:
-	rm -f src-cpu/*.o src-cpu/tests/*.o $(BIN) $(TEST_BINS)
+	rm -f src-cpu/*.o src-cpu/utils/*.o src-cpu/tests/*.o $(TEST_BINS) $(BIN) $(BUILD_TOK)

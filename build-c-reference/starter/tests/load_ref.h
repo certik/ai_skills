@@ -45,7 +45,7 @@ static void ref_free(ref_t* r) { if (r) { free(r->data); free(r); } }
 
 // Compare an f32 reference against a bf16 buffer; print max-abs-error.
 // Returns 0 on success (<= tol), nonzero otherwise.
-#include "../src-cpu/bf16.h"
+#include "../utils/bf16.h"
 static int ref_check_bf16_vs_f32(const bf16* got, const float* want, size_t n,
                                  float tol, const char* label) {
     float max_d = 0.0f;

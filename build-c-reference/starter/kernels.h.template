@@ -26,7 +26,7 @@
 #define KERNELS_H
 
 #include <stdint.h>
-#include "bf16.h"
+#include "utils/bf16.h"
 
 // ---- Phase 3: embed, RMSNorm, dense linear ---------------------------------
 

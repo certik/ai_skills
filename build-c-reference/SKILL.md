@@ -97,61 +97,97 @@ Ask the user for (if not already provided / discoverable):
 ├── main.c             # CLI; reads config.json; calls forward() per token
 ├── kernels.h          # one C function per distinct math op
 ├── kernels.c          # naive scalar implementations
-├── safetensors.c      # HF safetensors mmap loader (drop-in)
-├── safetensors.h
-├── tokenizer.c        # BPE tokenizer (drop-in)
-├── tokenizer.h
-├── tokenizer.bin      # built by tools/build_tokenizer.py
-├── <chattmpl>.c       # chat-template builder (e.g., harmony.c for gpt-oss)
-├── <chattmpl>.h
-├── bf16.h             # bf16 ↔ fp32 helpers (drop-in)
+├── safetensors.{c,h}  # HF safetensors mmap loader (drop-in)
+├── tokenizer.{c,h}    # BPE tokenizer engine (mostly drop-in; swap regex)
+├── tokenizer.bin      # built by ./build_tokenizer (pure-C, no Python)
+├── build_tokenizer.c  # tokenizer.json → tokenizer.bin (drop-in for byte-BPE)
+├── <chattmpl>.{c,h}   # model-specific chat-template builder
+├── utils/             # reusable, model-agnostic helpers (no model knowledge)
+│   ├── bf16.h         # bf16 ↔ fp32 helpers (RN-even)
+│   ├── jsmn.h         # vendored single-header JSON tokenizer (MIT)
+│   ├── json.{c,h}     # Python-like JSON reader on top of jsmn
+│   ├── utf8.{c,h}     # UTF-8 encode/decode (one codepoint)
+│   ├── bytebuf.{c,h}  # growable byte buffer (Python's `bytearray`)
+│   └── iofile.{c,h}   # read-only file mmap helper
 ├── Makefile
 ├── refs/              # oracle dumps from Python (per-kernel inputs/outputs)
 │   ├── input_ids.bin
 │   ├── x_after_embed.bin
 │   ├── x_after_rmsnorm_0.bin
-│   ├── ...
+│   └── ...
 └── tests/
     ├── load_ref.h         # .bin loader + bf16-aware err_check
     └── test_kernels.c     # one test fn per kernel; CLI-selectable
 ```
 
-Plus:
+Plus the **only** remaining Python tool, kept outside `src-cpu/`:
+
 ```
 ./tools/
-├── build_tokenizer.py  # tokenizer.json → tokenizer.bin (drop-in)
-└── dump_ref.py         # runs Python reference, dumps refs/*.bin
+└── dump_ref.py         # runs the Python reference, dumps refs/*.bin
 ```
+
+Note: `src-cpu/` is fully Python-free. The inference build needs only
+clang + libc + libm. Python is used only to regenerate oracle dumps in
+`refs/` for the per-kernel correctness tests.
 
 ## Starter files (in this skill's `starter/`)
 
-Drop-in (copy verbatim — model-agnostic):
+### Drop-in, model-agnostic (copy verbatim)
 
-- `safetensors.c` / `safetensors.h` — HF safetensors mmap loader. Handles
-  single-file and sharded layouts, BF16/F16/F32/Uxx/Ixx dtypes.
-- `tokenizer.c` / `tokenizer.h` — BPE tokenizer engine. Reads
-  `tokenizer.bin`. The BPE merging algorithm is generic, but the **pre-
-  tokenizer regex is tuned for o200k_harmony** (the GPT-4o-class
-  tokenizer used by gpt-oss). For other tokenizers (llama, mistral,
-  qwen, ...) you may need to swap the pre-tokenizer rules in
-  `pretokenize()`. The special-token list is fully data-driven from
-  the `.bin`.
-- `tools/build_tokenizer.py` — converts HF `tokenizer.json` →
-  `tokenizer.bin`. **NB**: contains a hard-coded `HARMONY_SPECIALS` list
-  for gpt-oss. Replace this with your model's special tokens (usually
-  derivable from `added_tokens` in the HF tokenizer.json).
-- `bf16.h` — `bf16_to_f32` / `f32_to_bf16` helpers.
+The `utils/` subdirectory is a small "Python-stdlib equivalent in C"
+toolkit shared by `safetensors.c`, `tokenizer.c`, `build_tokenizer.c`,
+and `main.c`. None of these files contain any model knowledge:
 
-Templates (read, then customize):
+- `utils/bf16.h` — `bf16_to_f32` / `f32_to_bf16` (round-to-nearest-even).
+- `utils/jsmn.h` — vendored single-header JSON tokenizer (MIT, Serge Zaitsev).
+- `utils/json.{c,h}` — small Python-like wrapper: `json_open_file`,
+  `json_open_mem`, `json_get`, `json_path` (dotted), `json_obj_iter`,
+  `json_arr_iter`, `json_int_or`, `json_double_or`, `json_str_view`,
+  `json_str_utf8`, `json_str_codepoints`. **NB**: defines
+  `JSMN_PARENT_LINKS` before including jsmn — without this, parsing
+  large objects (like a 250k-entry `tokenizer.json::model.vocab`) is
+  O(N²) and takes ~40 s; with it, it's O(N) and takes ~40 ms (1000×
+  speedup). See "Common pitfalls".
+- `utils/utf8.{c,h}` — `utf8_encode` / `utf8_decode` (one codepoint each).
+- `utils/bytebuf.{c,h}` — growable buffer: `bb_append`, `bb_append_u32`
+  (little-endian), `bb_write_file`. Aborts on OOM (same policy as
+  Python's `bytearray` raising `MemoryError`).
+- `utils/iofile.{c,h}` — `iofile_mmap_ro` / `iofile_close`. Replaces
+  the open/fstat/mmap/close dance in every caller.
 
-- `main.c.template` — CLI skeleton: argparse, config.json loader, weight
-  load, tokenizer load, prompt encode, prefill, AR decode, stats.
+Then the model-shared model-format readers:
+
+- `safetensors.{c,h}` — HF safetensors mmap loader. Handles single-file
+  and sharded layouts, BF16/F16/F32/U8/I8/U16/I16/U32/I32/U64/I64. Uses
+  `utils/json` + `utils/iofile` internally.
+- `tokenizer.{c,h}` — byte-level BPE engine. Reads `tokenizer.bin`.
+  The BPE merging algorithm is fully generic; only the **pre-tokenizer
+  regex** in `pretokenize()` may need swapping (the default ships an
+  ASCII subset that matches Qwen 3.5 / Llama 3; for o200k_harmony /
+  Mistral / sentencepiece-based families, rewrite the `match_*` helpers
+  per `tokenizer.json::pre_tokenizer.pattern`).
+- `build_tokenizer.c` — converts HF `tokenizer.json` → `tokenizer.bin`
+  in pure C. Drop-in for any **byte-level BPE** family (Qwen, Llama 3,
+  GPT-2, o200k, gpt-oss). For sentencepiece / unigram tokenizers (older
+  Llama, Mistral, T5) the vocab-key decoding step is different — copy
+  + rewrite the `decode_vocab_key` helper.
+
+### Templates (read, then customize)
+
+- `main.c.template` — CLI skeleton: argparse, config.json loader (via
+  `json_path` so multi-modal `text_config` nesting is one line), weight
+  load, tokenizer load, prompt encode, prefill, AR decode (with live
+  text streaming + final summary), stats.
 - `kernels.h.template` — kernel signature pattern (one C function per
   distinct math op). Includes a checklist of common modern-architecture
   ops (output gate, partial RoPE, q/k_norm, SSM step, etc.).
 - `kernels.c.template` — naive scalar reference kernels plus commented
-  snippets for two common quantization formats (MXFP4 and MLX 8-bit affine).
-- `Makefile.template` — `make src-cpu` builds `./<BIN>`.
+  snippets for two common quantization formats (MXFP4 and MLX 8-bit
+  affine).
+- `Makefile.template` — `make` builds `./<BIN>`; `make tokenizer` builds
+  the C tokenizer-bin generator; `make tests` runs the per-kernel
+  correctness checks.
 - `tools/dump_ref.py.template` — Python oracle dumper. Includes both a
   PyTorch / HF path (using `forward_hook`s) and an MLX path (manual
   forward walk, since MLX has no hook mechanism).
@@ -213,29 +249,47 @@ Templates (read, then customize):
 
 ### Phase 2: Scaffold — get loader + tokenizer + CLI working
 
-1. Create `src-cpu/`. Copy drop-in starters: `safetensors.{c,h}`,
-   `tokenizer.{c,h}`, `bf16.h`. Customize `tools/build_tokenizer.py`'s
-   special-token list for your model and run it to produce
-   `src-cpu/tokenizer.bin`.
+1. Create `src-cpu/`. Copy the drop-in starters wholesale:
+   ```
+   utils/{bf16.h, jsmn.h, json.{c,h}, utf8.{c,h}, bytebuf.{c,h}, iofile.{c,h}}
+   safetensors.{c,h}
+   tokenizer.{c,h}
+   build_tokenizer.c
+   tests/load_ref.h
+   ```
+   These contain no model knowledge — only the tokenizer's pre-tokenizer
+   regex may need swapping later (see "Common pitfalls").
 
-2. Author `<chattmpl>.{c,h}` (e.g., `harmony.{c,h}`) that builds the
-   prompt token sequence. **Tip**: have the Python reference output the
-   numeric token IDs it produces for the same `(system, user, reasoning)`
-   tuple, and write the C builder to match byte-for-byte. Add a small
-   test that compares C and Python token sequences.
+2. Build and run the C tokenizer-bin generator on your model's
+   `tokenizer.json`:
+   ```
+   make tokenizer MODEL_DIR=/path/to/model
+   ```
+   This produces `src-cpu/tokenizer.bin` (a compact, mmap'd blob the
+   runtime tokenizer reads). For **byte-level BPE** tokenizers (Qwen,
+   Llama 3, GPT-2, gpt-oss/o200k) `build_tokenizer.c` is drop-in. For
+   sentencepiece-based families, rewrite `decode_vocab_key`.
 
-3. Author `main.c` from `main.c.template`:
+3. Author `<chattmpl>.{c,h}` (e.g., `harmony.{c,h}`, `qwen_chat.{c,h}`,
+   `llama3_chat.{c,h}`) that builds the prompt token sequence. **Tip**:
+   have the Python reference output the numeric token IDs it produces
+   for the same `(system, user, reasoning)` tuple, and write the C
+   builder to match byte-for-byte. Add a small test that compares C and
+   Python token sequences.
+
+4. Author `main.c` from `main.c.template`:
    - argparse `--prompt`, `--system`, `--max-tokens`, `--model`
-   - Load `config.json` into a `cfg_t` struct
+   - Load `config.json` via `json_open_file` + `json_get` + `json_int_or`
+     (the template handles multi-modal `text_config` nesting in one line)
    - Open safetensors archive
    - Load tokenizer; build prompt; print prompt_ids
    - Stub `forward()` that just returns argmax of a zero vector
    - Stub AR loop
 
-4. Author `Makefile` from `Makefile.template` (replace `<BIN>` with
+5. Author `Makefile` from `Makefile.template` (replace `<BIN>` with
    your chosen executable name from Inputs). Build and run:
    ```
-   make
+   make MODEL_DIR=/path/to/model
    ./<BIN> --prompt "Hello" --max-tokens 1 --model /path/to/model
    ```
    **Smoke-test checklist** (all must pass before moving to Phase 3):
@@ -248,7 +302,7 @@ Templates (read, then customize):
          the same `(system, user)`.
    - [ ] No segfault.
 
-5. **Commit**: `src-cpu: scaffold loader + tokenizer + CLI`.
+6. **Commit**: `src-cpu: scaffold loader + tokenizer + CLI`.
 
 ### Phase 3: Build the Python oracle
 
@@ -366,7 +420,7 @@ void linear_bf16(const bf16* X, const bf16* W, const bf16* B,
 **Style guidelines**:
 - One layer of nested loops per logical tensor index.
 - fp32 accumulator for any reduction.
-- Use `bf16_to_f32` / `f32_to_bf16` (in `bf16.h`); do not introduce
+- Use `bf16_to_f32` / `f32_to_bf16` (in `utils/bf16.h`); do not introduce
   arch-specific intrinsics.
 - Don't try to be clever. The Metal port will rearrange this anyway.
 
@@ -452,6 +506,46 @@ chain dumps later: layer 0 input → layer 0 output → layer 1 input → ...
 When all boxes are ticked, the skill is done.
 
 ## Tips
+
+### The `utils/` library — Python-stdlib equivalents in C
+
+The starter `utils/` directory exists because four different C files in
+the project (`safetensors.c`, `tokenizer.c`, `build_tokenizer.c`,
+`main.c::load_config`) all need to do the same four things:
+
+1. read a file by name (`open` / `fstat` / `mmap` / `close`),
+2. grow a byte buffer and write it back out (`bytearray` + `struct.pack`),
+3. parse + navigate a JSON document, and
+4. encode / decode UTF-8 codepoints.
+
+If every caller does these by hand you get four subtly different mini-
+parsers (the substring-search JSON walker bites you on multi-modal
+configs; the manual mmap dance gets the error path wrong; the BPE byte
+encoder reinvents UTF-8). Centralising them is a one-time ~700-LOC
+investment that the rest of `src-cpu/` reads as if it were Python:
+
+```c
+// "with open(path) as f: cfg = json.load(f)" + "cfg['text_config']['rope_theta']"
+json_doc_t* doc = json_open_file(path, &err);
+double theta = json_double_or(
+    json_path(json_root(doc), "text_config.rope_parameters.rope_theta"), 1e4);
+
+// "buf = bytearray(); buf += MAGIC; buf += struct.pack('<I', n); open(out,'wb').write(buf)"
+bytebuf_t out = BYTEBUF_INIT;
+bb_append    (&out, MAGIC, MAGIC_LEN);
+bb_append_u32(&out, n);
+bb_write_file(&out, out_path);
+
+// "with open(path,'rb') as f: data = mmap.mmap(f.fileno(), 0, mmap.PROT_READ)"
+iofile_t f;
+iofile_mmap_ro(path, &f, &err);
+// ... f.data, f.size ...
+iofile_close(&f);
+```
+
+Treat `utils/` as a fixed dependency of the project. Do *not* leak any
+model-specific knowledge into it: that's how you keep the port to a new
+model from being a fork of the whole tree.
 
 ### Choosing kernel boundaries
 
@@ -691,13 +785,21 @@ nested object:
 ```
 
 If you grep flatly for `num_hidden_layers` you'll get the wrong block.
-Implement a scoped JSON walker that descends into `text_config` first.
-The starter `main.c.template` shows the pattern (`find_section` +
-`find_key_in_section`).
+With the starter `utils/json.h` this is just:
 
-Some models also place the architecture-defining keys (e.g.,
-`rope_parameters`, `quantization`) at multiple levels of nesting.
-Always confirm by `print(json.load(open('config.json')))` first.
+```c
+json_doc_t* doc = json_open_file(path, &err);
+json_val_t  root = json_root(doc);
+json_val_t  lm   = json_get(root, "text_config");
+if (json_is_null(lm)) lm = root;       // text-only model
+
+int n_layers = (int)json_int_or(json_get(lm, "num_hidden_layers"), 32);
+float theta  = (float)json_double_or(
+    json_path(lm, "rope_parameters.rope_theta"), 10000.0);
+```
+
+`json_get` short-circuits safely through missing keys, so chained
+accesses on absent paths yield the default rather than crashing.
 
 ### Tolerance setting for bf16
 
@@ -739,14 +841,15 @@ the *tolerance*, not the kernel.
   the denominator of the softmax).
 - **bf16 round-to-nearest-even**: naive `(x >> 16)` truncation will
   cause systematic small errors. Use round-to-nearest-even (see
-  `bf16.h`).
+  `utils/bf16.h`).
 - **RoPE yarn scaling**: yarn has an extra `mscale` multiplier on top of
   the rotation — easy to miss. Match the reference exactly.
 - **RoPE freq formula**: `inv_freqs[k] = 1 / (base ** (2k / D))` for
   `k ∈ [0, D/2)`. With `partial_rotary_factor < 1.0` use `D = D_rot =
   head_dim * partial_rotary_factor`, NOT `head_dim`.
 - **Tokenizer special tokens**: HF `tokenizer.json` has special tokens in
-  `added_tokens` — make sure `build_tokenizer.py` includes them.
+  `added_tokens` — make sure `build_tokenizer.c` includes them (the
+  starter does this automatically from the JSON).
 - **Tokenizer `MAGIC` length**: the C reader expects 12 bytes; if the
   Python writes only 11 you'll silently load garbage. The fixed
   template now writes 12.
@@ -791,6 +894,21 @@ the *tolerance*, not the kernel.
 - **`-Wall -Wextra` clean**: hidden bugs love to live in `int`/`size_t`
   width mismatches and missing-prototype warnings. Get a clean build
   before declaring a kernel "validated".
+- **JSON parsing performance**: if you use `jsmn` (the starter does, in
+  `utils/json.c`), **define `JSMN_PARENT_LINKS` before including it**.
+  Without it, jsmn back-walks the entire token array on every `,` inside
+  an object — O(N²) on container size. For a 250k-entry
+  `tokenizer.json::model.vocab` that's ~40 s of pure overhead;
+  with `JSMN_PARENT_LINKS` defined it drops to ~40 ms (1000× speedup).
+  The cost is 4 extra bytes per token (~2 MB extra for the vocab).
+- **Centralize JSON, don't re-invent it per caller**: it's tempting to
+  write a one-off "good enough" substring-search JSON walker every time
+  (`strstr` for the key, `strchr` for `:`, `atoi`). This breaks for any
+  nested object with duplicate key names (every multi-modal config) and
+  for any key whose value contains a literal `:`. Build one JSON reader
+  (the starter's `utils/json` is ~500 LOC) and route everything through
+  it — `safetensors.c` shard headers, `config.json`, `tokenizer.json`,
+  and any future model registry files.
 
 ## Commit strategy
 
@@ -810,14 +928,17 @@ boundaries when porting and roll back surgically if anything regresses.
 
 The hand-off contract:
 
-1. `./src-cpu/` exists and builds with `make src-cpu`.
-2. `./src-cpu/<BIN> --prompt "<validation_prompt>" --max-tokens N`
-   produces the same N tokens as the Python reference.
+1. `./src-cpu/` exists and builds with `make` (no Python in the inference
+   build path — only `tools/dump_ref.py` for regenerating the oracle).
+2. `./<BIN> --prompt "<validation_prompt>" --max-tokens N` produces the
+   same N tokens as the Python reference.
 3. Every kernel is a plain C function in `kernels.{c,h}` with clear
    pointer-arity inputs / outputs.
 4. `src-cpu/refs/` contains per-op oracle dumps usable by the Metal
    port for kernel correctness tests.
-5. Tokenizer and chat-template are model-agnostic infrastructure that the
-   Metal port can copy/symlink rather than re-author.
+5. The `src-cpu/utils/` library (json, jsmn, utf8, bytebuf, iofile, bf16),
+   the tokenizer + tokenizer-bin builder, the safetensors reader, and the
+   per-kernel test harness are model-agnostic infrastructure the Metal
+   port can copy / symlink rather than re-author.
 
 When this contract is met, run the `port-c-to-metal` skill.

@@ -1,21 +1,11 @@
-// Tiktoken-style BPE tokenizer for o200k_harmony.
+// Byte-level BPE tokenizer (HF-style: GPT-2 byte-to-unicode + ranked merges).
 //
-// The encoding algorithm (`bpe_byte_pair_merge`) is a direct port of
-// openai/harmony's src/tiktoken.rs::_byte_pair_merge.  The pre-tokenizer
-// implements the o200k_harmony regex pattern (ASCII subset — sufficient for
-// the harmony chat template and English prompts):
-//
-//   1. [^\r\n\p{L}\p{N}]?[\p{Lu}...]*[\p{Ll}...]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-//   2. [^\r\n\p{L}\p{N}]?[\p{Lu}...]+[\p{Ll}...]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-//   3. \p{N}{1,3}
-//   4.  ?[^\s\p{L}\p{N}]+[\r\n/]*
-//   5. \s*[\r\n]+
-//   6. \s+(?!\S)
-//   7. \s+
-//
-// For ASCII input \p{L} = [A-Za-z] and \p{N} = [0-9].  Non-ASCII bytes
-// (>= 0x80) are treated as "other" (rule 4 territory) which is benign for
-// our use case (the entire harmony scaffolding is ASCII).
+// The encoding algorithm (`bpe_byte_pair_merge`) is a direct port of the
+// classical rank-priority BPE merger used by HF `tokenizers`, openai's
+// tiktoken, and friends. The **pre-tokenizer** rules differ per family —
+// see tokenizer.c for the alternation order. The default template ships
+// with an ASCII subset of the Qwen 3.5 / Llama 3 regex; swap for your
+// model as needed (gpt-oss/o200k_harmony, Mistral, ...).
 
 #ifndef TOKENIZER_H
 #define TOKENIZER_H
@@ -40,8 +30,8 @@ int tk_encode_ordinary(const tokenizer_t* tk,
                        const char* text, size_t n_bytes,
                        int* out_ids, int max_ids);
 
-// Look up the id of a special token by its surface form (e.g. "<|start|>").
-// Returns -1 if not found.
+// Look up the id of a special token by its surface form (e.g. "<|im_start|>",
+// "<|start|>", "<s>", "<|begin_of_text|>"). Returns -1 if not found.
 int tk_special(const tokenizer_t* tk, const char* name);
 
 // Decode a sequence of ids into raw bytes (no UTF-8 validation).  Returns

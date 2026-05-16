@@ -13,7 +13,7 @@
 
 #include "../kernels.h"
 #include "../safetensors.h"
-#include "../bf16.h"
+#include "../utils/bf16.h"
 #include "load_ref.h"
 
 #include <math.h>

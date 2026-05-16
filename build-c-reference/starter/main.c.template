@@ -14,6 +14,7 @@
 #include "safetensors.h"
 #include "tokenizer.h"
 #include "<chattmpl>.h"     // [MODEL] chat-template builder (e.g., harmony.h)
+#include "utils/json.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -40,54 +41,37 @@ typedef struct {
     float swiglu_limit;
 } cfg_t;
 
-static int parse_json_int(const char* json, const char* key);
-static float parse_json_float(const char* json, const char* key);
-
 static void load_config(const char* model_dir, cfg_t* c) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/config.json", model_dir);
-    FILE* f = fopen(path, "rb");
-    if (!f) { perror(path); exit(1); }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char* j = malloc((size_t)n + 1);
-    fread(j, 1, (size_t)n, f);
-    j[n] = '\0';
-    fclose(f);
 
-    // [MODEL] adjust keys to match your config.json schema.
-    c->n_layers   = parse_json_int(j, "num_hidden_layers");
-    c->hidden     = parse_json_int(j, "hidden_size");
-    c->n_qheads   = parse_json_int(j, "num_attention_heads");
-    c->n_kvheads  = parse_json_int(j, "num_key_value_heads");
-    c->head_dim   = parse_json_int(j, "head_dim");
-    c->inter      = parse_json_int(j, "intermediate_size");
-    c->n_experts  = parse_json_int(j, "num_local_experts");
-    c->k_top      = parse_json_int(j, "num_experts_per_tok");
-    c->vocab      = parse_json_int(j, "vocab_size");
-    c->window     = parse_json_int(j, "sliding_window");
-    c->max_ctx    = 1024;
-    c->rms_eps    = 1e-5f;            // [MODEL] check config
+    char* err = NULL;
+    json_doc_t* doc = json_open_file(path, &err);
+    if (!doc) { fprintf(stderr, "config: %s\n", err); exit(1); }
+    json_val_t root = json_root(doc);
+
+    // [MODEL] Multi-modal wrappers nest the LM dims inside `text_config`.
+    // For text-only models pass `root` instead.
+    json_val_t lm = json_get(root, "text_config");
+    if (json_is_null(lm)) lm = root;
+
+    // [MODEL] Adjust key names + defaults to match your config.json schema.
+    c->n_layers   = (int)json_int_or(json_get(lm, "num_hidden_layers"), 32);
+    c->hidden     = (int)json_int_or(json_get(lm, "hidden_size"), 4096);
+    c->n_qheads   = (int)json_int_or(json_get(lm, "num_attention_heads"), 32);
+    c->n_kvheads  = (int)json_int_or(json_get(lm, "num_key_value_heads"), 8);
+    c->head_dim   = (int)json_int_or(json_get(lm, "head_dim"), c->hidden / c->n_qheads);
+    c->inter      = (int)json_int_or(json_get(lm, "intermediate_size"), 14336);
+    c->n_experts  = (int)json_int_or(json_get(lm, "num_local_experts"), 0);
+    c->k_top      = (int)json_int_or(json_get(lm, "num_experts_per_tok"), 0);
+    c->vocab      = (int)json_int_or(json_get(lm, "vocab_size"), 128256);
+    c->window     = (int)json_int_or(json_get(lm, "sliding_window"), 0);
+    c->rms_eps    = (float)json_double_or(json_get(lm, "rms_norm_eps"), 1e-5);
     c->swiglu_alpha = 1.702f;          // [MODEL] gpt-oss-style
     c->swiglu_limit = 7.0f;            // [MODEL] gpt-oss-style
-    free(j);
-}
+    c->max_ctx    = 1024;
 
-// Minimal JSON value extractors (good enough for HF config.json).
-static int parse_json_int(const char* j, const char* key) {
-    char needle[128]; snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char* p = strstr(j, needle);
-    if (!p) { fprintf(stderr, "config: missing key %s\n", key); exit(1); }
-    p = strchr(p, ':'); if (!p) exit(1);
-    return atoi(p + 1);
-}
-static float parse_json_float(const char* j, const char* key) {
-    char needle[128]; snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char* p = strstr(j, needle);
-    if (!p) return 0.0f;
-    p = strchr(p, ':'); if (!p) return 0.0f;
-    return (float)atof(p + 1);
+    json_close(doc);
 }
 
 // ---- Globals: weights archive, tokenizer, workspace -----------------------
