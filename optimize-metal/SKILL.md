@@ -306,6 +306,34 @@ API gives you the residency budget.
 
 **Original commit**: 6361113.
 
+#### A9. Parallel pread weight loader — beats mmap+memcpy 2.5–3×
+
+**What**: At startup, weights are read from disk into MTLBuffers.
+The naive "mmap shard + memcpy per tensor" is **page-fault bound** on
+macOS (the VM lock serializes faults at ~1 GB/s, even with parallel
+threads). The fix is to skip mmap for the bulk copy entirely and use
+**parallel `pread()` per shard**:
+
+1. Pre-allocate one MTLBuffer per tensor (serial — alloc isn't
+   guaranteed thread-safe).
+2. Bucket tensors by `shard_idx`, preserving order so each shard's
+   reads are sequential on disk.
+3. `dispatch_apply(n_shards)`: each iteration opens one fd and
+   `pread`s its tensors directly into the matching MTLBuffer's host
+   pointer (`gpu_buf_contents`).
+
+Also: **delete any `madvise(MADV_WILLNEED)` calls** — on macOS that's
+blocking, adding ~5s for 35 GB (see GOTCHA #28).
+
+**When**: From the very first port — startup is the most user-visible
+"wait" and it's trivial to fix.
+
+**Speedup**: 28.5s → 5s startup (Qwen3.6-35B, M4 Max, 8 shards). This
+**beats MLX's** ParallelFileReader on the same machine. See GOTCHAS
+#28, #29.
+
+**Snippet**: `patterns/load_parallel_pread.c`
+
 ---
 
 ### B. GEMV optimization — for decode-time Linear layers
@@ -750,6 +778,7 @@ patterns/
 ├── topk_parallel_router.metal              <-- F2 worked example
 ├── sdpa_multi_sg_online_merge.metal        <-- D3 worked example
 ├── parallel_independent_chains.md          <-- A8 (END-GAME WIN)
+├── load_parallel_pread.c                   <-- A9 (startup beats MLX)
 └── decode_prefill_split.md
 ```
 

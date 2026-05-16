@@ -408,3 +408,79 @@ when to commit. The naive port (one commit_wait at end of forward())
 caps decode at the ~110-tok/s ceiling determined by per-cmdbuf
 overhead — even if your kernels are infinitely fast.
 
+
+# 28. macOS madvise(MADV_WILLNEED) is BLOCKING — never use it on big files
+
+On Linux, `madvise(addr, len, MADV_WILLNEED)` is a hint: the kernel
+prefetches pages asynchronously. On macOS it is **synchronous** — the
+call does not return until the entire range has been read into the
+page cache. For a 35 GB safetensors archive this is ~5s of pure
+"loading" with no progress feedback.
+
+**Symptom**: `st_open` (or equivalent header-scan function) takes
+inexplicably long. Profile breakdown reveals it's the madvise call.
+
+**Fix**: Just delete the call. The actual page-ins should happen during
+your weight-copy step instead, where you can parallelize them.
+
+# 29. mmap + memcpy is page-fault-bound at ~1 GB/s — use parallel pread instead
+
+The naive port loads weights as: `mmap(shard)` → `memcpy(dst, mmap_ptr,
+nbytes)` per tensor. This is fast on first inspection because mmap is
+zero-cost. But the **memcpy triggers page faults**, and on macOS the
+fault handler serializes on VM locks. Even with `dispatch_apply` to
+parallelize across tensors, you get ~4 GB/s aggregate.
+
+**Fix**: skip mmap for the bulk copy entirely. Use parallel
+`pread()`:
+
+  1. Keep the shard JSON header parse via mmap (it's tiny).
+  2. For the bulk data, open ONE fd per shard.
+  3. `dispatch_apply` over `n_shards` (e.g., 8): each iteration
+     sequentially `pread`s its shard's tensors directly into the
+     preallocated MTLBuffers.
+
+This matches MLX's `ParallelFileReader` strategy (4 worker threads,
+32 MB chunks). On M4 Max with 8 shards it hits ~10 GB/s — a 2.5×
+speedup, and brings startup time to **below MLX's**.
+
+**Pattern**: `patterns/load_parallel_pread.c`
+
+**Measurement** (35 GB Qwen3.6 model, M4 Max, warm cache):
+  - mmap + single-threaded memcpy + madvise: 5s (madvise) + 5s (copy) = 10s
+  - mmap + dispatch_apply(per-tensor) memcpy:  8s
+  - parallel pread per shard:                   3.5s   ← winner
+
+# 30. First Metal cmdbuf pays ~1s residency wiring per ~30 GB of buffers
+
+The very first cmdbuf submitted to Metal that references a large
+working set of MTLBuffers blocks for ~1s before the GPU starts work.
+`gpuStartTime - committedTime` is the wait; actual GPU execution time
+(`gpuEndTime - gpuStartTime`) is much smaller. This is Metal's
+residency / wiring of the buffers into the GPU address space, paid
+exactly once.
+
+**Symptom**: `prefill: 1.5s (16 tokens; 11 tok/s; gpu_busy=0.08s)` —
+huge gap between wall time and gpu_busy.
+
+**Quantification**: ~1s per ~30 GB resident, scales roughly linearly
+with the number of distinct MTLBuffers (2090 in our case).
+
+**Workaround attempts that did NOT work**:
+- Trivial argmax-only warmup cmdbuf: ineffective because it only
+  wires the 2 buffers it references; the rest still pay on the real
+  cmdbuf.
+- Full forward(Lq=1) warmup cmdbuf: works (shifts the 1.4s out of
+  prefill into "warmup"), but TOTAL wall time is unchanged.
+- Run warmup forward(Lq=1) CONCURRENTLY with parallel pread copy:
+  fails because the CPU pread writes to wired buffers, and Metal
+  appears to invalidate residency on concurrent CPU writes, so the
+  subsequent real prefill re-pays the residency cost.
+
+**Workable mitigation**: do the full forward(Lq=1) warmup AFTER copy
+finishes. It shifts the 1.4s out of the user-visible "prefill" phase
+(time-to-first-token) but does not reduce total wall time. Only use
+this if TTFT matters more than total time.
+
+**Conclusion**: this is a fixed cost. Beating MLX on total wall time
+comes from saving I/O time, not from removing this 1s.
