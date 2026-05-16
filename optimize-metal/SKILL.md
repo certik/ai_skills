@@ -254,6 +254,32 @@ Independent ops (q_proj/k_proj/v_proj or gate/up) may overlap.
 
 **Original commit**: d08def0.
 
+#### A8. Parallel independent computation chains (END-GAME WIN)
+
+**What**: With concurrent encoder enabled (A5), look for SUBGRAPHS that
+share only an input buffer and merge only at a single fan-in. Two
+independent chains (e.g., MoE main vs shared-expert in Qwen MoE
+models, or gate vs up projection trees) can run **fully concurrently**
+when you drop ALL barriers between them and re-add barriers only at
+true fan-in points.
+
+This is qualitatively different from A5: A5 overlaps pairs of
+neighboring independent dispatches; A8 interleaves entire chains so
+they execute as parallel pipelines.
+
+**When**: Late-stage optimization, when you're at ~95% of MLX and
+kernel-level techniques are exhausted. Required signal: `gpu_busy ≈
+wall` (you ARE GPU-bound) AND your encoder graph shows two subgraphs
+sharing only the input.
+
+**Speedup**: 1.03–1.05× decode (the gap to MLX parity in Qwen3.6:
+66.9 → 69.5 tok/s).
+
+**Snippet**: `patterns/parallel_independent_chains.md`
+
+**Original commit**: d813cf5 (Qwen3.6-35B-A3B: parallel MoE + shared
+expert chains, MLX parity in 1 commit).
+
 #### A6. JIT-compile each kernel from source
 
 **What**: Apple's `MTLLibrary newLibraryWithSource:` JIT-compiles MSL.
@@ -471,10 +497,11 @@ busy per head.
 
 **Speedup**: 1.05–2.0× decode (cd2ec6b +5%, 11b7562 +96%, 2d59eed +3%).
 
-**Snippet**: `patterns/sdpa_multi_sg.metal`
+**Snippet**: `patterns/sdpa_multi_sg_online_merge.metal`
 
 **Original commits**: 11b7562 (1.96× decode), cd2ec6b (4 SGs/head),
-2d59eed (32 SGs + transpose-merge).
+2d59eed (32 SGs + transpose-merge), b2c8736 (Qwen3.6 N_SG=4 + online
+merge, 52 → 65 tok/s).
 
 #### D4. Sliding-window / rotating fixed-size KV cache
 
@@ -587,10 +614,23 @@ argmax shows up as a fat slice in the profile.
 
 **Original commit**: e34bf80.
 
-#### F2. Parallel topk_softmax
+#### F2. Parallel topk_softmax (router)
 
-Same idea for the router topk_softmax over N_EXPERTS=32 (smaller, so
-less urgent, but still worth it for prefill).
+**What**: SIMD-group-per-row router softmax + top-K. Each lane holds
+E/SIMD logits in registers; one simd_max for softmax; K iterations of
+(simd_max, simd_min tie-break, simd_broadcast winner) to extract top-K
+without any threadgroup memory or barriers.
+
+**When**: As soon as decode is mid-pipeline and softmax_topk shows up
+in KPROF. The naive 1-thread-per-row softmax_topk over even just E=32
+experts costs >100 µs/token of dispatch+serial work.
+
+**Speedup**: 1.10–1.25× decode on Qwen3.6-35B-A3B (41.5 → 52.0 tok/s).
+Bigger for larger E or K.
+
+**Snippet**: `patterns/topk_parallel_router.metal`
+
+**Original commit**: 2177f38 (Qwen3.6 parallel top-K, +25%).
 
 ---
 
@@ -707,6 +747,9 @@ patterns/
 ├── argmax_parallel.metal
 ├── glue_kernels_no_host_break.metal        <-- H1 (often biggest win)
 ├── recurrent_state_sg_per_row.metal        <-- I1 for SSM/RNN
+├── topk_parallel_router.metal              <-- F2 worked example
+├── sdpa_multi_sg_online_merge.metal        <-- D3 worked example
+├── parallel_independent_chains.md          <-- A8 (END-GAME WIN)
 └── decode_prefill_split.md
 ```
 
@@ -766,16 +809,40 @@ on M4 Max, with the same patterns from gpt-oss work):
    single biggest jump in the whole pipeline. Often 1.5–2×.
 7. **Merge embed + forward + argmax into one cmdbuf** (H2). Small win.
 8. **2-deep cmdbuf pipeline with id-swap** (A4 variant). Closes the
-   last CPU-encode gap to MLX.
+   first CPU-encode gap to MLX.
 
-This sequence took Qwen3.6-35B-A3B on M4 Max from 1.9 → 43.6 tok/s
-decode, matching MLX (40–48 tok/s) on the same prompt.
+The above sequence took Qwen3.6-35B-A3B from 1.9 → ~43 tok/s.
+
+For the LAST 5-10% to MLX parity, you need:
+
+9. **Parallel top-K** (F2 generalized) — same trick as parallel argmax
+   but applied to router top-K over N_EXPERTS=32-128. Use simd_max +
+   tie-break simd_min for K iterations, all in registers.
+10. **Multi-SG SDPA with online-softmax merge** (D3). Once D1+D2 are
+    in, splitting each (lq, hq) across N_SG=4 SIMD groups + merging
+    per-SG (m_i, s_i, o_i) via the online-softmax formula is the
+    decode SDPA endgame.
+11. **TG=(1,1,1) → (32,1,1) bump** for all elemwise/glue kernels (see
+    GOTCHA #17). Free win.
+12. **Drop barriers between independent ops** (subset of A5): e.g.,
+    q_norm/k_norm, rope Q/K, rmsnorm_scale q/k, sigmoid+compute_g.
+13. **Fuse residual into LAST linear epilogue** (B5) — o_proj,
+    out_proj, shared_combine_add. Drops dispatches.
+14. **PARALLEL INDEPENDENT CHAINS** (A8). Restructure your encoder so
+    multi-kernel subgraphs (e.g., MoE chain vs shared-expert chain in
+    Qwen MoE) run as parallel pipelines, not in series. Final 3-5%
+    to MLX parity — usually the BIGGEST single late-stage commit.
+
+Steps 9-14 took Qwen3.6-35B-A3B from 41.5 → 69.5 tok/s, hitting MLX
+parity (70.1 tok/s) on M4 Max.
 
 Optimizations that *should* help but landed in the noise band on this
 model (don't skip but don't expect miracles):
 - bfloat4 vector loads in isolation (baked into B1 already).
-- qmv4 K_OUT=4 register tile.
-- Concurrent encoder.
+- qmv4 K_OUT=4 register tile (q8 dequant is bandwidth-bound, not
+  register-bound; K_OUT=8 actually regressed).
+- Concurrent encoder ALONE without barrier surgery (most barriers
+  already needed, A8 is where the big win lives).
 
 Optimizations to skip in this order for decode-only goals:
 - C1/C2/C3 (GEMM MMA for prefill) — only relevant if your goal is to

@@ -200,3 +200,88 @@ is going to OVERWRITE the same buffer before the CPU has time to
 fread it. Use two buffers, with step at slot s writing to
 id_io_buf[1-s], so the CPU read of id_io_buf[1-s] (the buffer cb[k]
 wrote) is safe because cb[k+1] is writing to id_io_buf[s] instead.
+
+# 17. Tiny TG sizes — (1,1,1) wastes 31/32 of every SIMD group
+
+dispatchThreads:(N, 1, 1) threadsPerThreadgroup:(1, 1, 1) puts one
+thread per TG. Metal allocates an entire SIMD group (32 lanes) per
+TG regardless. Result: 31/32 lanes idle, ~32x dispatch overhead for
+nothing.
+
+Symptom in KPROF: a kernel that should take <2 us (e.g. residual_add,
+silu_inplace, sigmoid, qkv_split) reports ~25 us/call.
+
+Fix: bump tg_x to 32, ensure the kernel has a `if (i >= N) return;`
+bounds check (most port-c-to-metal naive kernels already do).
+
+```
+gpu_cmdbuf_dispatch(cb, pso, args, n_args,
+                    (size_t)N, 1, 1,         // total threads
+                    32, 1, 1);               // 32-thread TG, not 1!
+```
+
+Real measured impact on Qwen3.6 (M4 Max, batch of ~15 small kernels):
++1 tok/s overall (65.9 → 66.0). Small but free.
+
+# 18. concurrent encoder + no_bar = YOU own hazard tracking
+
+`computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent` means
+Metal does NOT auto-serialize dispatches. The shim's
+`gpu_cmdbuf_dispatch` (no_bar) lets the next dispatch start
+immediately. If there's a data hazard you didn't account for, you get
+non-deterministic garbage that often "passes" on small N because the
+race resolved lucky.
+
+Rule: use `dispatch_bar` after any kernel whose output is read by
+the next kernel. Use plain `dispatch` only when you've verified
+no_hazard (different buffers, or same buffer but disjoint regions).
+
+Test: after changing barriers, ALWAYS re-run `--max-tokens 16` and
+verify the exact token-id sequence matches a known-good run. If it
+diverges, you have a missing barrier.
+
+# 19. Critical-path concurrency > kernel speedups in late optimization
+
+Once individual kernels are ~bandwidth-saturated (linear_q8 at 25us
+for K=N=2880 is reading ~11MB of weights at ~430 GB/s — within 7%
+of M4 Max's peak), making the kernel "faster" buys nothing. The only
+remaining wins are:
+
+  (a) Reducing the critical path (fuse dispatches that produce X→consume X)
+  (b) Removing barriers between independent chains so they run in
+      parallel (see parallel_independent_chains.md)
+
+For Qwen3.6-35B-A3B at >65 tok/s, ALL further wins came from category (b).
+None from kernel-internal optimization.
+
+# 20. KPROF total > wall time means concurrent encoder is actually working
+
+`KPROF` mode wraps each dispatch in its own cmdbuf with commit+wait,
+serializing everything. KPROF total time = serialized GPU work.
+
+Real run wall ≪ KPROF total ⇒ concurrent encoder is overlapping work.
+For decode at n=210 we measured:
+  - KPROF total: 22.2 ms/tok
+  - Real wall: 14.4 ms/tok
+  - Overlap factor: 35%
+
+If KPROF total ≈ wall, your concurrent encoder ISN'T overlapping;
+suspect missing barrier-removal opportunities, not slow kernels.
+
+# 21. Fuse residual into the LAST linear, not into a separate kernel
+
+The classic B5 pattern (residual into o_proj/out_proj epilogue):
+the catalog says +3-5%. In our q8 case it was +0.5%. Why? Because
+residual_add at TG=(32,1,1) was already overlapping with the
+subsequent rmsnorm via the concurrent encoder, so the dispatch
+"cost" was mostly hidden.
+
+The fusion is still WORTH doing because:
+  1. It eliminates a launch-overhead dispatch
+  2. It keeps the bf16 round point identical to what an "in-fused"
+     reference produces (helps token agreement for longer N)
+  3. It composes well with later concurrency restructuring
+
+But don't expect huge numbers when concurrent encoder is on; the win
+shows up cumulatively, not per-fusion.
+
