@@ -1,22 +1,17 @@
 ---
 name: optimize-metal
 description: >
-  Optimize a working but naive Apple-GPU Metal LLM implementation
-  (produced by the port-c-to-metal skill, living in ./src-metal/) to match
-  the speed of the MLX reference (within ±5%). Applies a named catalog
-  of Metal-specific optimization techniques: SIMD-group-per-output GEMV,
-  bfloat4 vector loads, qmv4 register tiling, simdgroup_matrix MMA for
-  prefill, sorted-gather MoE for prefill, online-softmax SDPA, multi-SG
-  parallel SDPA, parallel argmax, 2-deep command-buffer pipeline,
-  persistent + const param buffers, concurrent encoder with explicit
-  barriers, fused residual epilogues, separate decode/prefill kernel
-  paths, MXFP4 dequant-in-register, JIT-compiled metallib, GPU "glue"
-  kernels for host-side breaks (often the biggest single decode win),
-  SG-per-(state_row, state_dim) for RNN/SSM recurrences. After each
-  change validates end-to-end tokens against the previous commit and
-  the C reference; rolls back on regressions. Triggers: optimize
-  metal, speed up metal, match mlx speed, gpu optimization, metal
-  performance, kernel tuning.
+  Optimize a working but naive Apple-GPU Metal LLM implementation (from
+  the port-c-to-metal skill, in ./src-metal/) to match MLX speed within
+  ±5%. Catalog: SIMD-group-per-output GEMV, bfloat4 loads, qmv4 register
+  tiling, simdgroup_matrix MMA for prefill, sorted-gather MoE, online-
+  softmax SDPA, multi-SG SDPA, parallel argmax, 2-deep cmdbuf pipeline,
+  persistent + const param buffers, concurrent encoder, fused residual
+  epilogues, decode/prefill split, GPU glue kernels for host-side
+  breaks (often the biggest single decode win), SG-per-(row,dim) for
+  RNN/SSM recurrences. Validates tokens against the C reference after
+  each change. Triggers: optimize metal, speed up metal, match mlx
+  speed, gpu optimization, metal performance, kernel tuning.
 ---
 
 # optimize-metal — make the Metal port fast (match MLX ±5%)
