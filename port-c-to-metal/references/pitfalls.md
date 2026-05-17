@@ -134,6 +134,63 @@ Apple Metal allows fairly large per-thread arrays. This is simpler
 than threadgroup or global scratch buffers — `optimize-metal` will
 replace it with online softmax later.
 
+## Shared inline helpers across `.metal` files
+
+**Symptoms**
+- MSL compile fails with `redefinition of 'bf16_roundtrip'` (or
+  similar) — usually at the second occurrence of the helper in the
+  concatenated source.
+- Or: header parses but `bfloat` is not found (`expected unqualified-id`
+  / `unknown type name 'bfloat'`) when the header is included from a
+  kernel.
+
+**Why**
+
+`kernel_concat.c` concatenates every `kernels/*.metal` file into ONE
+MSL source string before JIT compile. It deduplicates `#include` lines
+*by path*, but it does NOT dedupe arbitrary code. So if you paste the
+same inline helper function into 4 different `.metal` files, the MSL
+compiler sees 4 definitions and errors.
+
+For the same reason, the `bfloat` type lives in the `metal::`
+namespace. Each `.metal` file pulls it in with `using namespace metal;`
+after `#include <metal_stdlib>`. A bare header that just defines
+`inline bfloat bf16_roundtrip(bfloat x) { ... }` without `using
+namespace metal;` cannot name the type.
+
+**Fix**
+
+Put shared helpers in `kernels/_bf16_helpers.metalh` (the underscore
+prefix is a convention to flag "not a kernel"). Inside the header,
+include `<metal_stdlib>` and do `using namespace metal;` once, so the
+helper can name `bfloat` directly:
+
+```metal
+// kernels/_bf16_helpers.metalh
+#pragma once
+#include <metal_stdlib>
+using namespace metal;
+
+inline bfloat bf16_roundtrip(bfloat x) { return bfloat(float(x)); }
+```
+
+Then every kernel that needs it does:
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+#include "_bf16_helpers.metalh"
+```
+
+Because `kernel_concat` dedupes by include path, the helper appears
+once in the final MSL string. Use the *same* relative path in every
+include — absolute and relative paths to the same file are NOT
+deduped.
+
+This pattern is common: many kernels (rmsnorm, rope, sdpa, silu_mul)
+need a `bf16_roundtrip` helper to mirror C-reference `f32_to_bf16 ->
+bf16_to_f32` round-trips at the same boundaries.
+
 ## bfloat type name
 
 Older Metal versions (pre-3) lack native `bfloat`. If your Xcode is

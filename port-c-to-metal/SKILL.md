@@ -93,7 +93,9 @@ are creating a moving target.
 │   ├── rope.metal
 │   ├── sdpa.metal
 │   ├── ...
-│   └── argmax.metal
+│   ├── argmax.metal
+│   └── _bf16_helpers.metalh  # OPTIONAL: shared inline helpers (bf16_roundtrip etc.)
+│                             # see references/pitfalls.md "Shared inline helpers"
 ├── safetensors.{c,h}       # symlink or copy from src-cpu
 ├── tokenizer.{c,h}         # symlink or copy from src-cpu
 ├── tokenizer.bin           # symlink or copy
@@ -166,6 +168,16 @@ Customize:
        x[id] += 1;
    }
    ```
+
+   If you find yourself wanting the same inline helper (e.g. a
+   `bf16_roundtrip` function mirroring `f32_to_bf16(bf16_to_f32(x))`)
+   in two or more kernels, put it in a single `_bf16_helpers.metalh`
+   and `#include` it. `kernel_concat.c` dedupes includes by path, so
+   the helper appears once in the concatenated MSL source. Inlining
+   the same helper into multiple `.metal` files causes "redefinition"
+   errors at MSL compile time — see `references/pitfalls.md` for
+   details (including the `using namespace metal;` gotcha for the
+   header itself).
 
 4. Author `tests/test_shim.c` that **compiles every `.metal` file you
    plan to write AND looks up every named kernel function**, in addition

@@ -20,6 +20,42 @@ write-after-read hazard across threads.
 `optimize-metal` can later replace the host shift with a dedicated
 kernel + barrier.
 
+## Block-diffusion KV cache (Fast-dLLM-style)
+
+Diffusion LMs with block-local KV caching (e.g. Fast-dLLM's
+`DualKVCache` — append for prefetch, slice-replace inside the active
+block) port very cleanly with the same compute-on-GPU /
+update-state-on-host split as conv1d:
+
+1. Allocate one Metal buffer per layer for K and per layer for V via
+   `gpu_buf_new(ctx, n_layers * 2 * max_L * Nkv * D * sizeof(bfloat))`,
+   or one buffer per (layer, K|V) — either works.
+2. For each layer in `forward_cached()`:
+   - **Phase A cmdbuf**: rmsnorm → q/k/v projections → RoPE on Q and
+     fresh K. `commit_wait`.
+   - Host-side `memcpy` of fresh K and V into the per-layer cache
+     buffer at the right offset (append mode: `cache->offset`;
+     slice-replace: `eff_pos`). Mirrors `kv_cache_write_layer` from
+     `src-cpu/cache.c`.
+   - **Phase B cmdbuf**: SDPA against the *full* `Lk` slice of the
+     cache → o_proj → residual → rmsnorm → MLP → residual.
+     `commit_wait`.
+3. Bookkeeping (`cache->offset += Lq` for append; nothing for
+   replace) happens in host C code in the outer loop, *not* via a
+   kernel.
+
+Cost: `2 * n_layers` commit_waits per block-local forward. Slow
+(GPU under-utilised), but trivially correct. `optimize-metal` will
+fuse this into one cmdbuf per forward with a GPU-side "write to
+cache" kernel and an SDPA that reads K/V directly without the host
+round-trip.
+
+**`Lk` must be captured before the per-layer loop**, not re-read
+each iteration — once you start writing into the cache, `offset`
+advances, but every layer's SDPA needs the same `Lk` (computed once
+as `replace ? offset : (eff_pos + Lq)`). Same gotcha as `src-cpu`'s
+`forward_cached`; just mirror its `Lk` capture.
+
 ## Host-side scalar broadcasts
 
 For one-off ops that don't decompose cleanly into a kernel — e.g.
@@ -27,6 +63,41 @@ For one-off ops that don't decompose cleanly into a kernel — e.g.
 host-side intermediates" — just commit_wait, do them on the host with
 `gpu_buf_contents(...)`, and open a fresh cmdbuf. Naive is fine; the
 optimisation skill will reshape these as broadcast kernels.
+
+## Diffusion / non-AR samplers stay on host
+
+For diffusion LMs (no per-token loop; one forward fills many mask
+positions at once), the **entire sampler** can stay on CPU in the
+naive port — only the model forward runs on GPU:
+
+- `forward()` ends with `commit_wait` and produces `logits_buf` in
+  shared (unified) memory.
+- The C-reference sampler logic — `softmax_fp32`, `argmax_bf16`,
+  `neg_entropy_fp32`, topk-by-confidence, confidence-threshold
+  fill, "shift logits left by 1" — all reads `gpu_buf_contents(
+  logits_buf)` and runs in plain C99 on the host.
+- Same code as `src-cpu/main.c`'s sampler; no need to port these to
+  MSL.
+
+Argmax over the vocab (152k for Qwen2.5, 200k for GPT-OSS) takes
+about a millisecond on host — well under the model forward time. If
+the sampler turns out to be a hot spot later, `optimize-metal` will
+move it to GPU.
+
+## Mask-count / per-step trajectory drift is OK
+
+For confidence-threshold samplers (Fast-dLLM-style), GPU and CPU may
+report slightly different per-step `n_changed` trajectories
+(e.g. CPU `15 → 9 → 5 → 4 → 3 → 2 → 1 → 0` vs GPU `15 → 10 → 5 → 4
+→ 3 → 2 → 1 → 0`) because fp32 reductions reorder differently on
+the GPU. The final emitted tokens still match exactly, because the
+threshold-plus-force-fill logic is robust to small softmax noise.
+
+This is the strongest single argument for the skill's "token
+equivalence, not per-step trace equivalence" acceptance criterion.
+If you've matched the C reference's tokens but the printed
+trajectory differs slightly, you're done — don't chase the
+trajectory.
 
 ## MoE down_proj reshape trick
 

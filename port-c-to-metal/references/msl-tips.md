@@ -23,6 +23,19 @@ stage they only obscure bugs.
 - For trivially-sequential reductions (e.g. argmax over the whole vocab),
   a single-thread kernel (`if (i != 0u) return;`) is fine. `optimize-metal`
   will parallelise.
+- One kernel can serve bias and no-bias call sites. Linear projections
+  in transformers are usually a mix: e.g. Qwen2-family has bias on
+  `q/k/v` but no bias on `o_proj`, `gate/up/down`, `lm_head`. Rather
+  than two kernels (`linear_bias` / `linear_nobias`), add a `uint
+  has_bias` field to your `linear_params` struct and a `bias`
+  `device const bfloat*` buffer slot. At the no-bias call sites, pass
+  a single shared **zero-bias buffer** (one `gpu_buf_new` of size
+  `max_N * sizeof(bfloat)`, zero-initialised once at startup) and set
+  `has_bias = 0`. The kernel does `float b = p.has_bias ? float(B[n])
+  : 0.0f;`. One kernel, all eight call sites in a typical dense
+  transformer. `optimize-metal` may later split the kernel for
+  micro-perf, but for correctness this is clean and avoids
+  duplicating the body.
 
 `starter/rmsnorm.metal.template` and `starter/linear_naive.metal.template`
 are worked examples of this style.
