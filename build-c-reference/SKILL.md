@@ -225,7 +225,7 @@ The **template** files are starting points you customize per model:
 4. Identify model-specific details by reading the reference and asking
    the user when unclear:
    - **Precision-reduction format**: bf16? f16? MXFP4 (e2m1+e8m0)? FP8?
-     Per-channel scales? Group size? → `references/quantization.md`
+     Per-channel scales? Group size? → `references/precision-reduction.md`
    - **RoPE flavor**: standard? llama-style? yarn? long-rope? →
      `references/architectures.md`
    - **Attention variant**: MHA / GQA / MQA; sliding window every N
@@ -429,7 +429,7 @@ void linear_bf16(const bf16* X, const bf16* W, const bf16* B,
 - Don't try to be clever. The Metal port will rearrange this anyway.
 
 For reduced-precision linears (MXFP4, MLX affine) see
-`references/quantization.md`.
+`references/precision-reduction.md`.
 
 For **per-element bf16 round-trips that mirror the reference's hidden
 `.to(dtype)` casts** — the most common source of small numerical
@@ -614,7 +614,7 @@ Deep dives are kept in `references/`. Read them on demand:
 |---|---|
 | `references/precision-and-tolerance.md` | Writing or debugging any kernel; per-kernel test fails by 1–4 ULPs; choosing tolerance; argmax-stability acceptance; deciding on `-ffast-math`. |
 | `references/architectures.md` | Phase 1 reconnaissance on non-vanilla architectures; implementing GQA / sinks / sliding window / partial RoPE / q,k_norm / output gate / MoE / shared expert / SSM (Mamba / GatedDeltaNet / RWKV) / bidirectional attention. |
-| `references/quantization.md` | The reference uses MXFP4 (gpt-oss) or MLX-style affine 4-bit / 8-bit precision reduction. |
+| `references/precision-reduction.md` | The reference uses MXFP4 (gpt-oss) or MLX-style affine 4-bit / 8-bit precision reduction. |
 | `references/samplers.md` | Phase 5 driver loops; discrete-diffusion / masked LM samplers; Fast-dLLM-style block diffusion with DualKVCache; supporting multiple samplers in the same binary. |
 | `references/mlx-gotchas.md` | The reference is MLX (no `forward_hook`; `mx.eval`; `sanitize`; `cast_predicate`; `quant_predicate`; `mx.fast.rope`). |
 | `references/pytorch-gotchas.md` | The reference is PyTorch / HF (FLASH vs MATH SDPA; AutoModel wrappers; `num_logits_to_keep`; `trust_remote_code`; multi-modal `config.json`). |
