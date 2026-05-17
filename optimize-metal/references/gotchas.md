@@ -46,6 +46,7 @@ the same symptoms again.
 | 36 | Per-step CPU sampler work is invisible to `gpu_busy` — track host_post | Profiling |
 | 37 | `gpu_buf_contents()` is zero-copy but per-step CPU reads still hit caches | Sampler perf |
 | 38 | Two M shapes → two PSOs with different (BM, BK); pad workspaces to max BM | GEMM tuning |
+| 39 | Aspect-ratio routing: K > N matmuls need MORE TGs (use the smaller BM)    | GEMM tuning |
 
 ---
 
@@ -691,3 +692,72 @@ or corrupted neighbouring data. The smaller tile (BM=16) needs
 This won us ~5–8% on Dream-7B refine on top of the dual-tile dispatch.
 The cost is one extra PSO compile at startup and one extra weight
 buffer view (no copy — same backing store).
+
+# 39. Aspect-ratio routing: K > N matmuls need MORE TGs (use the smaller BM)
+
+Extends #38. Even within a single M shape, two matmuls of *identical
+matrix size* can have wildly different bandwidth efficiency depending
+on (K, N) aspect ratio. The same BM=32 BN=64 tile that's optimal for
+N >> K shapes (gate_proj, lm_head, etc.) can leave 30%+ on the floor
+for K >> N shapes (down_proj is the textbook case in any LLaMA-style
+MLP: H=3584 hidden ↔ I=18944 intermediate).
+
+In Dream-7B BL=32 refine, KPROF attributed 38.5% of refine GPU time
+to a SINGLE kernel — down_proj. Same kernel as gate_proj (BM=32 BN=64
+WM=1 WN=2), same total matrix size (3584×18944×2 = 135 MB W), but:
+
+  gate_proj (K=3584, N=18944):  430us/call,  ~314 GB/s effective
+  down_proj (K=18944, N=3584): 1082us/call,  ~125 GB/s effective
+
+**Root cause**: TG count is N/BN tiles per M-band. With BM=32 and
+BN=64, that's:
+  gate_proj: N/BN = 18944/64 = **296 TGs** (well above GPU capacity →
+             plenty of in-flight memory ops → bandwidth fills)
+  down_proj: N/BN = 3584/64  =  **56 TGs** (below M4 Max's ~80 TG-slot
+             capacity → outstanding loads starve → bandwidth collapses)
+
+The W matrix doesn't fit in L2 either way, so the W traffic IS the
+bottleneck. More TGs in flight means more memory requests in flight
+means more bandwidth used.
+
+**Fix**: at dispatch time, route K > N shapes to the SMALLER BM kernel.
+This doubles M-bands from 1 to 2 (for M=32), doubling TG count from
+56 to 112 — enough to fill the memory subsystem:
+
+```c
+// In d_linear_full_off (or wherever you pick a PSO by M):
+//   normally:  pso = (M > 16) ? pso_gemm_bm32 : pso_gemm;
+// becomes:
+int use_bm32 = (M > 16) && (K <= N);  // K > N → use BM=16 even at M>16
+const uint32_t BM = use_bm32 ? 32u : 16u;
+gpu_pipeline* pso = use_bm32 ? pso_gemm_bm32 : pso_gemm;
+```
+
+The "double the W reads from DRAM" downside of going BM=16 is real
+(2 M-bands × 135 MB = 270 MB streamed instead of 1 × 135 MB), BUT
+the bandwidth gain dominates because at the smaller-BM occupancy
+W reads HIT 350+ GB/s effective. Concretely on Dream-7B BL=32:
+  before: down_proj 1082us, refine 73ms, wall 1.72s
+  after:  down_proj  741us, refine 63ms, wall 1.52s
+
+That's **12% wall improvement from a single-line dispatch change**.
+
+**How to spot**: when KPROF shows one matmul taking >2× longer than
+another of the same matrix size, check (K, N): the larger-K one is
+almost certainly under-occupied at BM=32. The trigger condition is
+simply `K > N` for the K > N matmul, OR equivalently `N < N_tiles_min × BN`
+where `N_tiles_min` is what you need to saturate the GPU. For M4 Max
+~80 TG slots at WM*WN=2 SGs per TG → `N_tiles_min ≈ 80`. So at BN=64
+this is N < 5120; at BN=32 it's N < 2560.
+
+**Don't generalize "smaller BM is always better"**: for the typical
+N >> K case, BM=32 IS the right choice — its lower per-row W-streaming
+cost outweighs the parallelism loss because N is already big enough
+to fill the GPU. The rule is "use smaller BM only when N alone can't
+fill the GPU".
+
+Generalizes to any model: any K > N MLP down_proj (or attention
+o_proj when the head_dim×num_heads is smaller than hidden) is a
+candidate. Always KPROF the candidate matmuls and check effective
+bandwidth = (matrix_bytes / per_call_time) against your device peak.
+If you're below 60% of peak on a single matmul, you're TG-starved.

@@ -21,7 +21,7 @@ each section the entries are roughly in the order you'd apply them.
 
 - [A. Host-side scheduling](#a-host-side-scheduling) — cmdbuf batching, param ring, pipeline, concurrent encoder, parallel weight loader
 - [B. GEMV (decode Linear)](#b-gemv--decode-time-linear-layers) — simdgroup-per-output, bfloat4, qmv4 register tile, TG-mem X share, residual epilogue
-- [C. GEMM (prefill Linear)](#c-gemm--prefill-time-linear-layers) — simdgroup_matrix MMA, tile sweep, fused-op templates
+- [C. GEMM (prefill Linear)](#c-gemm--prefill-time-linear-layers) — simdgroup_matrix MMA, tile sweep, fused-op templates, aspect-ratio dispatch
 - [D. SDPA](#d-sdpa--attention) — parallel softmax, online softmax, multi-SG, sliding KV
 - [E. MoE](#e-moe--typically-the-biggest-bottleneck) — decode qmv4, fused gate_up_swiglu, prefill sorted-gather, fused combine_scatter
 - [F. Reductions](#f-reductions--small-but-pesky-kernels) — parallel argmax, parallel topk softmax, per-row softmax+argmax (diffusion samplers)
@@ -391,6 +391,47 @@ kernel void gemm_bf16(...) { /* if (DO_ADD) y += residual; */ }
 **When**: When you start fusing prefill epilogues.
 
 **Commit**: 4e3bb14.
+
+### C4. Aspect-ratio dispatch — route K > N matmuls to the SMALLER BM
+
+**What**: Within a single M shape, route by (K, N) aspect ratio.
+The same BM=32 BN=64 tile that's optimal for `N ≥ N_min` shapes
+under-occupies the GPU when `N < N_min`. For Dream-7B's down_proj
+(K=18944, N=3584) at BM=32 BN=64, you get only N/BN = 56 TGs — below
+M4 Max's ~80 TG-slot capacity — and effective bandwidth collapses
+to 125 GB/s vs 314 GB/s on gate_proj of the same matrix size.
+
+```c
+// d_linear dispatcher with aspect-ratio routing:
+int use_bm32 = (M > 16) && (K <= N);    // K > N → BM=16 even at M>16
+const uint32_t BM = use_bm32 ? 32u : 16u;
+gpu_pipeline* pso = use_bm32 ? pso_gemm_bm32 : pso_gemm;
+```
+
+The trigger condition: `N < N_tiles_min × BN` where `N_tiles_min` is
+what you need to fill GPU SG-slots. For M4 Max ~80 TG slots at
+WM×WN = 2 SGs/TG, that's N ≲ 5120 at BN=64. Going BM=16 doubles
+M-bands and so doubles TG count (56 → 112), restoring memory-level
+parallelism. Yes, this also doubles W bytes read from DRAM (the
+M-band W stream is repeated), but at the higher TG count effective
+bandwidth recovers to 350+ GB/s and the net wall time DROPS.
+
+**When**: After C1+C2. KPROF any matmul that takes >2× longer than
+another of the same total matrix size — the slow one is almost
+certainly K >> N and TG-starved.
+
+**Speedup**: 12% wall on Dream-7B BL=32 refine (1.72s → 1.52s) from
+a single-line dispatch change. The matmul itself dropped from
+1082us to 741us (-31%). Generalizes to any LLaMA-style MLP
+down_proj where the intermediate dimension I is large enough that
+K = I makes (M > 16 → BM=32) under-occupy.
+
+**Don't generalize "smaller BM always wins"**: the N >> K cases
+(gate_proj, lm_head, qkv when num_heads × head_dim >> hidden) are
+already well-occupied at BM=32 and would slow down at BM=16. The
+rule is *use smaller BM only when N alone can't fill the GPU*.
+
+**Commit**: see Dream-7B `src-metal/main.c` `d_linear_full_off`.
 
 ---
 

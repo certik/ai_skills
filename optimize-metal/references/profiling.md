@@ -105,6 +105,41 @@ Spend the KPROF effort only if your profile genuinely surprises you.
 
 See `references/gotchas.md` #20 and #23 for the full story.
 
+### KPROF as a TG-starvation detector
+
+After getting the per-kernel breakdown, compute **effective bandwidth**
+for each large matmul:
+
+```
+eff_bw[k] = (W_bytes[k] + X_bytes[k] + Y_bytes[k]) / per_call_time[k]
+```
+
+For weight-bound shapes (typical at decode/refine), `W_bytes` dominates.
+Compare each matmul's `eff_bw` against your device's peak (M4 Max:
+~410 GB/s; M2 Max: ~400 GB/s; M1 Max: ~400 GB/s; M3 Max: ~300 GB/s).
+
+- **eff_bw > 60% of peak**: matmul is bandwidth-saturated; no easy
+  kernel-internal win. Move on.
+- **eff_bw < 40% of peak**: matmul is TG-starved or has a register/
+  occupancy issue. Check `TG_count = N/BN × ceil(M/BM)`:
+  - If TG_count < ~80 (M4 Max SG-slot capacity / WM·WN SGs per TG),
+    you don't have enough TGs in flight. Apply **catalog C4 (aspect-
+    ratio dispatch)**: route to a smaller BM to double M-bands and
+    therefore TGs. See gotcha #39.
+  - If TG_count ≥ 80 but eff_bw is still low, the issue is per-TG —
+    register spill, bad load pattern, or compute-bound (rare).
+
+Concrete diagnostic from Dream-7B BL=32 refine (KPROF output):
+
+```
+gate_proj  K=3584  N=18944  per_call=430us  W=135MB → 314 GB/s (77% peak)  ← fine
+down_proj  K=18944 N=3584   per_call=1082us W=135MB → 125 GB/s (30% peak)  ← TG-starved
+```
+
+Same matrix size, 2.5× different bandwidth. The slow one had only
+N/BN = 56 TGs vs the fast one's 296. A one-line dispatch change (C4)
+closed the gap.
+
 ## Measuring tok/s — match MLX exactly
 
 Use `mlx_lm`-equivalent timing so you can compare apples to apples
@@ -116,6 +151,32 @@ tps = (n_gen - 1) / decode_time      // exclude the FIRST decoded token
 
 The first decoded token is the prefill argmax; including it inflates
 your tok/s number AND distorts decode-only measurements.
+
+### Watch out: MLX's `tok/s` denominator is `max_new_tokens`, not `actual_emitted`
+
+For diffusion-LLM benches in particular, MLX's example scripts compute
+`tps = args.max_new_tokens / elapsed` — i.e., the DENOMINATOR is the
+slot budget, not the number of tokens actually emitted before EOS. If
+your port instead reports `tps = actual_gen / elapsed` (the natural
+metric for an autoregressive decoder), you'll see a HUGE apparent
+ratio when EOS hits early:
+
+```
+MLX  bench:   1.58s, ~20.3 tok/s on 32 slots  ← 32 / 1.58
+Yours bench:  1.72s, 9.3 tok/s wall            ← 16 actual / 1.72
+```
+
+That's 2.2× on tok/s but only 9% on wall — a metric mismatch, not
+a real perf gap. Before chasing what looks like a 2× regression,
+recompute both with the same denominator:
+
+```
+MLX  (slot):   32 / 1.58s = 20.3 tok/s
+Yours (slot):  32 / 1.72s = 18.6 tok/s   ← actual 8% gap, not 2×
+```
+
+For real comparisons, always **report wall-time directly** in addition
+to whatever tok/s convention your code uses. Wall is unambiguous.
 
 ### Run length and best-of-N
 

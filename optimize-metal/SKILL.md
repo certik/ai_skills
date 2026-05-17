@@ -247,13 +247,21 @@ don't help at all. The wins, in order:
 4. **C2 BK=16** — unroll two K-bands per loop iter in the BM=16 GEMM.
    Doesn't fit BM=32 (TM=4 doubles the A register footprint).
 5. **B5 fused residual** — same as for autoregressive, modest win.
+6. **C4 aspect-ratio dispatch (BL ≥ 32 only)** — extend C2 with
+   `use_bm32 = (M > 16) && (K <= N)`. The MLP down_proj (K=I, N=H,
+   I >> H) is the only K > N matmul; at BM=32 BN=64 it has too few
+   N-tiles to fill the GPU, collapsing effective bandwidth. Routing
+   it to BM=16 doubles TG count. In our Dream-7B BL=32 port: down_proj
+   1082us → 741us, wall 1.72 s → 1.52 s (12% win, beats MLX 1.56 s).
 
 Skip A4 (no usable overlap — refine step N+1's ids depend on step N's
 argmax). Skip A8 (the forward chain is mostly serial — Q/K/V→SDPA→o→
 gate/up→down — with very little independent work to interleave).
 
 See `references/diffusion-llm.md` for the full worked Dream-7B example
-(naive ~3.04 s → 2.63 s, beating MLX's 2.74 s by 4%).
+(naive ~3.04 s → 2.63 s on the long bench, beating MLX's 2.74 s by 4%;
+and on the BL=32 short bench, 1.72 s → 1.52 s, beating MLX's 1.56 s
+by 3%).
 
 ## The optimization catalog
 
@@ -358,6 +366,13 @@ optimization:
   (M=BL) differ by 4–5×, compile two GEMM PSOs with different
   `(BM, BK)` and switch at dispatch by `M > 16`. Pad workspace buffers
   to the larger `BM`. (gotcha #38)
+- **K > N matmuls are TG-starved at BM=32.** A LLaMA-style MLP
+  down_proj (K=I, N=H with I >> H) at BM=32 BN=64 produces only N/BN
+  TGs — often well below the GPU's TG-slot capacity, collapsing
+  effective bandwidth to ~30% of peak. Extend the dual-tile dispatch
+  with `use_bm32 = (M > 16) && (K <= N)` so K > N shapes route to the
+  smaller BM and double their TG count. 12% wall win on Dream-7B BL=32
+  refine from a single-line change. (gotcha #39, catalog C4)
 
 ## Commit strategy
 

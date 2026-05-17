@@ -164,6 +164,31 @@ rope_Q/rope_K are independent, cache_write_K/cache_write_V are
 independent. Wrap each independent group in a `gpu_cmdbuf_barrier`
 fence.
 
+### Step 6 (BL ≥ 32 only): Aspect-ratio dispatch for down_proj (C4)
+
+At small BL (e.g., 16) the refine M is ≤16 and everything routes to
+the BM=16 path, so this step is a no-op. At BL ≥ 32 refine starts
+hitting `M > 16` and the dual-tile dispatch (Step 3) sends EVERYTHING
+to BM=32. That's right for gate_proj, up_proj, qkv, o_proj, lm_head —
+all of which have `N ≥ K`. It's WRONG for down_proj.
+
+down_proj has `K = I = 18944, N = H = 3584` — the only LLaMA-style MLP
+matmul with K > N. At BM=32 BN=64 you get N/BN = 56 TGs, which on
+M4 Max (~80 TG slots) leaves the memory subsystem starved (measured
+125 GB/s effective vs gate_proj's 314 GB/s on the SAME matrix size).
+
+Fix: extend the dual-tile dispatch with an aspect-ratio check.
+
+```c
+int use_bm32 = (M > 16) && (K <= N);   // K > N → BM=16 even at M>16
+gpu_pipeline* pso = use_bm32 ? pso_gemm_bm32 : pso_gemm;
+```
+
+On Dream-7B BL=32 this drops down_proj from 1082us → 741us per call
+(-31%), refine from 73ms → 63ms per step, and wall from **1.72 s →
+1.52 s (12% faster, beats MLX 1.56 s)**. See gotcha #39 and catalog
+C4 for the full analysis.
+
 ## End-to-end validation
 
 Diffusion LLMs are particularly easy to validate because the entire
@@ -189,3 +214,29 @@ tokens" rule is essentially "all generated tokens" here.
 
 Final: 4% faster than MLX (`2.63 s` vs `2.74 s`). F3 alone closed half
 the remaining gap.
+
+### Follow-up: BL=32 with max_tokens=32, where down_proj dominates
+
+A second, shorter benchmark (`max-new-tokens=32 --steps=24 --block-length=32`)
+exposed a different bottleneck — **down_proj alone took 38.5% of refine
+GPU time** because at BM=32 BN=64 it produced only 56 TGs (vs gate_proj's
+296), under-occupying the GPU's memory subsystem.
+
+| Stage                                            | Wall (s) | Notes                            |
+|--------------------------------------------------|----------|----------------------------------|
+| All optimizations above (≤ Step 5)               | 1.72     | refine 73 ms/step, down_proj 1082 us/call (125 GB/s) |
+| **After C4 (down_proj K>N → BM=16 routing)**     | **1.52** | refine 63 ms/step, down_proj 741 us/call (-31%) |
+| MLX target                                       | 1.56     | —                                |
+
+Final on this bench: **3% faster than MLX** (1.52 s vs 1.56 s),
+single-line dispatch change. This is the lesson that prompted gotcha
+#39 / catalog C4 and made aspect-ratio routing a permanent step in
+the recipe (Step 6 above).
+
+**Diagnostic note**: this win would have stayed hidden without KPROF.
+The wall gap to MLX was only ~10% (not 2×, despite a misleading `tok/s`
+ratio in the surface output — see "Profiling diffusion runs" above),
+and the bottleneck wasn't one of the usual suspects. Always KPROF
+before optimizing past the empirical attack order; per-kernel attribution
+is what makes "this matmul is twice as slow as the matmul of the same
+size" visible.
