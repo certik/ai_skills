@@ -8,7 +8,7 @@
 // How to use:
 //   1. cp src-metal/main.c.template src-metal/main.c
 //   2. Replace `<chattmpl>`, `<MODEL_NAME>`, and the placeholder paths /
-//      tensor name prefixes for your model. Search the file for "PLACEHOLDER".
+//      array name prefixes for your model. Search the file for "PLACEHOLDER".
 //   3. Add or remove `d_*` dispatch helpers + per-layer dispatches in
 //      forward() to match the C reference's forward() exactly.
 //   4. Adjust `cfg_t` / load_config() for any model-specific fields.
@@ -85,9 +85,9 @@ static gpu_pipeline *pso_embed, *pso_rmsnorm, *pso_linear, *pso_rope,
                     *pso_sdpa,  *pso_kv_write, *pso_silu_mul,
                     *pso_residual, *pso_argmax;
 
-// One Metal buffer per safetensors tensor, indexed by (t - st_at(arch, 0)).
-// Per-tensor buffers guarantee offset=0 / natural alignment at every
-// dispatch — see references/pitfalls.md ("Per-tensor offset alignment").
+// One Metal buffer per safetensors array (tensor), indexed by (t - st_at(arch, 0)).
+// Per-array buffers guarantee offset=0 / natural alignment at every
+// dispatch — see references/pitfalls.md ("Per-array offset alignment").
 static gpu_buf** g_tensor_bufs;
 static size_t    g_tensor_count;
 
@@ -139,7 +139,7 @@ static gpu_buf* tensor_buf(const char* name) {
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     size_t idx = (size_t)(t - st_at(g_arch, 0));
     if (g_tensor_bufs[idx]) return g_tensor_bufs[idx];
-    // Per-tensor copy (NOT wrap_nocopy). See references/pitfalls.md.
+    // Per-array copy (NOT wrap_nocopy). See references/pitfalls.md.
     g_tensor_bufs[idx] = gpu_buf_new_from(g_ctx, t->data, t->nbytes);
     if (!g_tensor_bufs[idx]) {
         fprintf(stderr, "gpu_buf_new_from %s failed\n", name); exit(1);
@@ -151,7 +151,7 @@ static void cache_weights(void) {
     g_tensor_count = st_count(g_arch);
     g_tensor_bufs  = (gpu_buf**)calloc(g_tensor_count, sizeof(gpu_buf*));
 
-    // PLACEHOLDER: adjust tensor name prefix ("model." here) for your weights.
+    // PLACEHOLDER: adjust array name prefix ("model." here) for your weights.
     g_embed_w      = tensor_buf("model.embed_tokens.weight");
     g_final_norm_w = tensor_buf("model.norm.weight");
     g_lm_head_w    = tensor_buf("lm_head.weight");
@@ -448,7 +448,7 @@ int main(int argc, char** argv) {
     PSO(pso_argmax,   "argmax_bf16");
     #undef PSO
 
-    // ---- weights (per-tensor Metal buffers — see references/pitfalls.md) ----
+    // ---- weights (per-array Metal buffers — see references/pitfalls.md) ----
     fprintf(stderr, "loading weights from %s ...\n", model_dir);
     g_arch = st_open(model_dir, &err);
     if (!g_arch) { fprintf(stderr, "weights: %s\n", err); return 1; }

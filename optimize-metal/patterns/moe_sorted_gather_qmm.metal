@@ -1,9 +1,9 @@
 // patterns/moe_sorted_gather_qmm.metal
 //
-// WHAT: The MMA quantized GEMM that the sorted-gather MoE prefill path
-//       (E3) calls. After bucketize → flatten → gather_x_sorted (see
-//       moe_sorted_gather_glue.metal), THIS kernel does the dense
-//       quantized matmul:
+// WHAT: The MMA reduced-precision (quantized) GEMM that the
+//       sorted-gather MoE prefill path (E3) calls. After bucketize →
+//       flatten → gather_x_sorted (see moe_sorted_gather_glue.metal),
+//       THIS kernel does the dense reduced-precision matmul:
 //
 //           y[m, n] = sum_k x[m, k] * W[indices[m], n, k]
 //
@@ -40,11 +40,11 @@
 
 #include "mlx_steel/fp_quantized_lite.h"
 
-// Sorted-gather quantized matmul.
+// Sorted-gather reduced-precision matmul.
 //   y[m, n] = sum_k x[m,k] * W[indices[m], n, k]
 //
 // x       — dense [M, K], rows already sorted by expert (gather output)
-// w       — quantized [E, N, K_blocks] of fp4 (2 vals/byte)
+// w       — reduced-precision [E, N, K_blocks] of fp4 (2 vals/byte)
 // scales  — e8m0 [E, N, K_blocks] (one scale per 32-element block)
 // indices — dense [M], expert id per row
 // y       — output [M, N] (bias applied in a separate epilogue kernel)

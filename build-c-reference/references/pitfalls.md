@@ -53,9 +53,9 @@ sources of "kernel-passes-but-tokens-don't-match" surprises.
 - **`safetensors.c` `__metadata__` key**: `__metadata__` is 12 chars,
   not 11. The fixed template has this corrected.
 - **Skipping vision tower / MTP heads**: multi-modal and
-  "multi-token-prediction" checkpoints have many unused tensors. The
-  Python reference's `sanitize` drops them; the C side may have to
-  walk the archive but ignore them. Filter by name prefix
+  "multi-token-prediction" checkpoints have many unused arrays
+  (tensors). The Python reference's `sanitize` drops them; the C side
+  may have to walk the archive but ignore them. Filter by name prefix
   (`vision_tower.`, `mtp.`, etc.). → `mlx-gotchas.md`
 - **`sanitize` adds `+1.0` to RMSNorm weights**: some `sanitize` paths
   shift all RMSNorm weights by +1 when MTP weights are present in the
@@ -106,7 +106,7 @@ sources of "kernel-passes-but-tokens-don't-match" surprises.
 ## Sampler-specific (Fast-dLLM-style block diffusion)
 
 - **Within-block vs full-sequence logit shift**: the shift is
-  **always relative to the actual logits tensor's row indexing**, not
+  **always relative to the actual logits array's row indexing**, not
   relative to absolute sequence position. → `samplers.md`
 - **`shift_rows_down1` must iterate backwards** so you don't clobber
   `row[i-1]` before reading it. → `samplers.md`

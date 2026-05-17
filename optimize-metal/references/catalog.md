@@ -181,17 +181,17 @@ MLX parity in 1 commit).
 ### A9. Parallel pread weight loader — beats mmap+memcpy 2.5–3×
 
 **What**: At startup, weights are read from disk into MTLBuffers.
-The naive "mmap shard + memcpy per tensor" is **page-fault bound** on
-macOS (the VM lock serializes faults at ~1 GB/s, even with parallel
-threads). The fix is to skip mmap for the bulk copy entirely and use
-**parallel `pread()` per shard**:
+The naive "mmap shard + memcpy per array (tensor)" is **page-fault
+bound** on macOS (the VM lock serializes faults at ~1 GB/s, even with
+parallel threads). The fix is to skip mmap for the bulk copy entirely
+and use **parallel `pread()` per shard**:
 
-1. Pre-allocate one MTLBuffer per tensor (serial — alloc isn't
+1. Pre-allocate one MTLBuffer per array (serial — alloc isn't
    guaranteed thread-safe).
-2. Bucket tensors by `shard_idx`, preserving order so each shard's
+2. Bucket arrays by `shard_idx`, preserving order so each shard's
    reads are sequential on disk.
 3. `dispatch_apply(n_shards)`: each iteration opens one fd and
-   `pread`s its tensors directly into the matching MTLBuffer's host
+   `pread`s its arrays directly into the matching MTLBuffer's host
    pointer (`gpu_buf_contents`).
 
 Also: **delete any `madvise(MADV_WILLNEED)` calls** — on macOS that's
@@ -510,12 +510,13 @@ math.
 
 Two completely different paths for decode (`Lq=1`) and prefill (`Lq>1`).
 
-### E1. Decode MoE: qmv4 (register-tile) on quantized weights
+### E1. Decode MoE: qmv4 (register-tile) on reduced-precision (quantized) weights
 
-**What**: Same as B3 but applied to the MXFP4 (or whatever quant) MoE
-GEMV. Each SG computes K outputs from the same X, dequantizing K-blocks
-inline as you go. The K_TOP active experts are gathered per token; only
-those K_TOP × N rows of weights are touched.
+**What**: Same as B3 but applied to the MXFP4 (or whatever
+precision-reduction format) MoE GEMV. Each SG computes K outputs from
+the same X, dequantizing K-blocks inline as you go. The K_TOP active
+experts are gathered per token; only those K_TOP × N rows of weights
+are touched.
 
 **When**: First MoE optimization for decode.
 
@@ -546,14 +547,14 @@ as separate buffers).
 ### E3. Prefill MoE: sorted-gather grouped GEMM
 
 **What**: For `Lq > 1`, bucketing tokens by expert lets you run **one
-dense quantized GEMM per expert** (no per-row gather inside the inner
-loop). The flow is:
+dense reduced-precision GEMM per expert** (no per-row gather inside the
+inner loop). The flow is:
 
 1. `expert_bucketize` — scatter `(token_idx, kt)` into per-expert lists
 2. `moe_flatten_buckets` — prefix-sum, sorted flat lists, reverse map
 3. `moe_gather_x_sorted` — gather X rows into expert-sorted layout
-4. `qmm_t_gather_rhs_*` (× 2: gate_up, down) — one MMA quantized GEMM
-   per layer covering all experts
+4. `qmm_t_gather_rhs_*` (× 2: gate_up, down) — one MMA reduced-precision
+   GEMM per layer covering all experts
 5. `moe_swiglu_epilogue` — clamp + sigmoid + (u+1) SwiGLU
 6. `moe_combine_scatter` — weighted sum + residual, scatter back
 
@@ -565,7 +566,7 @@ src-metal at first wire-up, more with MMA).
 
 **Snippets**: `patterns/moe_sorted_gather_glue.metal` (the 4–5 small
 glue kernels) + `patterns/moe_sorted_gather_qmm.metal` (the MMA
-quantized GEMM).
+reduced-precision GEMM).
 
 **Commits**: 1c4ddfd (264→348 +32%), 37ad895 (348→363, M_GROUP),
 51ced6b (sorted-gather MMA wire +24%), 7691d2f (mlx-cpp 387→608),

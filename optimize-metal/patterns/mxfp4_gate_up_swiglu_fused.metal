@@ -6,10 +6,11 @@
 //       separate buffers (`gate`, `up`) and runs a third SwiGLU
 //       dispatch over them.
 //
-// WHEN: Decode path for MoE models with quantized expert weights
-//       (gpt-oss MXFP4, similar quantization schemes). Apply after
-//       the basic mxfp4 qmv4 decode kernel (E1) so you're amortising
-//       the same expert-gather, not adding a new code path.
+// WHEN: Decode path for MoE models with reduced-precision (quantized)
+//       expert weights (gpt-oss MXFP4, similar precision-reduction
+//       schemes). Apply after the basic mxfp4 qmv4 decode kernel (E1)
+//       so you're amortising the same expert-gather, not adding a new
+//       code path.
 //
 // SPEEDUP: 1.05–1.10× decode. Saves 2 dispatches × N_LAYERS per
 //          token AND a full pass over `gate` and `up` buffers (which

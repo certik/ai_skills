@@ -1,7 +1,7 @@
 // load_parallel_pread.c
 //
 // WHAT: Parallel safetensors weight loader. One pread() worker per shard
-//       reads tensors directly into preallocated MTLBuffers.
+//       reads arrays (tensors) directly into preallocated MTLBuffers.
 //
 // WHEN: From the very first port. Single-threaded mmap+memcpy caps at
 //       ~6 GB/s on macOS due to page-fault serialization (see GOTCHAS
@@ -14,15 +14,15 @@
 // REQUIREMENTS:
 //   - Your safetensors header has a list of (tensor_name, dtype, shape,
 //     file_offset, nbytes, shard_idx) entries. The file_offset is the
-//     byte offset within the shard file of the tensor data.
-//   - Per-tensor MTLBuffer (no shard-wide zero-copy attempts — tensors
+//     byte offset within the shard file of the array data.
+//   - Per-array MTLBuffer (no shard-wide zero-copy attempts — arrays
 //     are typically not 16KB-page-aligned within the shard file).
 //   - macOS / libdispatch (built into Xcode SDK).
 //
 // PITFALLS:
 //   - Do NOT call madvise(MADV_WILLNEED) on macOS — it blocks
 //     synchronously paging in the entire file. Just skip it.
-//   - Do NOT try to mmap+memcpy with dispatch_apply over tensors;
+//   - Do NOT try to mmap+memcpy with dispatch_apply over arrays;
 //     macOS page-fault handler serializes on a VM lock at ~1 GB/s
 //     per thread, and adding more workers does not help.
 //   - Buffer ALLOCATION is not guaranteed thread-safe in Metal.
@@ -47,7 +47,7 @@ void load_weights(st_archive* arch, gpu_ctx* ctx, gpu_buf** out_bufs) {
         out_bufs[i] = gpu_buf_new(ctx, t->nbytes);
     }
 
-    // Pre-bucket tensors per shard. Preserving array order keeps the
+    // Pre-bucket arrays per shard. Preserving array order keeps the
     // per-shard reads sequential on disk (data_offsets are monotone).
     size_t** sh_idx = calloc(n_sh, sizeof(size_t*));
     size_t*  sh_n   = calloc(n_sh, sizeof(size_t));

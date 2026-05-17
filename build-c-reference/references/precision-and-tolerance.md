@@ -21,11 +21,12 @@ Read this when:
 ## Per-element bf16 rounding patterns ("hidden casts")
 
 This is the **#1 cause of 1–4 ULP per-element kernel mismatches**. When
-the reference is written in PyTorch / MLX / etc., each `tensor op tensor`
-in the model dtype (bf16) **rounds the intermediate to bf16** even when
-the surrounding math looks like one fused fp32 expression. A naive C
-kernel that runs the whole expression in fp32 and rounds only at the
-final store will be 1–2 ULP off per element.
+the reference is written in PyTorch / MLX / etc., each `array op array`
+(`tensor op tensor`) in the model dtype (bf16) **rounds the
+intermediate to bf16** even when the surrounding math looks like one
+fused fp32 expression. A naive C kernel that runs the whole expression
+in fp32 and rounds only at the final store will be 1–2 ULP off per
+element.
 
 The canonical examples in a vanilla decoder block:
 

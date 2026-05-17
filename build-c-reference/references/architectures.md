@@ -34,10 +34,10 @@ mid = self.swiglu(gate, up)
 then you have **two** kernels: `gate_up_linear` and `swiglu`. Even if
 fusing them would be faster, that's a job for `optimize-metal`.
 
-If, however, the reference's quantized linear is fundamentally a
-"gather expert weights + dequant + matmul" combined op (as in MLX's
-`mxfp4_qmm`), follow that: keep dequant inline with the matmul, do not
-materialize a bf16 weight buffer.
+If, however, the reference's reduced-precision (quantized) linear is
+fundamentally a "gather expert weights + dequant + matmul" combined op
+(as in MLX's `mxfp4_qmm`), follow that: keep dequant inline with the
+matmul, do not materialize a bf16 weight buffer.
 
 Reuse the same kernel for different call sites of the same op (e.g., one
 `linear_bf16` used for q_proj / k_proj / v_proj / o_proj / router /

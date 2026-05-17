@@ -77,7 +77,7 @@ For a naive RMSNorm where one thread does one row:
   page-alignment math.
 - **`PROT_READ` mmap is fine** for `newBufferWithBytesNoCopy` reads —
   the GPU happily reads from read-only host memory. (Moot if you take
-  the per-tensor-copy advice in `references/pitfalls.md`.)
+  the per-array-copy advice in `references/pitfalls.md`.)
 - **`tg = (1, 1, 1)` is accepted** by Apple GPUs (M1/M2/M3/M4). No
   need to bump to a SIMD group for the naive port.
 - **Apple `bfloat` works out of the box** at `MTLLanguageVersion3_1`

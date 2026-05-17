@@ -2,7 +2,7 @@
 // Shows the style (naive scalar, fp32 accumulator).  Customize / extend
 // for your model.  See SKILL.md for the full op list.
 //
-// Two example quantization formats are shown:
+// Two example precision-reduction (quantization) formats are shown:
 //   1. MXFP4 (openai-style, e2m1 + e8m0 per-32 block scale)
 //   2. MLX 8-bit affine (group_size=64, uint32-packed bytes + bf16 scale/bias)
 // Replace / extend per your model's storage layout.
@@ -90,7 +90,7 @@ void argmax_bf16(const bf16* logits, int32_t* out_idx, uint32_t N) {
 // Implement each, then add a test in tests/test_kernels.c (see template).
 
 // ===========================================================================
-//   Example quantization-helper snippets
+//   Example precision-reduction (dequant) helper snippets
 // ===========================================================================
 //
 // (1) MLX 8-bit affine (group_size = 64).  Storage:

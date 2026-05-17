@@ -95,4 +95,4 @@ kernel void gemm_bf16_mma(device const bfloat*   X       [[buffer(0)]],   // [M,
 // FOR REAL USE: see MLX 0.31.2's `mlx/backend/metal/kernels/steel/gemm/*.h`
 // or the gpt-oss repo's `src-metal/kernels/mlx_steel/` directory.  Those handle
 // the boundary conditions (M, N, K not multiples of tile), masking,
-// SoftMax fusion, transposed-LHS variants, and the qmm (quantized) variant.
+// SoftMax fusion, transposed-LHS variants, and the qmm (reduced-precision) variant.

@@ -5,7 +5,7 @@ SKILL.md flags the high-impact ones inline; this file has the full
 explanations. If a Metal kernel is producing nonsense, scan the
 "Symptoms" lines first.
 
-## Per-tensor offset alignment (the #1 silent-failure trap)
+## Per-array offset alignment (the #1 silent-failure trap)
 
 **Symptoms**
 - `./<BIN>` generates all-zero token IDs, or all-identical tokens.
@@ -16,24 +16,25 @@ explanations. If a Metal kernel is producing nonsense, scan the
 **Why**
 
 `gpu_buf_wrap_nocopy` on an mmap'd safetensors shard *sounds* great
-(zero-copy unified memory) but almost never works for per-tensor access:
+(zero-copy unified memory) but almost never works for per-array (tensor)
+access:
 
-- safetensors tightly packs tensor bytes. The `data_offsets` from the
-  JSON header place tensors at arbitrary byte boundaries (e.g. offset
-  2417203021 for a uint32 weight, 5118533389 for a bf16 scales tensor).
+- safetensors tightly packs array bytes. The `data_offsets` from the
+  JSON header place arrays at arbitrary byte boundaries (e.g. offset
+  2417203021 for a uint32 weight, 5118533389 for a bf16 scales array).
 - Metal `setBuffer:offset:atIndex:` requires the offset to be a multiple
   of 4 bytes *and* naturally aligned to the kernel's pointer dtype. An
   offset of 2417203021 (mod 4 = 1) fails silently with garbage reads.
 
 **Fix**
 
-Per-tensor `gpu_buf_new_from` at load time — every tensor becomes its
+Per-array `gpu_buf_new_from` at load time — every array becomes its
 own Metal buffer; every dispatch uses offset 0. Total RAM ≈ model size;
 the copy takes a few seconds at memory-bandwidth speed (~5s for 35 GB
 on M4 Max). On Apple Silicon unified memory this is the same RAM
 `mmap` would have lazily faulted in anyway.
 
-Convenient pattern: index per-tensor buffers by `(t - st_at(arch, 0))`
+Convenient pattern: index per-array buffers by `(t - st_at(arch, 0))`
 so `T_arg(t)` returns `{ g_tensor_bufs[idx], 0 }` — always offset 0,
 always naturally aligned.
 
@@ -45,7 +46,7 @@ Both options below are `optimize-metal` work; do not introduce here.
   raw-byte pointer plus a 4-byte-aligned byte offset uniform, and
   reconstruct the typed pointer in-kernel.
 - Pre-pass through the model and emit one Metal buffer per shard with
-  tensors re-laid-out at dtype-aligned offsets.
+  arrays re-laid-out at dtype-aligned offsets.
 
 ## Param buffer reuse within a cmdbuf
 

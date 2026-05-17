@@ -2,15 +2,15 @@
 //
 // WHAT: The "sorted-gather" MoE fast path for prefill (Lq > 1).  Instead
 //       of each token gathering its K_top experts independently, we bucket
-//       all (token, kt) pairs by expert, then run ONE dense quantized
-//       GEMM per expert covering its bucket.
+//       all (token, kt) pairs by expert, then run ONE dense
+//       reduced-precision (quantized) GEMM per expert covering its bucket.
 //
-// PIPELINE (4–5 small kernels + 2 quantized GEMMs):
+// PIPELINE (4–5 small kernels + 2 reduced-precision GEMMs):
 //   1. zero_uints              clear per-expert counters
 //   2. expert_bucketize        scatter (l, kt) into per-expert lists
 //   3. moe_flatten_buckets     prefix-sum + sorted flat lists + reverse map
 //   4. moe_gather_x_sorted     gather X rows into expert-sorted layout
-//   5. qmm_t_gather_rhs_*      ONE quantized GEMM per layer (all experts)
+//   5. qmm_t_gather_rhs_*      ONE reduced-precision GEMM per layer (all experts)
 //      → gate_up
 //   6. moe_swiglu_epilogue     clamp + sigmoid + (u+1) SwiGLU
 //   7. qmm_t_gather_rhs_*      → down
@@ -152,7 +152,7 @@ kernel void moe_combine_scatter(device const bfloat* down_out [[buffer(0)]], // 
     residual[l * H + h] = bfloat(acc);
 }
 
-// --- The quantized GEMM step (Kernel 5/7) ---------------------------------
+// --- The reduced-precision GEMM step (Kernel 5/7) -------------------------
 // `qmm_t_gather_rhs_bf16_g32_b4` — one dense MXFP4 GEMM per layer, with
 // per-row expert indirection (each row r selects expert e = flat[r]>>somewhere
 // or use prefix[]/counts[] to know which contiguous range belongs to each

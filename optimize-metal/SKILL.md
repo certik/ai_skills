@@ -161,18 +161,18 @@ hiccup): see `references/profiling.md`.
 
 ## The empirical attack order
 
-For a quantized MoE decoder LLM on Apple Silicon, this is the empirical
-order of biggest wins from a naive port (validated on Qwen3.6-35B-A3B
-on M4 Max). **Go in this order unless your profile clearly says
-otherwise** — the profile is always ground truth, but this list saves
-you most of the exploration cost.
+For a reduced-precision (quantized) MoE decoder LLM on Apple Silicon,
+this is the empirical order of biggest wins from a naive port
+(validated on Qwen3.6-35B-A3B on M4 Max). **Go in this order unless
+your profile clearly says otherwise** — the profile is always ground
+truth, but this list saves you most of the exploration cost.
 
 ### First-pass — naive → mid-pipeline (~1.9 → ~43 tok/s for Qwen3.6)
 
 1. **Parallel argmax** (F1). 1-thread argmax over 200k+ vocab is the
    most common "why is decode capped at <5 tok/s" answer.
-2. **SIMD-group-per-output for ALL quantized GEMV** (B1). Affects
-   q/k/v/o_proj, lm_head, router, every MoE linear.
+2. **SIMD-group-per-output for ALL reduced-precision GEMV** (B1).
+   Affects q/k/v/o_proj, lm_head, router, every MoE linear.
 3. **SG-per-row for the reduction kernels**: rmsnorm, softmax_topk,
    embed_dequant_gather. Cheap.
 4. **SG-per-(hv, dv) for the recurrent state step** (I1) if the model
@@ -460,7 +460,7 @@ patterns/
 ├── mxfp4_qmv4_decode.metal              (E1)
 ├── mxfp4_gate_up_swiglu_fused.metal     (E2)
 ├── moe_sorted_gather_glue.metal         (E3 glue kernels)
-├── moe_sorted_gather_qmm.metal          (E3 MMA quantized GEMM)
+├── moe_sorted_gather_qmm.metal          (E3 MMA reduced-precision GEMM)
 ├── argmax_parallel.metal                (F1)
 ├── topk_parallel_router.metal           (F2)
 ├── softmax_argmax_per_row.metal         (F3 — diffusion samplers)

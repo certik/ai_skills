@@ -1,8 +1,8 @@
 // main.c.template — pure-C CPU reference CLI for an LLM.
 //
-// Customize the parts marked [MODEL]: weight tensor names, the forward()
-// schedule (which kernels in which order), the chat-template builder, and
-// the config fields you load from config.json.
+// Customize the parts marked [MODEL]: weight array (tensor) names, the
+// forward() schedule (which kernels in which order), the chat-template
+// builder, and the config fields you load from config.json.
 //
 // Build: see Makefile.template.
 //

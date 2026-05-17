@@ -128,9 +128,9 @@ Customize:
 
 - `main.c.template` — naive 1:1 skeleton for a dense AR transformer
   (RMSNorm + GQA + RoPE + SwiGLU + LM head): `cfg_t` + JSON loader,
-  per-tensor weight buffers, params arena, `d_*` dispatch helpers,
-  `forward(q_off, Lq)`, prefill + decode loop. Distilled from real
-  ports; search the file for `PLACEHOLDER` to find what to adapt.
+  per-array (per-tensor) weight buffers, params arena, `d_*` dispatch
+  helpers, `forward(q_off, Lq)`, prefill + decode loop. Distilled from
+  real ports; search the file for `PLACEHOLDER` to find what to adapt.
 - `Makefile.template` — standalone Makefile, only useful if the repo has
   no existing root Makefile. Usually you'll extend the root Makefile
   instead (Phase 1.5).
@@ -358,16 +358,16 @@ src-metal: <kernel_name> 1:1 metal port + test
 1. Author `src-metal/main.c`. Structure: same as `src-cpu/main.c` but
    every C-function call becomes a `gpu_cmdbuf_dispatch(...)`.
 
-2. **Weights: allocate one Metal buffer per tensor** via
+2. **Weights: allocate one Metal buffer per array** via
    `gpu_buf_new_from(ctx, tensor.data, tensor.nbytes)` at load time.
    Zero-copy shard wrapping is almost always blocked by Metal's
    offset-alignment rule (this is the #1 silent-failure trap — see
    `references/pitfalls.md`). Total RAM usage ≈ model size; on Apple
    Silicon unified memory this is what `mmap` would page in anyway.
-   After all tensors are copied, you can `st_close(arch)` to free the
+   After all arrays are copied, you can `st_close(arch)` to free the
    mmap virtual range if you want.
 
-   Convenient pattern: index per-tensor buffers by
+   Convenient pattern: index per-array buffers by
    `(t - st_at(arch, 0))` so `T_arg(t)` returns
    `{ g_tensor_bufs[idx], 0 }` — always offset 0, always naturally
    aligned.
@@ -426,7 +426,7 @@ Read the relevant file when you hit the situation it covers; don't
 preload them all.
 
 - **`references/pitfalls.md`** — silent-failure traps and weird-symptom
-  lookup: per-tensor offset alignment, param buffer reuse, symlink
+  lookup: per-array offset alignment, param buffer reuse, symlink
   paths, KV cache offsets, etc. Read this first if a kernel "passes"
   but end-to-end output is garbage.
 - **`references/msl-tips.md`** — MSL / Apple-GPU specifics: the

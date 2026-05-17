@@ -157,8 +157,8 @@ What changes vs the naive sampler:
 6. **Within-block vs full-sequence logit shift**: `_shift_logits`
    (`cat(logits[:,:1], logits[:,:-1], dim=1)`) is applied to whatever
    shape comes out of the forward. In the prefetch call that's the
-   full `[L, V]` tensor; in block-local calls it's `[BL, V]` and the
-   shift is **within the block**, not relative to the absolute
+   full `[L, V]` array (tensor); in block-local calls it's `[BL, V]` and
+   the shift is **within the block**, not relative to the absolute
    sequence. Implement it as a row-shift over the actual array, NOT
    as a "use absolute position p-1" trick.
 7. **Performance**: the speedup grows with `num_blocks`. For
@@ -253,9 +253,9 @@ Implementation rules:
   after the loop completes.
 - **Within-block vs full-sequence logit shift**: the
   `cat(logits[:,:1], logits[:,:-1], dim=1)` shift in the Python
-  reference is applied to the actual `logits` tensor that comes out
+  reference is applied to the actual `logits` array that comes out
   of the call — full sequence for the prefetch (`[L, V]`), one block
   for refinement (`[BL, V]`). The shift is **always relative to that
-  tensor's own row indexing**, NOT relative to the absolute sequence
+  array's own row indexing**, NOT relative to the absolute sequence
   position. Implement it as a row-shift over the array, not as a
   "use absolute position p-1" trick.

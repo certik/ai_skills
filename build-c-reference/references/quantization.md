@@ -1,8 +1,8 @@
-# Quantization formats
+# Reduced precision (Quantization) formats
 
 Read this when:
 - The reference uses MXFP4 (openai-style, gpt-oss family).
-- The reference uses MLX-style affine 4-bit or 8-bit quantization.
+- The reference uses MLX-style affine 4-bit or 8-bit precision reduction.
 - You're sizing the dequant kernel for a MoE `gate_up_proj` / `down_proj`.
 
 Other formats (GGUF Q4_K, AWQ, GPTQ, ...) follow the same pattern: read
@@ -30,9 +30,9 @@ specific — check the reference's loader.
 
 ## MLX-style affine — 4-bit and 8-bit
 
-MLX uses a different family of quantization formats. For a Linear of
-shape `(N, K)` quantized affinely at `B` bits with `group_size` `G`,
-the safetensors stores **three** tensors:
+MLX uses a different family of precision-reduction formats. For a
+Linear of shape `(N, K)` with affine reduced precision at `B` bits and
+`group_size` `G`, the safetensors stores **three** arrays:
 
 ```
 <base>.weight  : uint32  [N, K * B / 32]   -- packs (32 / B) elements per uint32
@@ -60,11 +60,12 @@ unsigned value `q ∈ [0, 15]` then dequants identically.
 
 ### Quirks worth remembering
 
-- Even small linears (e.g., outputs of 1 or 32) are quantized in MLX
-  models. Don't assume "1-dim outputs" means f32.
+- Even small linears (e.g., outputs of 1 or 32) use the reduced-precision
+  representation in MLX models. Don't assume "1-dim outputs" means f32.
 - MLX's `mx.quantized_matmul` and `mx.gather_qmm` dequant inline; never
   materialize a dequantized weight buffer in the C reference.
-- `Embedding.weight` is quantized too in MLX-quantized models — use the
-  same dequant in your `embed_gather` kernel.
-- The MLX inference code may force certain weights to a specific quant
-  (`quant_predicate` in `mlx_lm/models/<name>.py`). Read it.
+- `Embedding.weight` is in the reduced-precision form too in MLX models
+  — use the same dequant in your `embed_gather` kernel.
+- The MLX inference code may force certain weights to a specific
+  reduced-precision format (`quant_predicate` in
+  `mlx_lm/models/<name>.py`). Read it.

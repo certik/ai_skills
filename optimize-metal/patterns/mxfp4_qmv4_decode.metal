@@ -1,6 +1,7 @@
 // patterns/mxfp4_qmv4_decode.metal
 //
-// WHAT: MXFP4 quantized GEMV for decode-time MoE.  Combines:
+// WHAT: MXFP4 reduced-precision (quantized) GEMV for decode-time MoE.
+//       Combines:
 //   * gather expert weights by indices (no materialization)
 //   * inline e2m1 + e8m0 dequant (per-32-element block)
 //   * qmv4 register-tile pattern (K_OUT outputs per SG, X reused)

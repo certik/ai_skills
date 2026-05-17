@@ -63,7 +63,7 @@ be confused.)
 ## `forward_hook` payload shape varies
 
 For most simple `nn.Linear` / `nn.LayerNorm` modules the hook output is
-a single tensor. For attention blocks the output may be a tuple of
+a single array (tensor). For attention blocks the output may be a tuple of
 `(attn_output, attn_weights, past_kv)`. Always check
 `isinstance(out, tuple)` and pick `out[0]`:
 

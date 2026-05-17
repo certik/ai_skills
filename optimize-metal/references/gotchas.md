@@ -185,13 +185,13 @@ without committing. The caller owns commit().
 
 # 12. Order of attack — bottlenecks worth checking in this order
 
-For decode (Lq=1) on a quantized MoE LLM, this is the empirical
-order of biggest wins from a naive port:
+For decode (Lq=1) on a reduced-precision (quantized) MoE LLM, this is
+the empirical order of biggest wins from a naive port:
 
   1. Parallelize ANY single-thread-per-row reduction:
      argmax over vocab (the king of decode bottlenecks at >50k vocab),
      softmax_topk over N_experts, rmsnorm rows.
-  2. SIMD-group-per-output for ALL quantized GEMV (B1).
+  2. SIMD-group-per-output for ALL reduced-precision GEMV (B1).
   3. Parallelize the recurrent state update if the model has one
      (gated_delta / Mamba SSM). See recurrent_state_sg_per_row.metal.
   4. SDPA SG-per-(lq,hq) with TG-mem scores + parallel softmax.
@@ -474,10 +474,11 @@ your weight-copy step instead, where you can parallelize them.
 # 29. mmap + memcpy is page-fault-bound at ~1 GB/s — use parallel pread instead
 
 The naive port loads weights as: `mmap(shard)` → `memcpy(dst, mmap_ptr,
-nbytes)` per tensor. This is fast on first inspection because mmap is
-zero-cost. But the **memcpy triggers page faults**, and on macOS the
-fault handler serializes on VM locks. Even with `dispatch_apply` to
-parallelize across tensors, you get ~4 GB/s aggregate.
+nbytes)` per array (tensor). This is fast on first inspection because
+mmap is zero-cost. But the **memcpy triggers page faults**, and on
+macOS the fault handler serializes on VM locks. Even with
+`dispatch_apply` to parallelize across arrays, you get ~4 GB/s
+aggregate.
 
 **Fix**: skip mmap for the bulk copy entirely. Use parallel
 `pread()`:
@@ -485,7 +486,7 @@ parallelize across tensors, you get ~4 GB/s aggregate.
   1. Keep the shard JSON header parse via mmap (it's tiny).
   2. For the bulk data, open ONE fd per shard.
   3. `dispatch_apply` over `n_shards` (e.g., 8): each iteration
-     sequentially `pread`s its shard's tensors directly into the
+     sequentially `pread`s its shard's arrays directly into the
      preallocated MTLBuffers.
 
 This matches MLX's `ParallelFileReader` strategy (4 worker threads,
@@ -496,7 +497,7 @@ speedup, and brings startup time to **below MLX's**.
 
 **Measurement** (35 GB Qwen3.6 model, M4 Max, warm cache):
   - mmap + single-threaded memcpy + madvise: 5s (madvise) + 5s (copy) = 10s
-  - mmap + dispatch_apply(per-tensor) memcpy:  8s
+  - mmap + dispatch_apply(per-array) memcpy:  8s
   - parallel pread per shard:                   3.5s   ← winner
 
 # 30. First Metal cmdbuf pays ~1 s residency wiring per ~30 GB of buffers
@@ -590,7 +591,7 @@ This is correct (one fewer rounding step), but:
 2. The diff vs an ORACLE dump (MLX or HF) typically *shrinks* (fewer
    rounds = closer to f32).
 3. Per-element tolerance vs the unfused C ref may need to loosen from
-   1e-2 to ~5e-2 absolute on residual-stream tensors.
+   1e-2 to ~5e-2 absolute on residual-stream arrays.
 
 **Fix**: ALSO regenerate the C-reference oracle dump with the
 equivalent fused-rounding kernel, OR loosen the tolerance and re-verify

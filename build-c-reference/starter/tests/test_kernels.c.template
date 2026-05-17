@@ -26,7 +26,7 @@
 
 static st_archive* g_arch = NULL;
 
-// Look up a tensor by name and assert its dtype.
+// Look up an array (tensor) by name and assert its dtype.
 static const void* tens(const char* name, st_dtype want, size_t* nelem) {
     const st_tensor* t = st_find(g_arch, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
@@ -82,7 +82,7 @@ static int err_check(const bf16* got, const float* want, size_t n,
     return ok ? 0 : 1;
 }
 
-// Convenience: load an f32 ref tensor, convert to bf16 in a malloc'd buffer.
+// Convenience: load an f32 ref array, convert to bf16 in a malloc'd buffer.
 static bf16* f32ref_to_bf16(const ref_t* r) {
     bf16* x = (bf16*)malloc(r->n_elem * sizeof(bf16));
     const float* f = (const float*)r->data;
@@ -94,7 +94,7 @@ static bf16* f32ref_to_bf16(const ref_t* r) {
 
 static int test_rmsnorm(void) {
     printf("[rmsnorm]\n");
-    // [MODEL] Adjust ref filenames + weight tensor name for your model.
+    // [MODEL] Adjust ref filenames + weight array name for your model.
     ref_t* xin  = ref_load("src-cpu/refs/x_in_0.bin");
     ref_t* hout = ref_load("src-cpu/refs/h_after_input_norm_0.bin");
     size_t L = (size_t)xin->shape[0], D = (size_t)xin->shape[1];

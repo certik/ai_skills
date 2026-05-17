@@ -3,7 +3,7 @@
 Read this when:
 - Your reference is MLX (`mlx_lm/models/<name>.py`).
 - Writing `tools/dump_ref.py` for an MLX backend.
-- The model is quantized in MLX format.
+- The model uses reduced precision (quantization) in MLX format.
 - A kernel matches PyTorch but fails MLX (or vice versa).
 
 MLX is the preferred reference for this skill because the codebase is
@@ -39,9 +39,9 @@ small and easy to read. But it has a few footguns:
    the Python code (e.g., `A_log.astype(mx.float32)`). Mirror this in
    your C kernel.
 
-7. **`quant_predicate`**: lists which parameters get which quantization
-   settings. May force certain weights to a different bit-width than
-   the model default.
+7. **`quant_predicate`**: lists which parameters get which
+   reduced-precision settings. May force certain weights to a different
+   bit-width than the model default.
 
 8. **`Model.sanitize(weights)`**: applied at load time. May rename keys
    (e.g., `model.*` → `language_model.model.*` for multi-modal wrappers),
@@ -58,7 +58,7 @@ small and easy to read. But it has a few footguns:
      `moveaxis(2, 1)` to put the kernel dim in the middle. Confirm
      via the safetensors header shape.
    - **Skipping vision tower / MTP heads**: multi-modal and
-     "multi-token-prediction" checkpoints have many unused tensors.
+     "multi-token-prediction" checkpoints have many unused arrays.
      `sanitize` drops them; the C side may have to walk the archive
      but ignore them. Filter by name prefix (`vision_tower.`, `mtp.`,
      etc.).

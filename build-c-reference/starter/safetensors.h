@@ -1,8 +1,8 @@
 // Minimal safetensors reader. Each shard file is mmap'd and its JSON header
-// parsed into a flat list of tensor descriptors that point into the mapped
-// region. We support exactly the subset of JSON the safetensors format
-// produces (objects, arrays, strings, integers, "null" values, no escapes
-// inside tensor-name keys beyond plain ASCII).
+// parsed into a flat list of array (tensor) descriptors that point into the
+// mapped region. We support exactly the subset of JSON the safetensors
+// format produces (objects, arrays, strings, integers, "null" values, no
+// escapes inside array-name keys beyond plain ASCII).
 
 #ifndef SAFETENSORS_H
 #define SAFETENSORS_H
@@ -46,7 +46,7 @@ typedef struct st_archive st_archive;
 
 // Open a directory containing one or more `model-XXXXX-of-YYYYY.safetensors`
 // shards (or a single `model.safetensors`). All shards are mmap'd and their
-// tensors merged into one table.
+// arrays merged into one table.
 st_archive* st_open(const char* dir, char** err);
 void        st_close(st_archive* a);
 

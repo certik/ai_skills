@@ -66,11 +66,11 @@ void sdpa_bf16(const bf16* Q, const bf16* K, const bf16* V,
 void topk_softmax_bf16(const bf16* logits, int32_t* out_idx, float* out_w,
                        uint32_t L, uint32_t E, uint32_t K);
 
-// ---- Phase 6: MoE quantized linear (model-specific quantization!) ----------
+// ---- Phase 6: MoE reduced-precision (quantized) linear (model-specific!) --
 
 // MXFP4 example: per-32-element e2m1 block + e8m0 scale byte.
 // Fused gather + dequant + matmul (no materialized bf16 weight buffer).
-// Replace with your model's quantization format.
+// Replace with your model's precision-reduction format.
 //
 // Y[l, kt, n] = bias[E_kt, n] + Σ_k dequant(W[E_kt, n, k]) * X[l, k]
 // where E_kt = expert_ids[l, kt].

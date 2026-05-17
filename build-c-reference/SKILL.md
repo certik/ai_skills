@@ -66,8 +66,8 @@ own future skill).
 - A **C99 compiler** (clang or gcc). `-O2` is the default; `-ffast-math`
   may be used cautiously **only if** it doesn't change per-kernel outputs
   beyond tolerance (see `references/precision-and-tolerance.md`).
-- Python deps to run the reference + dump oracle tensors (numpy, mlx /
-  torch / transformers as required by the reference).
+- Python deps to run the reference + dump oracle arrays (tensors) (numpy,
+  mlx / torch / transformers as required by the reference).
 
 ## Inputs to gather
 
@@ -175,8 +175,8 @@ The **template** files are starting points you customize per model:
   distinct math op). Includes a checklist of common modern-architecture
   ops (output gate, partial RoPE, q/k_norm, SSM step, etc.).
 - `kernels.c.template` — naive scalar reference kernels plus commented
-  snippets for two common quantization formats (MXFP4 and MLX 8-bit
-  affine).
+  snippets for two common precision-reduction (quantization) formats
+  (MXFP4 and MLX 8-bit affine).
 - `Makefile.template` — `make` builds `./<BIN>`; `make tokenizer`
   builds the C tokenizer-bin generator; `make tests` runs the
   per-kernel correctness checks.
@@ -224,8 +224,8 @@ The **template** files are starting points you customize per model:
 
 4. Identify model-specific details by reading the reference and asking
    the user when unclear:
-   - **Quantization format**: bf16? f16? MXFP4 (e2m1+e8m0)? FP8? Per-channel
-     scales? Group size? → `references/quantization.md`
+   - **Precision-reduction format**: bf16? f16? MXFP4 (e2m1+e8m0)? FP8?
+     Per-channel scales? Group size? → `references/quantization.md`
    - **RoPE flavor**: standard? llama-style? yarn? long-rope? →
      `references/architectures.md`
    - **Attention variant**: MHA / GQA / MQA; sliding window every N
@@ -244,7 +244,7 @@ The **template** files are starting points you customize per model:
      `model.generation_config.eos_token_id` ≠ `tokenizer.eos_token_id`
      in some models — see `references/pytorch-gotchas.md`.
 
-5. Identify the **safetensors tensor names** for each weight by reading
+5. Identify the **safetensors array names** for each weight by reading
    the reference's `__init__` / `state_dict` keys.
 
 6. Commit a `src-cpu/README.md` capturing this reconnaissance.
@@ -298,7 +298,7 @@ The **template** files are starting points you customize per model:
    **Smoke-test checklist** (all must pass before moving to Phase 3):
    - [ ] Build succeeds with `-Wall -Wextra` clean.
    - [ ] Program prints the model dims read from `config.json`.
-   - [ ] Program prints the list of tensors found in safetensors and
+   - [ ] Program prints the list of arrays found in safetensors and
          their dtypes (add a `--list-tensors` debug flag if helpful).
    - [ ] Program prints the prompt token IDs from the chat-template
          builder and they match what the Python reference produces for
@@ -315,7 +315,7 @@ Author `tools/dump_ref.py` (start from
 1. Load the Python reference model and tokenizer.
 2. Encode the validation prompt.
 3. Run the forward pass on layer 0 only (initially) and dump the
-   intermediate tensors at every op boundary. Use a small binary
+   intermediate arrays at every op boundary. Use a small binary
    format with a magic header:
    ```
    "LLMTNSR1" (8 bytes) | u32 dtype | u32 ndim | i64[ndim] shape | data
@@ -367,10 +367,10 @@ input → layer 0 output → layer 1 input → ...
   `gate, up = self.gate_up_proj(x); mid = self.swiglu(gate, up)`, you
   have **two** kernels: `gate_up_linear` and `swiglu`. Even if fusing
   them would be faster, that's a job for `optimize-metal`. If, however,
-  the reference's quantized linear is fundamentally a "gather expert
-  weights + dequant + matmul" combined op (as in MLX's `mxfp4_qmm`),
-  follow that — keep dequant inline with the matmul. Reuse the same
-  kernel for different call sites of the same op (e.g., one
+  the reference's reduced-precision linear is fundamentally a "gather
+  expert weights + dequant + matmul" combined op (as in MLX's
+  `mxfp4_qmm`), follow that — keep dequant inline with the matmul. Reuse
+  the same kernel for different call sites of the same op (e.g., one
   `linear_bf16` used for q_proj / k_proj / v_proj / o_proj / router /
   lm_head). **One C function per distinct math op, not per call site.**
 
@@ -422,13 +422,13 @@ void linear_bf16(const bf16* X, const bf16* W, const bf16* B,
 ```
 
 **Style guidelines**:
-- One layer of nested loops per logical tensor index.
+- One layer of nested loops per logical array index.
 - fp32 accumulator for any reduction.
 - Use `bf16_to_f32` / `f32_to_bf16` (in `utils/bf16.h`); do not
   introduce arch-specific intrinsics.
 - Don't try to be clever. The Metal port will rearrange this anyway.
 
-For quantized linears (MXFP4, MLX affine) see
+For reduced-precision linears (MXFP4, MLX affine) see
 `references/quantization.md`.
 
 For **per-element bf16 round-trips that mirror the reference's hidden
@@ -462,7 +462,7 @@ K. For a magnitude-aware tolerance table and the
 
 If the test fails:
 - Print the first few mismatching elements.
-- Check tensor layout / strides against the reference.
+- Check array layout / strides against the reference.
 - Check accumulator precision. Move to fp32 if you were using bf16.
 - Check special cases (sinks, sliding window, the +1 in SwiGLU's
   `(u+1)`, the clamping, the scale on RoPE for yarn, etc.).
@@ -614,7 +614,7 @@ Deep dives are kept in `references/`. Read them on demand:
 |---|---|
 | `references/precision-and-tolerance.md` | Writing or debugging any kernel; per-kernel test fails by 1–4 ULPs; choosing tolerance; argmax-stability acceptance; deciding on `-ffast-math`. |
 | `references/architectures.md` | Phase 1 reconnaissance on non-vanilla architectures; implementing GQA / sinks / sliding window / partial RoPE / q,k_norm / output gate / MoE / shared expert / SSM (Mamba / GatedDeltaNet / RWKV) / bidirectional attention. |
-| `references/quantization.md` | The reference uses MXFP4 (gpt-oss) or MLX-style affine 4-bit / 8-bit quantization. |
+| `references/quantization.md` | The reference uses MXFP4 (gpt-oss) or MLX-style affine 4-bit / 8-bit precision reduction. |
 | `references/samplers.md` | Phase 5 driver loops; discrete-diffusion / masked LM samplers; Fast-dLLM-style block diffusion with DualKVCache; supporting multiple samplers in the same binary. |
 | `references/mlx-gotchas.md` | The reference is MLX (no `forward_hook`; `mx.eval`; `sanitize`; `cast_predicate`; `quant_predicate`; `mx.fast.rope`). |
 | `references/pytorch-gotchas.md` | The reference is PyTorch / HF (FLASH vs MATH SDPA; AutoModel wrappers; `num_logits_to_keep`; `trust_remote_code`; multi-modal `config.json`). |

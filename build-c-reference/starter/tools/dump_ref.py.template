@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dump_ref.py.template — run the Python reference model on a fixed prompt
-and dump per-op intermediate tensors as f32 binaries readable by the C
-per-kernel correctness tests.
+and dump per-op intermediate arrays (tensors) as f32 binaries readable by
+the C per-kernel correctness tests.
 
 Two backends are supported:
   - **PyTorch / HF transformers**: use `forward_hook`s to capture module
