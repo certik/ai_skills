@@ -1,4 +1,4 @@
-# patterns/sdpa_rotating_kv_cache.md
+# Sliding-window / rotating KV cache (catalog section D4)
 
 ## What
 

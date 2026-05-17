@@ -1,6 +1,45 @@
+# Gotchas — bug-and-fix war stories
+
 Concrete bug-and-fix war stories from optimizing src-metal/ ports.
 Each one cost at least one debug iteration; consult BEFORE chasing
 the same symptoms again.
+
+## Table of contents
+
+| #  | Topic                                                                | Category    |
+|----|----------------------------------------------------------------------|-------------|
+| 1  | `simd_ballot` returns `simd_vote`, not uint                          | MSL syntax  |
+| 2  | `dispatchThreads:` takes TOTAL THREADS, not threadgroups             | Dispatch    |
+| 3  | TG-memory MAX_CTX must match KV-cache `max_ctx`                      | SDPA bug    |
+| 4  | `constant constexpr uint NAME` collides across kernel files          | MSL build   |
+| 5  | First cmdbuf has 0.5–3 s of one-time driver overhead                 | Timing      |
+| 6  | Decode tok/s variance is ±20% with short runs                        | Measurement |
+| 7  | Forgetting `threadgroup_barrier` between phases of a same-SG kernel  | Barriers    |
+| 8  | K_OUT in qmv4 has a sweet spot — bigger isn't always better          | Register tile |
+| 9  | Host-side breaks are the single biggest hidden cost                  | Host overhead |
+| 10 | Verify the FIRST decoded token IS the prefill argmax                 | Off-by-one  |
+| 11 | `forward()` should not own its cmdbuf                                | Architecture |
+| 12 | Order of attack — bottlenecks worth checking in this order           | Strategy    |
+| 13 | Metal queue ordering = free RAW correctness between cmdbufs          | Pipeline    |
+| 14 | Use `commit()` (async) for pipelining, `commit_wait()` only at boundary | Pipeline |
+| 15 | port-c-to-metal often leaves `max_ctx` at the smoke-test value       | SDPA bug    |
+| 16 | Two id buffers, NOT one shared id buffer for the 2-deep pipeline     | Pipeline    |
+| 17 | Tiny TG sizes — (1,1,1) wastes 31/32 of every SIMD group             | Dispatch    |
+| 18 | Concurrent encoder + no_bar = YOU own hazard tracking                | Barriers    |
+| 19 | Critical-path concurrency > kernel speedups in late optimization     | Strategy    |
+| 20 | KPROF total > wall time means concurrent encoder is actually working | Profiling   |
+| 21 | Fuse residual into the LAST linear, not into a separate kernel       | Fusion      |
+| 22 | Common barrier-removable groups in transformer LLMs                  | Barriers    |
+| 23 | KPROF inflates total runtime ~30% but is the right tool              | Profiling   |
+| 24 | Fuse out-of-place elemwise pairs into one kernel                     | Fusion      |
+| 25 | tok/s differences < 2% are noise — run 5 times                       | Measurement |
+| 26 | Two different "barriers" — don't confuse them                        | Barriers    |
+| 27 | `forward()` should ACCEPT a cmdbuf, not own one                      | Architecture |
+| 28 | macOS `madvise(MADV_WILLNEED)` is BLOCKING — never use it on big files | Startup |
+| 29 | mmap + memcpy is page-fault-bound at ~1 GB/s — use parallel pread    | Startup     |
+| 30 | First Metal cmdbuf pays ~1 s residency wiring per ~30 GB of buffers  | Startup     |
+
+---
 
 # 1. simd_ballot returns simd_vote, not uint
 

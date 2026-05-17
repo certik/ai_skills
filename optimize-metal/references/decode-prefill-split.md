@@ -1,4 +1,4 @@
-# patterns/decode_prefill_split.md
+# Decode/prefill split (catalog section G)
 
 ## What
 
