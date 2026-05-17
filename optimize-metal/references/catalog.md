@@ -21,10 +21,10 @@ each section the entries are roughly in the order you'd apply them.
 
 - [A. Host-side scheduling](#a-host-side-scheduling) — cmdbuf batching, param ring, pipeline, concurrent encoder, parallel weight loader
 - [B. GEMV (decode Linear)](#b-gemv--decode-time-linear-layers) — simdgroup-per-output, bfloat4, qmv4 register tile, TG-mem X share, residual epilogue
-- [C. GEMM (prefill Linear)](#c-gemm--prefill-time-linear-layers) — simdgroup_matrix MMA, tile sweep, fused-op templates, aspect-ratio dispatch
-- [D. SDPA](#d-sdpa--attention) — parallel softmax, online softmax, multi-SG, sliding KV
+- [C. GEMM (prefill Linear)](#c-gemm--prefill-time-linear-layers) — simdgroup_matrix MMA, tile sweep (incl. WN as register-pressure relief), fused-op templates, aspect-ratio dispatch (K>N AND small-N axes)
+- [D. SDPA](#d-sdpa--attention) — parallel softmax, online softmax, multi-SG, K-per-iter ILP unrolling, sliding KV
 - [E. MoE](#e-moe--typically-the-biggest-bottleneck) — decode qmv4, fused gate_up_swiglu, prefill sorted-gather, fused combine_scatter
-- [F. Reductions](#f-reductions--small-but-pesky-kernels) — parallel argmax, parallel topk softmax, per-row softmax+argmax (diffusion samplers)
+- [F. Reductions](#f-reductions--small-but-pesky-kernels) — parallel argmax, parallel topk softmax, per-row softmax+argmax (diffusion samplers), multi-SG-per-row rmsnorm
 - [G. Decode/Prefill split](#g-decodeprefill-split--only-when-techniques-diverge)
 - [H. Host/GPU boundary cleanup](#h-hostgpu-boundary-cleanup--often-the-biggest-single-win) — glue kernels, embed+forward+argmax merge, prune unused output rows
 - [I. Recurrent / state-update kernels](#i-recurrent--state-update-kernels) — SG-per-(row,dim) for RNN/SSM
@@ -379,13 +379,69 @@ for each kernel shape.
 - **BK**: K-bands processed per loop iter. BK=8 is one 8×8 MMA per K
   step; BK=16 unrolls two 8×8 MMAs per step. Halves the K-loop count
   and improves ILP at the cost of doubling A/Bt mma temp registers.
-  Worked at BM=16 in our reference port; at BM=32 the A footprint
-  (`TM × (BK/8)` mma tiles) overflowed. The win was 5–8% on refine.
+  The early gpt-oss reference port stopped at BK=16 because BK=32
+  spilled at WN=2 — but **BK=16 is NOT a fundamental ceiling**, it's
+  set by per-SG register pressure at the chosen `(BM, BN, WN)`. On
+  Dream-7B refine, going `WN=2 → WN=4` (see below) halves per-SG
+  C+Bt regs and unlocks BK=32 (BN=64 path, 24 regs/lane) and BK=64
+  (BN=32 path, 28 regs/lane; BN=64 path, 40 regs/lane), each landing
+  -2% to -10% wall on top of dual-tile + C4. Always sweep BK ∈ {16,
+  32, 64} with the WN that brings per-SG regs ≤ ~50. See gotcha #41
+  for the budget formula.
 - **WM**: SIMD-groups stacked in M. Forces Bt to be redundant across
   WM SGs (each loads the same Bt tile). Usually pick `WM=1` so that A
   is shared (small) and Bt is split (large).
-- **WN**: SIMD-groups stacked in N. Forces A to be redundant across
-  WN SGs. Pick `WN=2` for 64 threads/TG.
+- **WN**: SIMD-groups stacked in N. Treat WN as TWO knobs in one: it
+  picks how many SIMD groups split the BN dimension (more parallelism
+  per TG), AND it sets per-SG register pressure (more SGs → smaller
+  per-SG share of C accumulator and Bt staging). `WN=2` is a good
+  starting point (64 threads/TG); **`WN=4` is the register-pressure
+  relief lever** that unlocks larger BK without changing total
+  threads/TG. On Dream-7B: WN=2 BK=64 in BN=64 catastrophically spills
+  (64 regs/lane → 4× slowdown); WN=4 BK=64 (40 regs/lane) fits and
+  beats WN=2 BK=32 by -6% wall. Cost: A is now redundant across WN
+  SGs, but at BN=64 with BK=64 the A footprint is small enough that
+  this is a clear win.
+
+**Register-budget formula** (Apple GPU, validated on M4 Max). Counted
+in fp32 32-bit registers per lane (one `simdgroup_matrix<float, 8, 8>`
+tile = 2 fp32 regs/lane; one `simdgroup_matrix<bfloat, 8, 8>` tile =
+1 fp32-reg-equivalent/lane):
+
+```
+TM = BM / WM / 8;  TN = BN / WN / 8;  TKB = BK / 8;
+
+regs/lane ≈ TM·TN·2         # C accumulator (fp32, 2 regs/lane/tile)
+          + TM·TKB           # A staging   (bf16, 1 reg/lane/tile)
+          + TN·TKB           # Bt staging  (bf16, 1 reg/lane/tile)
+```
+
+(The kernel files in Dream-7B's `src-metal/kernels/gemm_bf16*.metal`
+have comments quoting these same C/A/Bt counts — this formula matches
+the live source.)
+
+M4 Max ceilings (empirical, from Dream-7B refine sweep):
+
+- ~28–32 regs/lane → easy, high occupancy
+- ~40 regs/lane → fits but occupancy drops; pays its way only if the
+  larger BK halves the K-loop count
+- ~50 regs/lane → border; some shapes regress silently
+- ~60+ regs/lane → catastrophic spill (4× slowdown observed)
+
+Examples (BM=16, threads/TG = 32·WM·WN):
+
+| Tile (BM, BN, BK, WM, WN) | TM, TN, TKB | C  | A  | Bt | Total | Status |
+|---------------------------|-------------|----|----|----|-------|--------|
+| 16, 64, 16, 1, 2          | 2, 4, 2     | 16 |  4 |  8 |  28   | OK (original cargo-cult choice) |
+| 16, 64, 32, 1, 4          | 2, 2, 4     |  8 |  8 |  8 |  24   | OK, -1.6% wall over BK=16 |
+| 16, 32, 64, 1, 4          | 2, 1, 8     |  4 | 16 |  8 |  28   | OK, **-10% wall** (biggest mid-stage win) |
+| 16, 64, 64, 1, 4          | 2, 2, 8     |  8 | 16 | 16 |  40   | OK (border), -6% wall vs BK=32 |
+| 16, 64, 64, 1, 2          | 2, 4, 8     | 16 | 16 | 32 |  64   | catastrophic 4× slowdown (spill) |
+
+The "WN=4 unlocks BK=64" pattern generalizes — if BK=64 puts the
+total over ~50 at your current WN, doubling WN halves both C and Bt
+contributions (A is unchanged: it's shared across the N-direction
+SGs). See gotcha #41 for the full sweep procedure.
 
 **Dual-tile dispatch**: If your model has two distinct `M` values
 (e.g., diffusion-LLM prefetch M=89 vs refine M=16), compile two PSOs
@@ -459,6 +515,58 @@ rule is *use smaller BM only when N alone can't fill the GPU*.
 
 **Commit**: see Dream-7B `src-metal/main.c` `d_linear_full_off`.
 
+### C5. Aspect-ratio dispatch — N-axis variant for small-N refine
+
+**What**: The N-axis analog of C4. When refine matmuls (`M ≤ 16`,
+already in the BM=16 path) have `N` too small to fill the GPU at the
+default BN, halve BN. For Dream-7B refine, N ∈ {3584 (q/o/down_proj),
+512 (k/v_proj GQA), 18944 (gate/up_proj), 152064 (lm_head)}. At BM=16
+BN=64, the N=3584 matmuls produce N/BN = 56 N-tiles — well below M4
+Max's "2 TGs/core" target (40 cores × 2 = 80 TGs) and the kernels
+become memory-latency-bound (effective BW ~150 GB/s vs ~400 GB/s for
+the wide N=18944 matmuls on the same tile). Halving BN to 32 doubles
+N-tiles to 112, fitting the target.
+
+```c
+// Refine dispatcher (called when M <= 16):
+int use_bn32 = (M <= 16) && (N < 5120);   // small-N → BN=32
+gpu_pipeline* pso = use_bn32 ? pso_gemm_bn32 : pso_gemm;   // BN=64 default
+```
+
+The trigger condition is symmetric to C4: at the chosen BM and WN,
+you need enough N-tiles to fill the GPU. On M4 Max the empirical
+threshold is `N < ~80 × BN_default`. The 12% wall win on Dream-7B
+BL=16 refine came from down_proj going 1082us → 741us (-31%) **plus**
+qkv/o_proj also picking up smaller wins at their N=3584 shape.
+
+**Don't confuse with C4**: C4 routes PREFETCH/prefill `K > N` shapes
+to smaller BM. C5 routes REFINE/decode small-N shapes to smaller BN.
+They're orthogonal — different M shape, different starvation axis —
+and they compose (you want both PSOs compiled and the dispatcher
+checks both conditions).
+
+**3-way tile routing** (the Dream-7B `d_linear_full_off` pattern):
+
+```c
+if (M > 16 && K <= N) {
+    pso = pso_gemm_bm32;             // prefetch wide-N (gate/up, lm_head)
+} else if (M <= 16 && N < 5120) {
+    pso = pso_gemm_bn32;             // refine small-N (qkv, o, down)
+} else {
+    pso = pso_gemm;                  // refine wide-N + prefetch K>N
+}
+```
+
+**When**: After C2 and C4. KPROF every refine matmul; the ones with
+effective BW well below another refine matmul of comparable arithmetic
+intensity are starved on N-tiles.
+
+**Speedup**: -5.4% wall on Dream-7B BL=16 refine bench. Stacks with
+C2 BK=64 + WN=4 for cumulative refine wins of ~25% from these tile-routing changes alone.
+
+**Commit**: Dream-7B `src-metal/main.c` `d_linear_full_off`
+(`use_bn32 = (M <= 16) && (N < 5120)`).
+
 ---
 
 ## D. SDPA — attention
@@ -529,6 +637,71 @@ kernel. Saves memory AND cache bandwidth.
 math.
 
 **Commits**: b09f12b, fc59ccf.
+
+### D5. K-per-iter ILP unrolling in the SDPA inner loop
+
+**What**: The SG-per-(query_token, head) tile's inner loop does one
+K-fetch + one `simd_sum` reduction per `lk` iteration. The K-band
+loads and the dot-accumulator chain form a serial dependency: the
+next K's vector load can't start until the previous `simd_sum`
+retires. Apple GPU instruction scheduling has to stall there.
+
+Unroll by N (typically 2, 4, or 8): process N K-vectors per outer
+iter with N independent dot accumulators. Same total instructions —
+N load groups, N FMA chains, N simd_sums — but the compiler now has
+N×D-per-lane worth of independent FMAs to interleave with the load
+group, hiding latency.
+
+```metal
+// 8 independent K-vectors per outer iter (M4 Max sweet spot for Lk≤~128):
+uint lk = 0;
+for (; lk + 8u <= Lk; lk += 8u) {
+    const device bfloat* k0 = K + ( lk       * Nkv + kvh) * D;
+    const device bfloat* k1 = K + ((lk + 1u) * Nkv + kvh) * D;
+    /* k2 .. k7 */
+    float dot0 = 0, dot1 = 0, /* dot2..dot7 */ dot7 = 0;
+    for (uint i = 0; i < D_PER_LANE; ++i) {
+        uint d = i * 32u + lane;
+        float qi = q_reg[i];
+        dot0 += qi * float(k0[d]);
+        dot1 += qi * float(k1[d]);
+        /* dot2 += ... ; dot7 += qi * float(k7[d]); */
+    }
+    dot0 = simd_sum(dot0); /* ... */ dot7 = simd_sum(dot7);
+    if (lane == 0u) {
+        scores[lk]      = dot0 * scale;
+        scores[lk + 1u] = dot1 * scale;
+        /* ... scores[lk + 7] = dot7 * scale; */
+    }
+}
+for (; lk < Lk; ++lk) { /* scalar tail, runs at most N-1 times */ }
+```
+
+Apply the SAME unrolling to the AV phase (8 V-vectors per iter with
+8 lane-local accumulators).
+
+**When**: After D1 (parallel softmax). Independent of D2 and D3 — the
+three compose orthogonally (D2 = pass count, D3 = SGs per row, D5 =
+ILP within each SG's K-stripe). For diffusion-LLM refine where
+`Lk ≈ L ≤ 100`, D5 alone gets most of the SDPA win; D3 helps less
+because there aren't many K-tiles per (q, h) to split.
+
+**Speedup**: -81% cumulative SDPA per-call on Dream-7B refine
+(224 us → 42 us across N=2 → N=4 → N=8). That's ~7–9% total wall
+depending on SDPA's share of the budget.
+
+**Tuning N**: 2 is risk-free and gets ~22%; 4 gets ~50% cumulative; 8
+gets ~81% on M4 Max. Going to 16 starts hurting register pressure
+(N×D_PER_LANE worth of K loads held in registers per iter). For Lk
+known to be < N at runtime, the unrolled main loop never runs and you
+pay the slow tail — gate the unrolled path on `Lk > N_UNROLL`.
+
+**Snippet**: extracted from Dream-7B `src-metal/kernels/sdpa_sg.metal`
+(QK + AV phases each have an 8-K-per-iter main loop and a scalar tail).
+
+**Commits**: Dream-7B `src-metal` bed13e6 (N=2, -22% per call),
+eebedc9 (N=4, -33% on top), a226fe4 (N=8, -57% on top). Cumulative
+-81%.
 
 ---
 
@@ -678,6 +851,78 @@ one row at a time; F1 already covers that case).
 **Snippet**: `patterns/softmax_argmax_per_row.metal`
 
 **Commit**: df3d9d1 (Dream-7B fastdllm reference port).
+
+### F4. Multi-SG-per-row reduction for large D (rmsnorm / per-row softmax)
+
+**What**: When `D` is large (typically `≥ 1024`), 1-SG-per-row RMSNorm
+launches only `M` SGs total. At `M = BL = 16` (Dream-7B refine), that's
+16 SGs — well below M4 Max's ~160 SG-slot capacity. Each SG chews
+through all `D` elements serially, so the kernel is memory-latency-
+bound rather than bandwidth-bound (a single rmsnorm call at D=3584 ran
+~62 µs when peak BW says it should be < 1 µs).
+
+Fix: assign `N_SGs` (4, 8, 16) SGs to each row. Each SG handles `D /
+N_SGs` of the row. After SG-local `simd_sum` of squares, the `N_SGs`
+partials merge through TG-mem into the row-wide `rrms`, then each SG
+normalizes its own slice.
+
+```metal
+// 16 SGs / row, 32 lanes / SG → 512 threads/TG covering D up to 16384:
+constant constexpr uint RN_SGS = 16u;
+
+kernel void rmsnorm_sg_bf16(/* X, W, Y, params */
+                            uint tgid [[threadgroup_position_in_grid]],
+                            uint sgid [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]])
+{
+    uint row = tgid;
+    float s = 0.0f;
+    for (uint d = sgid * 32u + lane; d < D; d += RN_SGS * 32u) {
+        float x = float(X[row * D + d]);
+        s += x * x;
+    }
+    s = simd_sum(s);                           // SG-local
+
+    threadgroup float partials[RN_SGS];
+    if (lane == 0) partials[sgid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0) {                           // SG 0 reduces RN_SGS partials
+        float p = (lane < RN_SGS) ? partials[lane] : 0.0f;
+        p = simd_sum(p);
+        if (lane == 0) partials[0] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rrms = rsqrt(partials[0] / float(D) + eps);
+
+    for (uint d = sgid * 32u + lane; d < D; d += RN_SGS * 32u) {
+        float xv = float(X[row*D + d]);
+        Y[row*D + d] = bfloat(bf16_round(xv * rrms) * float(W[d]));
+    }
+}
+```
+
+Launch with `dispatchThreadgroups: (M, 1, 1)`, threads/TG `(RN_SGS *
+32, 1, 1)`, no per-TG iteration over rows.
+
+**When**: After F1 (1-SG-per-row already in). KPROF rmsnorm/per-row
+softmax: if the kernel runs `≫ 1 µs` per call at moderate D and there
+are 60+ calls/forward, you're SG-undersubscribed and F4 is a free win.
+
+**Tuning N_SGs**: 4 SGs covers `D ≤ 1024` per lane×8; 16 SGs covers
+`D ≤ 16384` per lane×32. The aim is `M × N_SGs × 4 ≳ 160-320` SG
+slots scheduled at once on M4 Max. For Dream-7B refine
+(`M = 16, D = 3584`): 4 SGs (-4% wall), then 16 SGs (-3% wall on top,
+per-call 62 µs → 9 µs, -85%). Going beyond 16 SGs (32 SGs / 1024
+threads/TG) regressed on M4 Max — TG-mem partial-array overhead
+plus final SG-0 reduction work exceed the marginal SG win.
+
+**Don't confuse with D3**: D3 is multi-SG SDPA per (q, h) tile. F4 is
+multi-SG rmsnorm/softmax per row. Same principle (spawn more SGs when
+the natural launch shape under-fills the GPU) but different kernel
+category, different reduction semantics.
+
+**Commits**: Dream-7B `src-metal` f6a3e44 (rmsnorm 4 SGs/row, -4%
+wall), fbd01fe (rmsnorm 16 SGs/row, -3% more on top, per-call -85%).
 
 ---
 

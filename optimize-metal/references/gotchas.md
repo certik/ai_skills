@@ -48,6 +48,7 @@ the same symptoms again.
 | 38 | Two M shapes → two PSOs with different (BM, BK); pad workspaces to max BM | GEMM tuning |
 | 39 | Aspect-ratio routing: K > N matmuls need MORE TGs (use the smaller BM)    | GEMM tuning |
 | 40 | `newBufferWithBytesNoCopy:` per-tensor fails on 8-byte-aligned safetensors offsets | Startup |
+| 41 | Per-SG register budget is set by WN — `WN=4` unlocks larger BK     | GEMM tuning |
 
 ---
 
@@ -570,8 +571,16 @@ gpt-oss-style shapes on M4 Max. **It is NOT a universal sweet spot.**
 
 Tile sizes are sensitive to (model shapes, Apple GPU generation,
 whether MLX is using its NAX path). Always sweep
-`(BM, BN, WM, WN) ∈ {(16,16,1,1), (16,32,1,2), (32,32,2,2), (32,64,2,4)}`
-on your target machine and your model's actual K-dim.
+`(BM, BN, BK, WM, WN) ∈ {BM: 16 or 32, BN: 32 or 64, BK: 16/32/64,
+WM: 1 or 2, WN: 2 or 4}` on your target machine and your model's
+actual K-dim.
+
+**Include BK and WN=4 in the sweep**, not just `(BM, BN, WM, WN)`. The
+"BK=16 maximum" heard from the earlier gpt-oss / Qwen3.6 reference
+ports was an artifact of `WN=2`. With `WN=4` (4 SGs per TG instead of
+2), per-SG register pressure halves and BK=32 / BK=64 become viable
+— often the biggest single mid-stage win. See gotcha #41 for the
+per-SG register budget formula.
 
 The cost of sweeping is one afternoon. The cost of not sweeping can be
 30%+ left on the floor in prefill.
@@ -820,3 +829,80 @@ problem (paging during compute) than startup latency.
 `newBufferWithBytesNoCopy:` work — it can't. Either parallel pread
 (A9, fast enough) or whole-shard wrap + byte_off plumbing (correct,
 invasive). Default to A9.
+
+# 41. Per-SG register budget is set by WN — `WN=4` unlocks larger BK
+
+The intuitive reading of "BM=16 BK=16 is the safe ceiling on M4 Max,
+BK=32 spills" treats BK as a hard ceiling at the chosen BM. It's not.
+The ceiling is **per-SG** register pressure, which is set BOTH by tile
+sizes AND by how many SIMD groups split each TG. WN is the cheapest
+lever to bring an otherwise-spilling tile under the limit.
+
+Per-SG register-per-lane budget for a `simdgroup_matrix<8,8>` MMA
+GEMM kernel. Counted in fp32 32-bit registers per lane (each
+`simdgroup_matrix<float, 8, 8>` tile holds 64 floats / 32 lanes = 2
+fp32 regs/lane; each `simdgroup_matrix<bfloat, 8, 8>` tile holds 64
+bf16 / 32 lanes = 1 fp32-reg-equivalent/lane):
+
+```
+TM = BM / WM / 8;  TN = BN / WN / 8;  TKB = BK / 8;
+
+regs/lane ≈ TM·TN·2         # C accumulator (fp32, 2 regs/lane/tile)
+          + TM·TKB           # A staging   (bf16, 1 reg/lane/tile)
+          + TN·TKB           # Bt staging  (bf16, 1 reg/lane/tile)
+```
+
+(The corresponding kernel files in Dream-7B's `src-metal/kernels/`
+have comments quoting the same C/A/Bt counts — this formula matches
+the live source.)
+
+M4 Max ceilings (empirical, from Dream-7B refine sweep):
+
+- ~28–32 regs/lane → easy, high occupancy
+- ~40 regs/lane → fits but occupancy drops; pays its way only if the
+  bigger BK halves the K-loop count
+- ~50 regs/lane → border; some shapes regress silently
+- ~60+ regs/lane → catastrophic spill (4× slowdown observed)
+
+Concrete examples (BM=16, threads/TG = 32·WM·WN):
+
+| BN | BK | WN | TM, TN, TKB | C  | A  | Bt | Total | Status                            |
+|----|----|----|-------------|----|----|----|-------|-----------------------------------|
+| 64 | 16 | 2  | 2, 4, 2     | 16 |  4 |  8 |  28   | OK (original cargo-cult choice)   |
+| 64 | 32 | 2  | 2, 4, 4     | 16 |  8 | 16 |  40   | over budget — measured regression |
+| 64 | 32 | 4  | 2, 2, 4     |  8 |  8 |  8 |  24   | OK, -1.6% wall over BK=16         |
+| 32 | 64 | 2  | 2, 2, 8     |  8 | 16 | 16 |  40   | OK, but no headroom               |
+| 32 | 64 | 4  | 2, 1, 8     |  4 | 16 |  8 |  28   | OK, **-10% wall** (biggest mid-stage win) |
+| 64 | 64 | 2  | 2, 4, 8     | 16 | 16 | 32 |  64   | catastrophic 4× slowdown (spill)  |
+| 64 | 64 | 4  | 2, 2, 8     |  8 | 16 | 16 |  40   | OK (border), -6% wall vs BK=32    |
+| 64 | 64 | 8  | 2, 1, 8     |  4 | 16 |  8 |  28   | budget OK but 2× threads/TG no register benefit → regression |
+
+The pattern: when BK=64 puts the total over ~50 at your current WN,
+**try doubling WN before lowering BK**. Doubling WN halves both C
+and Bt contributions (A is unchanged — it's shared across the
+N-direction SGs). Often a -5–10% wall win because the larger BK
+halves the K-loop count and improves ILP.
+
+**Operational rule**:
+
+```python
+# Before declaring "BK=N doesn't fit", check both WN=2 AND WN=4.
+# WN=4 doubles SGs per TG (4 instead of 2). Same total threads/TG.
+def regs_per_lane(BM, BN, BK, WM, WN):
+    TM, TN, TKB = BM // WM // 8, BN // WN // 8, BK // 8
+    return TM*TN*2 + TM*TKB + TN*TKB    # C(fp32) + A(bf16) + Bt(bf16)
+
+for (BM, BN, BK) in candidate_tiles:
+    for WN in (2, 4):
+        if regs_per_lane(BM, BN, BK, 1, WN) <= 50:
+            sweep_this_tile_pso((BM, BN, BK, 1, WN))
+```
+
+Three Dream-7B commits hinge on this realization:
+- bd43e45 (BK=32 BN=64 WN=4, -1.6% wall over BK=16)
+- 83fadc9 (BK=32 BN=32 WN=4, -2.5% on top)
+- bfcfcf3 (BK=64 BN=32 WN=4, **-10% wall**, biggest mid-stage win)
+
+Without the WN=4 understanding, BK=64 looks impossible (spills at
+WN=2 default). With it, BK=64 is the new optimum tile dimension on
+M4 Max for Dream-7B's refine GEMMs.

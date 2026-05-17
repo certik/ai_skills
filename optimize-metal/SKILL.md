@@ -288,24 +288,52 @@ faster gen. The wins, in order:
    most of one full lm_head streaming pass.
 3. **C2 dual-tile-by-M** — two PSOs with different (BM, BK), picked by
    `M > 16` at dispatch. Best (BM, BK) for refine ≠ best for prefetch.
-4. **C2 BK=16** — unroll two K-bands per loop iter in the BM=16 GEMM.
-   Doesn't fit BM=32 (TM=4 doubles the A register footprint).
+4. **C2 BK=16 (and beyond) with WN tuning** — unroll multiple K-bands
+   per loop iter in the BM=16 GEMM. BK=16 is the easy first step. On
+   Dream-7B refine, BK=32 and BK=64 are also viable once you double
+   WN from 2 → 4 (which halves per-SG register pressure — see gotcha
+   #41 and the register-budget formula in catalog C2). Cumulative
+   gains: BK=32 at WN=4 was -1.6% / -2.5% wall in the two tile paths;
+   BK=64 at WN=4 in the BN=32 path was **-10% wall** (the single
+   biggest mid-stage win on this port). At WN=2 BK=64 catastrophically
+   spills — don't lower BK before trying WN=4 first.
 5. **B5 fused residual** — same as for autoregressive, modest win.
-6. **C4 aspect-ratio dispatch (BL ≥ 32 only)** — extend C2 with
-   `use_bm32 = (M > 16) && (K <= N)`. The MLP down_proj (K=I, N=H,
-   I >> H) is the only K > N matmul; at BM=32 BN=64 it has too few
-   N-tiles to fill the GPU, collapsing effective bandwidth. Routing
-   it to BM=16 doubles TG count. In our Dream-7B BL=32 port: down_proj
-   1082us → 741us, wall 1.72 s → 1.52 s (12% win, beats MLX 1.56 s).
+6. **C4 aspect-ratio dispatch (K > N, BL ≥ 32 only)** — extend C2
+   with `use_bm32 = (M > 16) && (K <= N)`. The MLP down_proj (K=I,
+   N=H, I >> H) is the only K > N matmul; at BM=32 BN=64 it has too
+   few N-tiles to fill the GPU, collapsing effective bandwidth.
+   Routing it to BM=16 doubles TG count. In our Dream-7B BL=32 port:
+   down_proj 1082us → 741us, wall 1.72 s → 1.52 s (12% win, beats MLX
+   1.56 s).
+7. **C5 aspect-ratio dispatch (small-N refine)** — N-axis sibling of
+   C4. Even within the BM=16 path, refine matmuls with N=3584 at
+   BN=64 produce only 56 N-tiles — under the M4 Max ~80 TG-slot
+   target. Extend the dispatcher with `use_bn32 = (M <= 16) && (N <
+   5120)`. Affects qkv, o_proj, down_proj in Dream-7B refine. -5.4%
+   wall on the BL=16 bench. (Compose with C4: 3-way routing —
+   prefetch-wide → BN=64 BM=32; refine small-N → BN=32 BM=16; else →
+   BN=64 BM=16.)
+8. **D5 SDPA K-per-iter ILP unrolling** — even after D1 (parallel
+   softmax), the inner `lk` loop has a serial dependency chain
+   between K-fetch and `simd_sum`. Unroll the QK and AV phases by
+   N ∈ {2, 4, 8} K-vectors per outer iter with N independent
+   accumulators. On Dream-7B refine: -22% per call at N=2, -33% on
+   top at N=4, -57% on top at N=8 (cumulative -81%, 224 µs → 42 µs
+   per call, ~7% of wall). Three commits, each safely revertable.
+9. **F4 Multi-SG-per-row RMSNorm** — at M=BL=16 the 1-SG-per-row
+   rmsnorm launches only 16 SGs total, well below the GPU's
+   capacity. Spawn N_SGs ∈ {4, 16} SGs per row, merge partials via
+   TG-mem. On Dream-7B (D=3584): 4 SGs/row -4% wall, then 16
+   SGs/row -3% wall on top. Per-call: 62 µs → 9 µs (-85%). Same
+   principle as D3 (multi-SG SDPA), different kernel category.
 
 Skip A4 (no usable overlap — refine step N+1's ids depend on step N's
 argmax). Skip A8 (the forward chain is mostly serial — Q/K/V→SDPA→o→
 gate/up→down — with very little independent work to interleave).
 
 See `references/diffusion-llm.md` for the full worked Dream-7B example
-(naive ~3.04 s → 2.63 s on the long bench, beating MLX's 2.74 s by 4%;
-and on the BL=32 short bench, 1.72 s → 1.52 s, beating MLX's 1.56 s
-by 3%).
+(naive ~10 s wall → 1.68 s gen / 2.17 s total wall on the BL=16
+long bench, 39% faster than MLX gen / 19% faster than MLX total).
 
 ## The optimization catalog
 
@@ -319,10 +347,10 @@ details.
 |---------|-----------------------------|----------------------------------------------------------------------|
 | A       | Host-side scheduling        | cmdbuf batching · param ring · 2-deep pipeline · concurrent encoder · parallel pread loader · parallel independent chains (A8) |
 | B       | GEMV (decode Linear)        | SG-per-output · bfloat4 · qmv4 register tile · TG-mem X share · residual epilogue |
-| C       | GEMM (prefill Linear)       | simdgroup_matrix MMA · tile-size sweep · fused-op templates           |
-| D       | SDPA (attention)            | parallel softmax · online softmax · multi-SG · sliding KV cache       |
+| C       | GEMM (prefill Linear)       | simdgroup_matrix MMA · tile-size sweep (incl. WN as register-pressure relief) · fused-op templates · aspect-ratio dispatch K>N (C4) AND small-N (C5) |
+| D       | SDPA (attention)            | parallel softmax · online softmax · multi-SG · K-per-iter ILP unrolling · sliding KV cache       |
 | E       | MoE                         | decode qmv4 · fused gate_up_swiglu · prefill sorted-gather GEMM · fused combine_scatter |
-| F       | Reductions                  | parallel argmax · parallel topk softmax · per-row softmax+argmax (F3, diffusion samplers) |
+| F       | Reductions                  | parallel argmax · parallel topk softmax · per-row softmax+argmax (F3, diffusion samplers) · multi-SG-per-row rmsnorm (F4, large D) |
 | G       | Decode/Prefill split        | two implementations, dispatch by Lq                                   |
 | H       | Host/GPU boundary cleanup   | glue kernels (H1, often biggest single win) · embed+forward+argmax merge · output-row pruning via X offset (H3) |
 | I       | Recurrent / SSM             | SG-per-(state_row, state_dim)                                         |
@@ -417,6 +445,31 @@ optimization:
   with `use_bm32 = (M > 16) && (K <= N)` so K > N shapes route to the
   smaller BM and double their TG count. 12% wall win on Dream-7B BL=32
   refine from a single-line change. (gotcha #39, catalog C4)
+- **Small-N REFINE matmuls are also TG-starved — but on the N-axis.**
+  The N-axis sibling of the above: refine (M ≤ 16, already in BM=16)
+  with small N (3584 etc.) at BN=64 produces too few N-tiles to fill
+  the GPU. Extend the dispatcher with `use_bn32 = (M <= 16) && (N <
+  5120)` to halve BN and double N-tiles. -5.4% wall on Dream-7B BL=16
+  refine bench. (catalog C5)
+- **"BK=16 is the maximum" is a WN=2 artifact, not a fundamental
+  ceiling.** Per-SG register pressure (which sets the spill ceiling)
+  drops by ~half when you go `WN=2` → `WN=4`, often unlocking BK=32 or
+  BK=64. -6% to -10% wall on Dream-7B refine from this realization,
+  per tile. Always sweep BK ∈ {16, 32, 64} with the matching WN. (gotcha
+  #41, catalog C2 + register-budget formula)
+- **SDPA K-per-iter ILP unrolling is a separate axis from D1/D2/D3.**
+  Even after parallel/online/multi-SG SDPA, the inner `lk` loop has a
+  serial dependency chain. Unrolling 8 K-vectors per iter with 8
+  independent dot accumulators lets the compiler interleave loads and
+  arithmetic. -81% cumulative SDPA per-call on Dream-7B refine across
+  three commits (N=2→4→8). (catalog D5)
+- **1-SG-per-row rmsnorm undersubscribes the GPU when M is small.**
+  At `M = BL = 16`, 1 SG/row launches only 16 SGs total — vs M4 Max's
+  ~160 SG-slot capacity. The kernel becomes memory-latency-bound
+  (62 µs/call when peak BW says < 1 µs). Spawn 4 or 16 SGs/row, merge
+  the per-SG partials through TG-mem. -7% wall on Dream-7B refine
+  cumulative (4 SGs/row + later 16 SGs/row). Same principle as D3 for
+  SDPA, different kernel. (catalog F4)
 - **Weight loading via `mmap + memcpy` is page-fault-bound at ~1 GB/s
   on macOS.** Even with `dispatch_apply` parallelism, you cap around
   4 GB/s aggregate because the macOS VM fault handler serializes on

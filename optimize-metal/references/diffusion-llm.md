@@ -184,7 +184,7 @@ rope_Q/rope_K are independent, cache_write_K/cache_write_V are
 independent. Wrap each independent group in a `gpu_cmdbuf_barrier`
 fence.
 
-### Step 6 (BL ≥ 32 only): Aspect-ratio dispatch for down_proj (C4)
+### Step 6 (BL ≥ 32 only): Aspect-ratio dispatch K>N for down_proj (C4)
 
 At small BL (e.g., 16) the refine M is ≤16 and everything routes to
 the BM=16 path, so this step is a no-op. At BL ≥ 32 refine starts
@@ -208,6 +208,82 @@ On Dream-7B BL=32 this drops down_proj from 1082us → 741us per call
 (-31%), refine from 73ms → 63ms per step, and wall from **1.72 s →
 1.52 s (12% faster, beats MLX 1.56 s)**. See gotcha #39 and catalog
 C4 for the full analysis.
+
+### Step 7: Aspect-ratio dispatch — small-N refine BN=32 (C5)
+
+The N-axis sibling of Step 6. Even within the BM=16 refine path, the
+matmuls with N=3584 (qkv, o_proj, down_proj) at BN=64 produce only
+56 N-tiles — under M4 Max's ~80 TG-slot target. Halving BN to 32
+doubles N-tiles to 112 and restores memory-level parallelism.
+
+Extend Step 3's dispatcher to a 3-way:
+
+```c
+if (M > 16 && K <= N) {
+    pso = pso_gemm_bm32;            // prefetch wide-N (Step 6/C4)
+} else if (M <= 16 && N < 5120) {
+    pso = pso_gemm_bn32;            // refine small-N (this step, C5)
+} else {
+    pso = pso_gemm;                 // refine wide-N + prefetch K>N
+}
+```
+
+On Dream-7B BL=16 refine: -5.4% wall. See catalog C5.
+
+### Step 8: BK > 16 with WN=4 in the BN=32 / BN=64 paths (C2 + gotcha #41)
+
+The "BK=16 is the maximum on M4 Max" rule is a `WN=2` artifact, not
+a hardware ceiling. The hard limit is per-SG register pressure (see
+gotcha #41's register-budget formula). Going `WN=2 → WN=4` halves
+per-SG regs and unlocks BK=32 and BK=64.
+
+On Dream-7B:
+- BK=32 BN=32 WN=4: -2.5% wall over BK=16
+- BK=32 BN=64 WN=4: -1.6% wall
+- **BK=64 BN=32 WN=4** (BM=16, 48 regs/lane): -10% wall — biggest
+  single mid-stage win.
+- BK=64 BN=64 WN=4: -6% wall.
+
+At WN=2 BK=64 catastrophically spills (104 regs/lane → 4× slowdown).
+**Sweep BK ∈ {16, 32, 64} × WN ∈ {2, 4}** before declaring a tile
+unfit.
+
+### Step 9: SDPA K-per-iter ILP unrolling (D5)
+
+Even after D1 (parallel softmax), the inner `lk` loop has a serial
+dependency between the K-fetch and the `simd_sum` reduction.
+Unroll the QK phase (and AV phase) by N K-vectors per outer iter
+with N independent dot/V accumulators. The compiler then interleaves
+N K-band loads with N FMA chains, hiding load latency.
+
+On Dream-7B refine: -22% per call at N=2, -33% on top at N=4, -57%
+on top at N=8 (cumulative -81%, 224 µs → 42 µs per call, ~7% of
+wall). Tail loop handles `Lk mod N` iters scalar.
+
+```metal
+for (; lk + 8u <= Lk; lk += 8u) {
+    // load 8 K-vectors, compute 8 independent dots,
+    // simd_sum each into 8 scores; write all 8.
+}
+for (; lk < Lk; ++lk) { /* scalar tail */ }
+```
+
+See catalog D5 for the full snippet.
+
+### Step 10: Multi-SG-per-row RMSNorm for large D (F4)
+
+At M = BL = 16, the 1-SG-per-row rmsnorm launches only 16 SGs total
+— well below M4 Max's ~160 SG-slot capacity. The kernel becomes
+memory-latency-bound. Fix: spawn 4 (or 16) SGs per row, each
+processing `D / N_SGs` of the row, merge partials through TG-mem.
+
+On Dream-7B (D=3584):
+- 4 SGs/row: -4% wall (per-call 62 µs → ~16 µs)
+- 16 SGs/row: -3% wall on top (per-call → 9 µs, -85% total)
+
+32 SGs/row regressed — 1024 threads/TG exceeds the practical
+occupancy sweet spot, and the final SG-0 reduction overhead grows.
+16 SGs is the peak on M4 Max for D=3584. See catalog F4.
 
 ## End-to-end validation
 
@@ -280,3 +356,57 @@ This is the lesson that put A9 as **Step 0** in this attack order
 "simpler" alternative — it doesn't work because safetensors offsets
 aren't page-aligned). Always log `[startup] tokenizer=... weights=...
 total=...` before declaring the gen wins sufficient.
+
+### Follow-up #3: pushing refine wall from 2.60 → 1.68 s on the BL=16 long bench
+
+The BL=32 short bench (Follow-up #1, #2) doesn't exercise everything
+— it has only 24 refine steps. The BL=16 long bench (max_new_tokens=64,
+steps=64, threshold=0.9 — Dream's reference benchmark) runs ~1064
+refine forwards in this port, so per-call wins compound. After the
+short-bench wins above, the long-bench refine wall was 2.60 s — fine
+but with room left. The Steps 7–10 refinements drove it to 1.68 s
+(39% faster than MLX's 2.74 s).
+
+| Stage                                            | Wall (s) | Per-call wins                      |
+|--------------------------------------------------|----------|------------------------------------|
+| All optimizations above (Steps 0–6)              | 2.60     | refine 73 ms/step                  |
+| **Step 7** (BN=32 small-N refine, C5)            | 2.46     | qkv/o/down at N=3584: -X%/-Y%      |
+| **Step 8a** (BK=32 in BN=32 GEMM, WN=4)          | 2.42     | -1.6% wall                         |
+| **Step 8b** (BK=32 in BN=64 GEMM, WN=4)          | 2.36     | -2.5% wall on top                  |
+| **Step 9a** (SDPA 2-K-per-iter ILP, D5)          | 2.27     | sdpa per-call: 224 → 173 µs (-22%) |
+| **Step 9b** (SDPA 4-K-per-iter ILP)              | 2.19     | sdpa per-call: 173 → 116 µs (-33%) |
+| **Step 8c** (BK=64 in BN=32 GEMM, WN=4)          | **1.97** | -10% wall — biggest mid-stage win  |
+| **Step 8d** (WN=4 BK=64 in BN=64 GEMM, C2)       | 1.85     | -6% wall on top                    |
+| **Step 8e** (WN=4 BK=64 in BN=32 GEMM, C2 refresh) | 1.81  | -2% wall                           |
+| **Step 9c** (SDPA 8-K-per-iter ILP)              | 1.77     | sdpa per-call: 116 → 42 µs (-64%)  |
+| **Step 10a** (rmsnorm 4 SGs/row, F4)             | 1.74     | rmsnorm per-call: 62 → 16 µs       |
+| **Step 10b** (rmsnorm 16 SGs/row, F4)            | **1.68** | rmsnorm per-call: 16 → 9 µs (-85% total) |
+| MLX target                                       | 2.74     | —                                  |
+
+Final on this bench: **39% faster than MLX** (1.68 s vs 2.74 s),
+gpu_busy/wall = 94%.
+
+Diagnostic observations from this run:
+
+1. **WN=4 was the unlock for BK > 16.** Without the WN=2 → WN=4
+   change, BK=32 spilled and BK=64 catastrophically spilled (4×
+   slowdown). The "BK=16 is the maximum on M4 Max" rule of thumb
+   from the gpt-oss / Qwen3.6 ports was a WN=2 artifact. Sweep BK ∈
+   {16, 32, 64} × WN ∈ {2, 4} on every new model.
+
+2. **SDPA ILP unrolling is orthogonal to D1/D2/D3.** Even with parallel
+   softmax already in (D1) and short Lk (≤89, so D3 multi-SG split
+   has limited room), unrolling the inner loop by 8 K-vectors with
+   8 independent accumulators got -81% per-call. Worth applying
+   even on autoregressive decoders if SDPA is hot.
+
+3. **Multi-SG rmsnorm only matters when D and call count are both
+   large.** At M=16 D=3584 with 60+ calls/forward, the kernel was
+   memory-latency-bound at 62 µs/call. 16 SGs/row brought it under
+   10 µs. On a model where rmsnorm is < 1% of wall, skip this step.
+
+4. **Per-kernel attribution kept us honest.** Several "obvious" wins
+   (WN=8, BK=128, pre-transposed W, TG-mem A staging, fused
+   gate_up_silu) regressed when measured. KPROF every change. The
+   list of failures-from-this-port is in the dream repo's
+   `src-metal/PERF.md` "What was tried and didn't help".
