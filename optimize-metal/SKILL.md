@@ -3,19 +3,23 @@ name: optimize-metal
 description: >
   Optimize a working but naive Apple-GPU Metal LLM implementation (from
   the port-c-to-metal skill, in ./src-metal/) to match MLX speed within
-  ±5%. Catalog: SIMD-group-per-output GEMV, bfloat4 loads, qmv4 register
-  tiling, simdgroup_matrix MMA for prefill, sorted-gather MoE, online-
-  softmax SDPA, multi-SG SDPA, parallel argmax, 2-deep cmdbuf pipeline,
-  persistent + const param buffers, concurrent encoder, fused residual
-  epilogues, decode/prefill split, GPU glue kernels for host-side
-  breaks (often the biggest single decode win), SG-per-(row,dim) for
-  RNN/SSM recurrences. Also handles diffusion-LLM samplers
+  ±5% on BOTH per-token tok/s AND total wall time (including weight
+  load). Catalog: SIMD-group-per-output GEMV, bfloat4 loads, qmv4
+  register tiling, simdgroup_matrix MMA for prefill, sorted-gather MoE,
+  online-softmax SDPA, multi-SG SDPA, parallel argmax, 2-deep cmdbuf
+  pipeline, persistent + const param buffers, concurrent encoder, fused
+  residual epilogues, decode/prefill split, GPU glue kernels for
+  host-side breaks (often the biggest single decode win),
+  SG-per-(row,dim) for RNN/SSM recurrences, parallel pread weight
+  loader (one fd per shard via dispatch_apply — beats mmap+memcpy 2–3×
+  and brings startup below MLX). Also handles diffusion-LLM samplers
   (Dream / LLaDA / fastdllm): GPU per-row softmax+argmax+confidence
   (replaces the host_post loop), single-row output pruning via X
   offset, dual-tile (BM, BK) GEMM dispatch by M. Validates tokens
   against the C reference after each change. Triggers: optimize metal,
   speed up metal, match mlx speed, gpu optimization, metal performance,
-  kernel tuning, diffusion LLM (Dream / LLaDA / fastdllm) on metal.
+  kernel tuning, startup latency, weight loading, total wall time,
+  diffusion LLM (Dream / LLaDA / fastdllm) on metal.
 ---
 
 # optimize-metal — make the Metal port fast (match MLX ±5%)
@@ -73,6 +77,12 @@ build-c-reference  →  port-c-to-metal  →  optimize-metal
 
 - Decode tok/s within ±5% of MLX on the same prompt + machine.
 - Prefill tok/s within ±5% of MLX on the same prompt.
+- **Total wall time within ±5% of MLX** when startup latency is a
+  meaningful fraction of total (e.g., short benchmarks, diffusion LLMs
+  where gen is ~1 s — load can be 30–50% of total). This is what the
+  user sees from `time ./your_binary`. Hitting per-token parity but
+  losing on total because weight load is 2× slower than MLX is a real
+  failure mode that the tok/s metric hides.
 - First N generated tokens (N ≥ 4, ideally 16) match the C reference
   exactly. Later tokens may diverge due to pure numerical drift; that
   is acceptable as long as the divergence is *purely numerical* (no
@@ -151,6 +161,23 @@ is actually a sampler problem (F3): there's nothing to overlap with,
 the CPU is genuinely the gap. See `references/profiling.md` and
 `references/diffusion-llm.md`.
 
+**Print a phase-breakdown line at startup.** Before any tok/s
+optimization, log a one-liner:
+
+```c
+fprintf(stderr,
+    "[startup] tokenizer=%.3fs config=%.3fs metal=%.3fs weights=%.3fs total=%.3fs\n",
+    t_tok - t_start, t_cfg - t_tok, t_metal - t_cfg,
+    t_weights - t_metal, t_weights - t_start);
+```
+
+If `weights` dominates startup (almost always does — it's GB of I/O),
+apply **A9 parallel pread weight loader** immediately. On Dream-7B
+(14 GB, 4 shards, M4 Max) this dropped `weights` from 1.71 s → 0.82 s
+and total wall from 3.08 s → 2.17 s, beating MLX's 2.67 s by 19% on a
+short fastdllm bench where gen is only 1.18 s. See catalog A9 and
+gotcha #29.
+
 Use `mlx_lm`-equivalent timing (`tps = (n_gen - 1) / decode_time`,
 exclude the first decode step) so you can compare apples to apples with
 MLX, AND use ≥64 tokens AND best-of-3 runs: short runs on busy machines
@@ -169,6 +196,13 @@ truth, but this list saves you most of the exploration cost.
 
 ### First-pass — naive → mid-pipeline (~1.9 → ~43 tok/s for Qwen3.6)
 
+0. **Parallel pread weight loader** (A9). Apply from the very first
+   port — startup is the most user-visible "wait" and the win is huge
+   (2–3× on weight load, often turning a 10 s startup into 3.5 s on a
+   35 GB model, or 1.7 s into 0.82 s on a 7 B model). The naive
+   `mmap + memcpy per tensor` is page-fault-bound at ~1 GB/s on macOS
+   regardless of how many threads you throw at it. See catalog A9 and
+   gotcha #29.
 1. **Parallel argmax** (F1). 1-thread argmax over 200k+ vocab is the
    most common "why is decode capped at <5 tok/s" answer.
 2. **SIMD-group-per-output for ALL reduced-precision GEMV** (B1).
@@ -235,8 +269,18 @@ A/H techniques can't reach.
 
 The empirical order is different. Most A/H techniques (A4 2-deep
 pipeline, B5 fused residual, A8 parallel chains) do less work or
-don't help at all. The wins, in order:
+don't help at all. **Total wall (load + gen) matters as much as
+gen tok/s on these models** — gen is only ~1 s so a slow weight
+loader can easily make the whole process slower than MLX even with
+faster gen. The wins, in order:
 
+0. **A9 parallel pread weight loader** — even more important than for
+   autoregressive ports, because diffusion gen is short (~1 s on
+   short benches), so weight load is a comparable fraction of total
+   wall. On Dream-7B (4 shards, 14 GB, M4 Max): naive 1.71 s →
+   parallel pread 0.82 s, total wall 3.08 s → 2.17 s beating MLX's
+   2.67 s by 19% even before any gen-side optimization on the BL=32
+   bench.
 1. **F3** — per-row softmax+argmax+confidence on GPU. Replaces the
    host loop that shows up as a large `host_post` invisible to
    `gpu_busy`. In one port: 0.25 s → 0.00 s, wall 2.90 → 2.63 s.
@@ -373,6 +417,22 @@ optimization:
   with `use_bm32 = (M > 16) && (K <= N)` so K > N shapes route to the
   smaller BM and double their TG count. 12% wall win on Dream-7B BL=32
   refine from a single-line change. (gotcha #39, catalog C4)
+- **Weight loading via `mmap + memcpy` is page-fault-bound at ~1 GB/s
+  on macOS.** Even with `dispatch_apply` parallelism, you cap around
+  4 GB/s aggregate because the macOS VM fault handler serializes on
+  per-page locks. Use **parallel `pread()` per shard** (A9) — one fd
+  per shard, sequential reads inside, `dispatch_apply` across shards.
+  Brings startup below MLX on the same machine. Especially important
+  for diffusion LLMs / short benches where gen is comparable in size
+  to load. (gotcha #29, catalog A9)
+- **`newBufferWithBytesNoCopy:` per-tensor isn't a shortcut.** It
+  looks attractive (skip the bulk copy entirely!) but tensor data
+  offsets inside a safetensors shard are typically 8-byte aligned,
+  not the 16 KB page-aligned that `newBufferWithBytesNoCopy:` requires
+  on Apple Silicon. The only viable zero-copy approach is wrap the
+  *whole shard* as one Metal buffer + plumb per-tensor byte offsets
+  through every dispatch helper, which is invasive. Parallel pread
+  (A9) is simpler and already beats MLX. (gotcha #40)
 
 ## Commit strategy
 

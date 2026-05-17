@@ -100,9 +100,29 @@ right for BOTH. See "dual-tile dispatch" below.
 
 ## What DOES help (in order)
 
+### Step 0: Parallel pread weight loader (A9)
+
+**Do this first** — even more important on diffusion LLMs than on
+autoregressive ports. Diffusion gen is short (Dream-7B BL=32 short
+bench: ~1.2 s) so weight load can be a comparable fraction of total
+wall. A 1.7 s naive `mmap+memcpy` weight load against a 1.2 s gen
+makes "we beat MLX on tok/s" still lose on `time ./binary`.
+
+Replace `gpu_buf_new_from(g_ctx, t->data, t->nbytes)` (memcpy from
+the mmap'd shard) with one `pread()` thread per shard via
+`dispatch_apply`. On Dream-7B (14 GB, 4 shards, M4 Max): weight load
+drops 1.71 s → 0.82 s, total wall 3.08 s → 2.17 s, MLX target 2.67 s
+— we beat MLX on total wall by 19% (and that's *before* the gen-side
+wins below).
+
+Pattern: `patterns/load_parallel_pread.c`. Catalog: A9.
+Gotcha: #29 (why mmap+memcpy is slow), #40 (why the obvious zero-copy
+shortcut doesn't work).
+
 ### Step 1: GPU per-row softmax + argmax + confidence (F3)
 
-The single biggest diffusion-LLM win, period. Replace the host loop
+The single biggest *gen-time* diffusion-LLM win (the single biggest
+overall win is Step 0 above when load > gen). Replace the host loop
 above with one Metal kernel:
 
 ```
@@ -240,3 +260,23 @@ and the bottleneck wasn't one of the usual suspects. Always KPROF
 before optimizing past the empirical attack order; per-kernel attribution
 is what makes "this matmul is twice as slow as the matmul of the same
 size" visible.
+
+### Follow-up #2: total wall including startup latency (Step 0 / A9)
+
+After landing the gen wins above, gen on the BL=32 short bench was
+~1.18 s — already faster than MLX's 1.57 s — but `time ./dream`
+reported 3.08 s total vs MLX's 2.67 s total. We were losing on total
+wall despite winning on gen. Phase-breakdown timing showed weight
+loading at 1.71 s, paid before any GPU compute starts.
+
+| Stage                                    | Weights (s) | Gen (s) | Total wall (s) | Notes               |
+|------------------------------------------|-------------|---------|----------------|---------------------|
+| Per-tensor `gpu_buf_new_from` (mmap+memcpy) | 1.71     | 1.18    | 3.08           | slower than MLX (2.67) |
+| **After A9 (parallel pread per shard)**  | **0.82**    | 1.18    | **2.17**       | **19% faster than MLX** |
+| MLX target                               | ~1.1        | 1.57    | 2.67           | —                   |
+
+This is the lesson that put A9 as **Step 0** in this attack order
+(and gotcha #40 for the trap of trying per-tensor zero-copy as a
+"simpler" alternative — it doesn't work because safetensors offsets
+aren't page-aligned). Always log `[startup] tokenizer=... weights=...
+total=...` before declaring the gen wins sufficient.

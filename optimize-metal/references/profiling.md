@@ -72,6 +72,49 @@ If `host_post` is more than ~5% of wall, attack F3 (move the per-row
 softmax/argmax to the GPU as a single kernel). For a Dream-7B port,
 F3 dropped `host_post` 0.25 → 0.00 s and `wall` 2.90 → 2.63 s.
 
+## Startup phase-breakdown: where do those user-visible seconds go?
+
+`time ./your_binary` is the user's actual experience. If you're
+matching MLX on gen tok/s but `time` shows you're slower overall, the
+gap is in startup — and a one-line phase breakdown will tell you
+exactly where:
+
+```c
+double t_start   = now_sec();
+// ... tokenizer init ...
+double t_tok     = now_sec();
+// ... config / json parse ...
+double t_cfg     = now_sec();
+// ... Metal init + kernel compile + PSO lookup ...
+double t_metal   = now_sec();
+// ... weight load + RoPE inv_freqs + arch open ...
+double t_weights = now_sec();
+
+fprintf(stderr,
+    "[startup] tokenizer=%.3fs config=%.3fs metal=%.3fs weights=%.3fs total=%.3fs\n",
+    t_tok-t_start, t_cfg-t_tok, t_metal-t_cfg,
+    t_weights-t_metal, t_weights-t_start);
+```
+
+For Dream-7B (14 GB) on M4 Max, the naive (per-tensor
+`gpu_buf_new_from`) breakdown was:
+
+```
+[startup] tokenizer=0.003s config=0.000s metal=0.025s weights=1.709s total=1.735s
+```
+
+`weights` is ~98% of startup. The fix is catalog A9 (parallel pread
+per shard). Tokenizer / config / Metal init are essentially free —
+don't bother optimizing them. After A9:
+
+```
+[startup] tokenizer=0.003s config=0.000s metal=0.035s weights=0.817s total=0.856s
+```
+
+Especially important for **diffusion LLMs and short benches** where
+gen itself is ~1 s — startup latency can easily be 30–50% of total
+wall, and "matching MLX on tok/s" is not enough.
+
 ## KPROF — per-kernel GPU time (optional)
 
 `KPROF=1` wraps each dispatch in its own cmdbuf with commit+wait so you

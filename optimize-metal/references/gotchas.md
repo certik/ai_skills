@@ -47,6 +47,7 @@ the same symptoms again.
 | 37 | `gpu_buf_contents()` is zero-copy but per-step CPU reads still hit caches | Sampler perf |
 | 38 | Two M shapes → two PSOs with different (BM, BK); pad workspaces to max BM | GEMM tuning |
 | 39 | Aspect-ratio routing: K > N matmuls need MORE TGs (use the smaller BM)    | GEMM tuning |
+| 40 | `newBufferWithBytesNoCopy:` per-tensor fails on 8-byte-aligned safetensors offsets | Startup |
 
 ---
 
@@ -495,10 +496,24 @@ speedup, and brings startup time to **below MLX's**.
 
 **Pattern**: `patterns/load_parallel_pread.c`
 
-**Measurement** (35 GB Qwen3.6 model, M4 Max, warm cache):
+**Measurement** (35 GB Qwen3.6 model, M4 Max, warm cache, 8 shards):
   - mmap + single-threaded memcpy + madvise: 5s (madvise) + 5s (copy) = 10s
   - mmap + dispatch_apply(per-array) memcpy:  8s
   - parallel pread per shard:                   3.5s   ← winner
+
+**Measurement** (14 GB Dream-7B model, M4 Max, warm cache, 4 shards):
+  - per-tensor `gpu_buf_new_from` (mmap+memcpy):  1.71 s (≈ 8 GB/s)
+  - parallel pread per shard:                     0.82 s (≈ 17 GB/s aggregate, beats MLX)
+
+Total wall on the Dream-7B BL=32 short fastdllm bench:
+  - Before A9: 3.08 s (slower than MLX's 2.67 s despite faster gen).
+  - After A9:  2.17 s — **beats MLX by 19%** on total wall time,
+    not just per-token. Gen tok/s was already faster (1.18 s vs MLX's
+    1.57 s); A9 made the total beat MLX too.
+
+This is a good illustration of why total wall is a real success
+criterion, not just tok/s. See gotcha #40 for why per-tensor
+`newBufferWithBytesNoCopy:` isn't a viable alternative.
 
 # 30. First Metal cmdbuf pays ~1 s residency wiring per ~30 GB of buffers
 
@@ -762,3 +777,46 @@ o_proj when the head_dim×num_heads is smaller than hidden) is a
 candidate. Always KPROF the candidate matmuls and check effective
 bandwidth = (matrix_bytes / per_call_time) against your device peak.
 If you're below 60% of peak on a single matmul, you're TG-starved.
+
+# 40. `newBufferWithBytesNoCopy:` per-tensor fails on 8-byte-aligned safetensors offsets
+
+It's tempting, after seeing the cost of the bulk weight memcpy in
+gotcha #29, to skip the copy entirely with
+`[device newBufferWithBytesNoCopy:host_ptr length:nbytes options:...]`.
+On Apple Silicon (unified memory) this would let Metal kernels read
+straight out of the page cache — zero copy.
+
+**The trap**: Apple's API requires BOTH the host pointer AND the
+length to be `vm_page_size`-aligned (16 KB on M-series). The mmap of
+a safetensors shard *is* page-aligned (mmap guarantees the base ptr,
+length can be rounded up). But individual tensor offsets within a
+shard are only 8-byte aligned — they're computed from
+`8-byte header_len + JSON header + concatenated tensor blobs`, and
+neither the JSON header size nor any tensor offset is forced to a
+16 KB boundary. So **per-tensor** `newBufferWithBytesNoCopy:` either
+rejects the call or, worse, silently corrupts data.
+
+**The workaround that works in principle**: wrap the *whole shard*
+as one Metal buffer (its base ptr IS page-aligned; round length up
+to a page), then route every dispatch for weights in that shard to
+`gpu_arg_buf { shard_buf, off_bytes = tensor_offset_in_shard }`. The
+`off_bytes` field at bind time has finer alignment requirements
+(typically the dtype size — 2 bytes for bf16). This works, but it's
+invasive: every weight-bearing field in your layer struct goes from
+`gpu_buf*` to `(gpu_buf* shard, size_t off)`, and every dispatch
+helper that took a `gpu_buf*` weight now takes a `gpu_arg_buf`.
+
+**Why we don't bother in practice**: gotcha #29's parallel pread
+loader (catalog A9) already lands startup time *below* MLX on both
+Qwen3.6-35B and Dream-7B. The whole-shard nocopy refactor would shave
+the remaining ~0.8 s of warm-cache copy at the cost of touching ~50
+dispatch sites and a new gpu_buf-view bookkeeping array. We measured
+A9 is enough and stopped there. If your model is larger than RAM and
+the bulk pread fundamentally can't fit, then the whole-shard nocopy
+becomes mandatory — but at that point you're solving a different
+problem (paging during compute) than startup latency.
+
+**Summary**: don't waste a day trying to make per-tensor
+`newBufferWithBytesNoCopy:` work — it can't. Either parallel pread
+(A9, fast enough) or whole-shard wrap + byte_off plumbing (correct,
+invasive). Default to A9.

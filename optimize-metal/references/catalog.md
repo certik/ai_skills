@@ -197,12 +197,38 @@ and use **parallel `pread()` per shard**:
 Also: **delete any `madvise(MADV_WILLNEED)` calls** — on macOS that's
 blocking, adding ~5s for 35 GB (see `references/gotchas.md` #28).
 
+**Diagnostic — phase-breakdown line**: before applying A9 (and after,
+to confirm), log a one-liner separating tokenizer / config / metal /
+weights / total. If `weights` is 30%+ of `total`, A9 will pay off
+significantly:
+
+```
+[startup] tokenizer=0.003s config=0.000s metal=0.035s weights=0.817s total=0.856s
+```
+
+**Why not zero-copy `newBufferWithBytesNoCopy:` per tensor?** Apple's
+API requires the host pointer AND length to be `vm_page_size`-aligned
+(16 KB on Apple Silicon). Inside a safetensors shard, individual
+tensor offsets are 8-byte aligned (set by the JSON header layout), so
+per-tensor wrap fails. The *whole shard* IS page-aligned (mmap
+guarantees this for the base ptr; round length up to a page), so you
+*can* wrap one buffer per shard and pass per-tensor byte offsets via
+`gpu_arg_buf.off_bytes` to every dispatch — but plumbing offsets
+through every weight reference is invasive and parallel pread (this
+section) already lands startup below MLX, so the refactor isn't worth
+it on shipping ports. See gotcha #40.
+
 **When**: From the very first port — startup is the most user-visible
 "wait" and it's trivial to fix.
 
-**Speedup**: 28.5s → 5s startup (Qwen3.6-35B, M4 Max, 8 shards). This
-**beats MLX's** ParallelFileReader on the same machine. See
-`references/gotchas.md` #28, #29.
+**Speedup**:
+- 28.5 s → 5 s startup (Qwen3.6-35B, 8 shards × ~4 GB, M4 Max).
+- 1.71 s → 0.82 s weights (Dream-7B, 4 shards × ~3.5 GB, M4 Max),
+  total wall 3.08 s → 2.17 s — beats MLX (2.67 s) on a short
+  diffusion bench by 19%.
+
+Both beat MLX's `ParallelFileReader` on the same machine. See
+`references/gotchas.md` #28, #29, #40.
 
 **Snippet**: `patterns/load_parallel_pread.c`
 

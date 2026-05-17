@@ -7,9 +7,13 @@
 //       ~6 GB/s on macOS due to page-fault serialization (see GOTCHAS
 //       #28, #29).
 //
-// EXPECTED SPEEDUP: ~2.5–3× over mmap+memcpy. For a 35 GB / 8-shard
-//       model on M4 Max, 10s → 3.5s startup, beating MLX's
-//       ParallelFileReader by a small margin.
+// EXPECTED SPEEDUP: ~2.5–3× over mmap+memcpy. Two confirmed data points:
+//   - Qwen3.6-35B-A3B (8 shards × ~4 GB, M4 Max): 10 s → 3.5 s startup.
+//   - Dream-7B        (4 shards × ~3.5 GB, M4 Max): 1.71 s → 0.82 s
+//     weights; total wall 3.08 s → 2.17 s, beating MLX's 2.67 s by
+//     19% on a short fastdllm bench (BL=32, max_tokens=32).
+// In both cases, the resulting startup is below MLX's
+// ParallelFileReader on the same machine.
 //
 // REQUIREMENTS:
 //   - Your safetensors header has a list of (tensor_name, dtype, shape,
@@ -27,6 +31,12 @@
 //     per thread, and adding more workers does not help.
 //   - Buffer ALLOCATION is not guaranteed thread-safe in Metal.
 //     Do the alloc pass serially, then dispatch_apply the copy.
+//   - Do NOT try `newBufferWithBytesNoCopy:` per tensor as a "skip
+//     the copy entirely" shortcut. Tensor offsets within a
+//     safetensors shard are 8-byte aligned, NOT the 16 KB page-
+//     aligned that Apple's nocopy API requires. The whole-shard
+//     wrap+offset workaround exists but is invasive; parallel pread
+//     is already fast enough. See gotcha #40.
 //
 // Reference: this is what MLX's mlx/io/load.cpp does
 // (ParallelFileReader with ThreadPool{4} + batch_size 32 MB).
