@@ -1,0 +1,545 @@
+// src-metal/main.c.template — naive 1:1 Metal port skeleton for a dense
+// autoregressive transformer (RMSNorm + GQA + RoPE + SwiGLU MLP + LM head).
+//
+// Distilled from three real ports (qwen3.6, gpt-oss, dream). Models the
+// **naive correctness** style only — no cmdbuf pipelining, no warmup, no
+// parallel pread, no wrap_nocopy. Optimization is the next skill's job.
+//
+// How to use:
+//   1. cp src-metal/main.c.template src-metal/main.c
+//   2. Replace `<chattmpl>`, `<MODEL_NAME>`, and the placeholder paths /
+//      tensor name prefixes for your model. Search the file for "PLACEHOLDER".
+//   3. Add or remove `d_*` dispatch helpers + per-layer dispatches in
+//      forward() to match the C reference's forward() exactly.
+//   4. Adjust `cfg_t` / load_config() for any model-specific fields.
+//
+// If your model is MoE: add `d_topk_softmax`, `d_linear_gather`,
+// `d_expert_mix`. If hybrid (some layers linear-attn / SSM): branch in
+// the layer loop. If sliding-window attention: pass the window through
+// the SDPA params.
+
+#include "metal_shim.h"
+#include "kernel_concat.h"
+#include "safetensors.h"
+#include "tokenizer.h"
+#include "<chattmpl>.h"          // PLACEHOLDER: your chat-template header
+#include "utils/json.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+typedef uint16_t bf16;
+
+// ---- config ----------------------------------------------------------------
+
+typedef struct {
+    int   n_layers;
+    int   hidden;
+    int   n_qheads;
+    int   n_kvheads;
+    int   head_dim;
+    int   inter;       // MLP intermediate (gate/up width)
+    int   vocab;
+    int   max_ctx;
+    int   eos_id;
+    float rms_eps;
+    float rope_theta;
+} cfg_t;
+
+static void load_config(const char* model_dir, cfg_t* c) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/config.json", model_dir);
+    char* err = NULL;
+    json_doc_t* doc = json_open_file(path, &err);
+    if (!doc) { fprintf(stderr, "config: %s\n", err ? err : "(null)"); exit(1); }
+    json_val_t r = json_root(doc);
+
+    // PLACEHOLDER: adjust JSON keys / defaults to match your model's config.json.
+    c->n_layers   = (int)json_int_or   (json_get(r, "num_hidden_layers"),    32);
+    c->hidden     = (int)json_int_or   (json_get(r, "hidden_size"),        4096);
+    c->n_qheads   = (int)json_int_or   (json_get(r, "num_attention_heads"),  32);
+    c->n_kvheads  = (int)json_int_or   (json_get(r, "num_key_value_heads"),   8);
+    c->head_dim   = (int)json_int_or   (json_get(r, "head_dim"),
+                                        c->hidden / c->n_qheads);
+    c->inter      = (int)json_int_or   (json_get(r, "intermediate_size"),  11008);
+    c->vocab      = (int)json_int_or   (json_get(r, "vocab_size"),         32000);
+    c->max_ctx    = (int)json_int_or   (json_get(r, "max_position_embeddings"), 4096);
+    c->eos_id     = (int)json_int_or   (json_get(r, "eos_token_id"),           2);
+    c->rms_eps    = (float)json_double_or(json_get(r, "rms_norm_eps"),    1e-6);
+    c->rope_theta = (float)json_double_or(json_get(r, "rope_theta"),       1e4);
+    json_close(doc);
+}
+
+// ---- globals ---------------------------------------------------------------
+
+static gpu_ctx*    g_ctx;
+static st_archive* g_arch;
+static cfg_t       g_cfg;
+
+// One Metal pipeline per kernel name. PLACEHOLDER: add/remove to match your kernels.
+static gpu_pipeline *pso_embed, *pso_rmsnorm, *pso_linear, *pso_rope,
+                    *pso_sdpa,  *pso_kv_write, *pso_silu_mul,
+                    *pso_residual, *pso_argmax;
+
+// One Metal buffer per safetensors tensor, indexed by (t - st_at(arch, 0)).
+// Per-tensor buffers guarantee offset=0 / natural alignment at every
+// dispatch — see references/pitfalls.md ("Per-tensor offset alignment").
+static gpu_buf** g_tensor_bufs;
+static size_t    g_tensor_count;
+
+// Per-layer weight pointers (resolved once at startup).
+typedef struct {
+    gpu_buf *in_norm_w;
+    gpu_buf *q_w, *k_w, *v_w, *o_w;
+    gpu_buf *post_norm_w;
+    gpu_buf *gate_w, *up_w, *down_w;
+} layer_w_t;
+static layer_w_t* g_layers;
+static gpu_buf *g_embed_w, *g_final_norm_w, *g_lm_head_w;
+static gpu_buf *g_inv_freqs_buf;     // float[head_dim/2], RoPE constants
+
+// Workspace (allocated once, reused every forward()).
+static gpu_buf *x_buf, *h_buf;                       // [max_ctx, hidden]
+static gpu_buf *q_buf, *k_buf, *v_buf, *o_buf;       // per-step Q/K/V/O temps
+static gpu_buf *attn_buf;                            // SDPA output
+static gpu_buf *gate_buf, *up_buf, *mid_buf, *down_buf;  // MLP temps
+static gpu_buf *logits_buf;                          // [Lq_max, vocab]
+static gpu_buf *ids_buf;                             // [max_ctx] int32 prompt ids
+static gpu_buf *argmax_buf;                          // [1] int32
+
+// Per-layer KV cache: [max_ctx, Nkv, head_dim] bf16 each.
+static gpu_buf **g_kc, **g_vc;
+
+// Params bump arena. One slot is sufficient for the naive port; a 2-deep
+// pipeline (per-cmdbuf slot) belongs in optimize-metal — see
+// references/pitfalls.md ("Param buffer reuse within a cmdbuf").
+#define PARAMS_ARENA_BYTES (4u << 20)
+static gpu_buf* g_params_buf;
+static size_t   g_params_off;
+
+static gpu_arg_buf push_params(const void* p, size_t n) {
+    size_t off = (g_params_off + 15u) & ~(size_t)15;        // 16-byte align
+    if (off + n > PARAMS_ARENA_BYTES) {
+        fprintf(stderr, "params arena overflow\n"); exit(1);
+    }
+    memcpy((char*)gpu_buf_contents(g_params_buf) + off, p, n);
+    g_params_off = off + n;
+    return (gpu_arg_buf){ g_params_buf, off };
+}
+static void reset_params(void) { g_params_off = 0; }
+
+// ---- weight loading --------------------------------------------------------
+
+static gpu_buf* tensor_buf(const char* name) {
+    const st_tensor* t = st_find(g_arch, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    size_t idx = (size_t)(t - st_at(g_arch, 0));
+    if (g_tensor_bufs[idx]) return g_tensor_bufs[idx];
+    // Per-tensor copy (NOT wrap_nocopy). See references/pitfalls.md.
+    g_tensor_bufs[idx] = gpu_buf_new_from(g_ctx, t->data, t->nbytes);
+    if (!g_tensor_bufs[idx]) {
+        fprintf(stderr, "gpu_buf_new_from %s failed\n", name); exit(1);
+    }
+    return g_tensor_bufs[idx];
+}
+
+static void cache_weights(void) {
+    g_tensor_count = st_count(g_arch);
+    g_tensor_bufs  = (gpu_buf**)calloc(g_tensor_count, sizeof(gpu_buf*));
+
+    // PLACEHOLDER: adjust tensor name prefix ("model." here) for your weights.
+    g_embed_w      = tensor_buf("model.embed_tokens.weight");
+    g_final_norm_w = tensor_buf("model.norm.weight");
+    g_lm_head_w    = tensor_buf("lm_head.weight");
+
+    g_layers = (layer_w_t*)calloc((size_t)g_cfg.n_layers, sizeof(layer_w_t));
+    char nm[256];
+    for (int li = 0; li < g_cfg.n_layers; li++) {
+        layer_w_t* w = &g_layers[li];
+        #define T(member, fmt) do { snprintf(nm, sizeof nm, fmt, li); \
+                                    w->member = tensor_buf(nm); } while (0)
+        T(in_norm_w,   "model.layers.%d.input_layernorm.weight");
+        T(q_w,         "model.layers.%d.self_attn.q_proj.weight");
+        T(k_w,         "model.layers.%d.self_attn.k_proj.weight");
+        T(v_w,         "model.layers.%d.self_attn.v_proj.weight");
+        T(o_w,         "model.layers.%d.self_attn.o_proj.weight");
+        T(post_norm_w, "model.layers.%d.post_attention_layernorm.weight");
+        T(gate_w,      "model.layers.%d.mlp.gate_proj.weight");
+        T(up_w,        "model.layers.%d.mlp.up_proj.weight");
+        T(down_w,      "model.layers.%d.mlp.down_proj.weight");
+        #undef T
+    }
+}
+
+static void compute_inv_freqs(void) {
+    int Dh = g_cfg.head_dim / 2;
+    float* inv = (float*)malloc((size_t)Dh * sizeof(float));
+    for (int k = 0; k < Dh; k++) {
+        float exponent = (float)(2 * k) / (float)g_cfg.head_dim;
+        inv[k] = 1.0f / powf(g_cfg.rope_theta, exponent);
+    }
+    g_inv_freqs_buf = gpu_buf_new_from(g_ctx, inv, (size_t)Dh * sizeof(float));
+    free(inv);
+}
+
+// ---- dispatch helpers ------------------------------------------------------
+//
+// One thin wrapper per kernel. Each one packs its dims into the params
+// arena and issues a single dispatch. Grids are deliberately naive:
+// "one thread per output row/element". optimize-metal will replace these
+// with tiled / SIMD-group variants.
+
+#define ARG(b) ((gpu_arg_buf){ (b), 0 })
+
+static void d_embed(gpu_cmdbuf* cb, gpu_buf* ids, gpu_buf* E, gpu_buf* Y,
+                    uint32_t M, uint32_t D)
+{
+    struct { uint32_t M, D; } p = { M, D };
+    gpu_arg_buf args[] = { ARG(ids), ARG(E), ARG(Y), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_embed, args, 4, M, 1, 1, 1, 1, 1);
+}
+
+static void d_rmsnorm(gpu_cmdbuf* cb, gpu_buf* X, gpu_buf* W, gpu_buf* Y,
+                      uint32_t M, uint32_t D, float eps)
+{
+    struct { uint32_t M, D; float eps; } p = { M, D, eps };
+    gpu_arg_buf args[] = { ARG(X), ARG(W), ARG(Y), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_rmsnorm, args, 4, M, 1, 1, 1, 1, 1);
+}
+
+static void d_linear(gpu_cmdbuf* cb, gpu_buf* X, gpu_buf* W, gpu_buf* Y,
+                     uint32_t M, uint32_t K, uint32_t N)
+{
+    struct { uint32_t M, K, N; } p = { M, K, N };
+    gpu_arg_buf args[] = { ARG(X), ARG(W), ARG(Y), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_linear, args, 4, N, M, 1, 1, 1, 1);
+}
+
+static void d_rope(gpu_cmdbuf* cb, gpu_buf* X,
+                   uint32_t Lq, uint32_t H, uint32_t D, uint32_t q_off)
+{
+    struct { uint32_t Lq, H, D, q_off; } p = { Lq, H, D, q_off };
+    gpu_arg_buf args[] = { ARG(X), ARG(g_inv_freqs_buf), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_rope, args, 3, H, Lq, 1, 1, 1, 1);
+}
+
+// kv_write copies [Lq, Nkv*D] from `src` into `cache[q_off..q_off+Lq]`.
+// One thread per (row, element). Naive but the cleanest way to keep
+// forward() inside one cmdbuf — the alternative is host-side memcpy
+// between cmdbufs, which adds a CPU↔GPU sync per layer.
+static void d_kv_write(gpu_cmdbuf* cb, gpu_buf* src, gpu_buf* cache,
+                       uint32_t q_off, uint32_t Lq, uint32_t row_elems)
+{
+    struct { uint32_t q_off, Lq, row_elems; } p = { q_off, Lq, row_elems };
+    gpu_arg_buf args[] = { ARG(src), ARG(cache), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_kv_write, args, 3, row_elems, Lq, 1, 1, 1, 1);
+}
+
+static void d_sdpa(gpu_cmdbuf* cb, gpu_buf* Q, gpu_buf* K, gpu_buf* V,
+                   gpu_buf* OUT,
+                   uint32_t Lq, uint32_t Lk, uint32_t q_off,
+                   uint32_t Nq, uint32_t Nkv, uint32_t D, float scale)
+{
+    struct { uint32_t Lq, Lk, q_off, Nq, Nkv, D; float scale; }
+        p = { Lq, Lk, q_off, Nq, Nkv, D, scale };
+    gpu_arg_buf args[] = { ARG(Q), ARG(K), ARG(V), ARG(OUT), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_sdpa, args, 5, Nq, Lq, 1, 1, 1, 1);
+}
+
+static void d_silu_mul(gpu_cmdbuf* cb, gpu_buf* gate, gpu_buf* up, gpu_buf* out,
+                       uint32_t N)
+{
+    struct { uint32_t N; } p = { N };
+    gpu_arg_buf args[] = { ARG(gate), ARG(up), ARG(out), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_silu_mul, args, 4, N, 1, 1, 1, 1, 1);
+}
+
+static void d_residual(gpu_cmdbuf* cb, gpu_buf* x, gpu_buf* dy, uint32_t N) {
+    struct { uint32_t N; } p = { N };
+    gpu_arg_buf args[] = { ARG(x), ARG(dy), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_residual, args, 3, N, 1, 1, 1, 1, 1);
+}
+
+static void d_argmax(gpu_cmdbuf* cb, gpu_buf* row, gpu_buf* out_idx, uint32_t N) {
+    struct { uint32_t N; } p = { N };
+    gpu_arg_buf args[] = { ARG(row), ARG(out_idx), push_params(&p, sizeof p) };
+    gpu_cmdbuf_dispatch(cb, pso_argmax, args, 3, 1, 1, 1, 1, 1, 1);
+}
+
+// ---- forward() -------------------------------------------------------------
+//
+// Records all dispatches for one prefill (`q_off=0, Lq=Lp`) OR one
+// decode step (`q_off=Lp+t, Lq=1`) into a single cmdbuf and waits.
+//
+// PLACEHOLDER: this is the spine you'll keep tuning. It must match the C
+// reference's forward() schedule kernel-for-kernel.
+
+static void forward(int q_off, int Lq) {
+    const float attn_scale = 1.0f / sqrtf((float)g_cfg.head_dim);
+    const uint32_t H   = (uint32_t)g_cfg.hidden;
+    const uint32_t Nq  = (uint32_t)g_cfg.n_qheads;
+    const uint32_t Nkv = (uint32_t)g_cfg.n_kvheads;
+    const uint32_t D   = (uint32_t)g_cfg.head_dim;
+    const uint32_t QD  = Nq  * D;
+    const uint32_t KVD = Nkv * D;
+    const uint32_t I   = (uint32_t)g_cfg.inter;
+    const uint32_t V   = (uint32_t)g_cfg.vocab;
+    const uint32_t LL  = (uint32_t)Lq;
+    const uint32_t Lk  = (uint32_t)(q_off + Lq);
+
+    reset_params();
+    gpu_cmdbuf* cb = gpu_cmdbuf_new(g_ctx);
+
+    // The prefill / decode caller is expected to have already filled x_buf
+    // by dispatching d_embed(ids_buf -> x_buf). Done outside forward() so
+    // forward() can be reused as a per-layer pure compute schedule.
+
+    for (int li = 0; li < g_cfg.n_layers; li++) {
+        const layer_w_t* w = &g_layers[li];
+
+        // ---- attention block ----
+        d_rmsnorm (cb, x_buf, w->in_norm_w, h_buf, LL, H, g_cfg.rms_eps);
+        d_linear  (cb, h_buf, w->q_w, q_buf, LL, H, QD);
+        d_linear  (cb, h_buf, w->k_w, k_buf, LL, H, KVD);
+        d_linear  (cb, h_buf, w->v_w, v_buf, LL, H, KVD);
+        d_rope    (cb, q_buf, LL, Nq,  D, (uint32_t)q_off);
+        d_rope    (cb, k_buf, LL, Nkv, D, (uint32_t)q_off);
+        d_kv_write(cb, k_buf, g_kc[li], (uint32_t)q_off, LL, KVD);
+        d_kv_write(cb, v_buf, g_vc[li], (uint32_t)q_off, LL, KVD);
+        d_sdpa    (cb, q_buf, g_kc[li], g_vc[li], attn_buf,
+                   LL, Lk, (uint32_t)q_off, Nq, Nkv, D, attn_scale);
+        d_linear  (cb, attn_buf, w->o_w, o_buf, LL, QD, H);
+        d_residual(cb, x_buf, o_buf, LL * H);
+
+        // ---- MLP block ----
+        d_rmsnorm (cb, x_buf, w->post_norm_w, h_buf, LL, H, g_cfg.rms_eps);
+        d_linear  (cb, h_buf, w->gate_w, gate_buf, LL, H, I);
+        d_linear  (cb, h_buf, w->up_w,   up_buf,   LL, H, I);
+        d_silu_mul(cb, gate_buf, up_buf, mid_buf, LL * I);
+        d_linear  (cb, mid_buf, w->down_w, down_buf, LL, I, H);
+        d_residual(cb, x_buf, down_buf, LL * H);
+    }
+
+    d_rmsnorm(cb, x_buf, g_final_norm_w, h_buf, LL, H, g_cfg.rms_eps);
+    // Only compute logits for the last row in decode; for prefill we still
+    // only need row Lq-1 (we sample one token). The naive lm_head pass
+    // below computes all LL rows; you can optimize to LL=1 later.
+    d_linear (cb, h_buf, g_lm_head_w, logits_buf, LL, H, V);
+
+    char* err = NULL;
+    if (!gpu_cmdbuf_commit_wait(cb, &err)) {
+        fprintf(stderr, "forward commit: %s\n", err ? err : "?"); exit(1);
+    }
+}
+
+// ---- buffer allocation -----------------------------------------------------
+
+static void alloc_buffers(int max_ctx) {
+    const size_t H   = (size_t)g_cfg.hidden;
+    const size_t QD  = (size_t)g_cfg.n_qheads  * g_cfg.head_dim;
+    const size_t KVD = (size_t)g_cfg.n_kvheads * g_cfg.head_dim;
+    const size_t I   = (size_t)g_cfg.inter;
+    const size_t V   = (size_t)g_cfg.vocab;
+    const size_t L   = (size_t)max_ctx;
+    const size_t bf  = sizeof(bf16);
+
+    x_buf      = gpu_buf_new(g_ctx, L * H   * bf);
+    h_buf      = gpu_buf_new(g_ctx, L * H   * bf);
+    q_buf      = gpu_buf_new(g_ctx, L * QD  * bf);
+    k_buf      = gpu_buf_new(g_ctx, L * KVD * bf);
+    v_buf      = gpu_buf_new(g_ctx, L * KVD * bf);
+    o_buf      = gpu_buf_new(g_ctx, L * H   * bf);
+    attn_buf   = gpu_buf_new(g_ctx, L * QD  * bf);
+    gate_buf   = gpu_buf_new(g_ctx, L * I   * bf);
+    up_buf     = gpu_buf_new(g_ctx, L * I   * bf);
+    mid_buf    = gpu_buf_new(g_ctx, L * I   * bf);
+    down_buf   = gpu_buf_new(g_ctx, L * H   * bf);
+    logits_buf = gpu_buf_new(g_ctx, L * V   * bf);
+    ids_buf    = gpu_buf_new(g_ctx, L * sizeof(int32_t));
+    argmax_buf = gpu_buf_new(g_ctx, sizeof(int32_t));
+
+    g_kc = (gpu_buf**)calloc((size_t)g_cfg.n_layers, sizeof(gpu_buf*));
+    g_vc = (gpu_buf**)calloc((size_t)g_cfg.n_layers, sizeof(gpu_buf*));
+    for (int li = 0; li < g_cfg.n_layers; li++) {
+        g_kc[li] = gpu_buf_new(g_ctx, L * KVD * bf);
+        g_vc[li] = gpu_buf_new(g_ctx, L * KVD * bf);
+    }
+
+    g_params_buf = gpu_buf_new(g_ctx, PARAMS_ARENA_BYTES);
+}
+
+// ---- main ------------------------------------------------------------------
+
+int main(int argc, char** argv) {
+    const char* prompt    = NULL;
+    const char* sysmsg    = "You are a helpful assistant.";
+    const char* model_dir = NULL;
+    int max_tokens = 16;
+
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i], "--prompt")     && i+1 < argc) prompt    = argv[++i];
+        else if (!strcmp(argv[i], "--system")     && i+1 < argc) sysmsg    = argv[++i];
+        else if (!strcmp(argv[i], "--model")      && i+1 < argc) model_dir = argv[++i];
+        else if (!strcmp(argv[i], "--max-tokens") && i+1 < argc) max_tokens = atoi(argv[++i]);
+        else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
+    }
+    if (!prompt || !model_dir) {
+        fprintf(stderr,
+            "usage: %s --model PATH --prompt TEXT [--system TEXT] [--max-tokens N]\n",
+            argv[0]);
+        return 2;
+    }
+
+    // ---- tokenizer + prompt build ----
+    char* err = NULL;
+    tokenizer_t* tk = tk_load("src-cpu/tokenizer.bin", &err);
+    if (!tk) { fprintf(stderr, "tokenizer: %s\n", err); return 1; }
+
+    int prompt_ids[4096];
+    int Lp = /*PLACEHOLDER*/ <chattmpl>_build_prompt(
+        tk, sysmsg, prompt, prompt_ids, 4096);
+    if (Lp < 0) { fprintf(stderr, "prompt too long\n"); return 1; }
+    fprintf(stderr, "prompt: %d tokens\n", Lp);
+
+    // ---- config ----
+    load_config(model_dir, &g_cfg);
+    fprintf(stderr,
+        "[config] L=%d H=%d Nq=%d Nkv=%d D=%d inter=%d V=%d max_ctx=%d\n",
+        g_cfg.n_layers, g_cfg.hidden, g_cfg.n_qheads, g_cfg.n_kvheads,
+        g_cfg.head_dim, g_cfg.inter, g_cfg.vocab, g_cfg.max_ctx);
+
+    // ---- compile MSL + look up pipelines ----
+    const char* kernel_paths[] = {
+        // PLACEHOLDER: list every .metal file in src-metal/kernels/.
+        "src-metal/kernels/embed_gather.metal",
+        "src-metal/kernels/rmsnorm.metal",
+        "src-metal/kernels/linear.metal",
+        "src-metal/kernels/rope.metal",
+        "src-metal/kernels/sdpa.metal",
+        "src-metal/kernels/kv_write.metal",
+        "src-metal/kernels/silu_mul.metal",
+        "src-metal/kernels/residual_add.metal",
+        "src-metal/kernels/argmax.metal",
+    };
+    char* msl = concat_kernels((int)(sizeof kernel_paths / sizeof *kernel_paths),
+                               kernel_paths);
+    g_ctx = gpu_init(msl, &err);
+    if (!g_ctx) { fprintf(stderr, "gpu_init: %s\n", err ? err : "?"); return 1; }
+    free(msl);
+    fprintf(stderr, "metal device: %s\n", gpu_device_name(g_ctx));
+
+    #define PSO(var, name) do { \
+        var = gpu_pipeline_for(g_ctx, name, &err); \
+        if (!var) { fprintf(stderr, "pipeline %s: %s\n", name, err ? err : "?"); return 1; } \
+    } while (0)
+    // PLACEHOLDER: match the kernel function names in your .metal files.
+    PSO(pso_embed,    "embed_gather_bf16");
+    PSO(pso_rmsnorm,  "rmsnorm_bf16");
+    PSO(pso_linear,   "linear_bf16");
+    PSO(pso_rope,     "rope_inplace_bf16");
+    PSO(pso_sdpa,     "sdpa_bf16");
+    PSO(pso_kv_write, "kv_write_bf16");
+    PSO(pso_silu_mul, "silu_mul_bf16");
+    PSO(pso_residual, "residual_add_bf16");
+    PSO(pso_argmax,   "argmax_bf16");
+    #undef PSO
+
+    // ---- weights (per-tensor Metal buffers — see references/pitfalls.md) ----
+    fprintf(stderr, "loading weights from %s ...\n", model_dir);
+    g_arch = st_open(model_dir, &err);
+    if (!g_arch) { fprintf(stderr, "weights: %s\n", err); return 1; }
+    fprintf(stderr, "  %zu tensors\n", st_count(g_arch));
+    cache_weights();
+    compute_inv_freqs();
+
+    // ---- workspace ----
+    alloc_buffers(g_cfg.max_ctx);
+
+    // Stage prompt ids in ids_buf so the prefill embed reads them on-GPU.
+    {
+        int32_t* p = (int32_t*)gpu_buf_contents(ids_buf);
+        for (int i = 0; i < Lp; i++) p[i] = (int32_t)prompt_ids[i];
+    }
+
+    // ---- prefill: embed prompt -> x_buf, run forward(0, Lp), argmax ----
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    {
+        reset_params();
+        gpu_cmdbuf* cb = gpu_cmdbuf_new(g_ctx);
+        d_embed(cb, ids_buf, g_embed_w, x_buf,
+                (uint32_t)Lp, (uint32_t)g_cfg.hidden);
+        if (!gpu_cmdbuf_commit_wait(cb, &err)) {
+            fprintf(stderr, "prefill embed: %s\n", err ? err : "?"); return 1;
+        }
+    }
+    forward(0, Lp);
+    // Sample from the last row of logits_buf.
+    {
+        reset_params();
+        gpu_cmdbuf* cb = gpu_cmdbuf_new(g_ctx);
+        size_t row_off_bytes = (size_t)(Lp - 1) * (size_t)g_cfg.vocab * sizeof(bf16);
+        gpu_arg_buf last_row = (gpu_arg_buf){ logits_buf, row_off_bytes };
+        struct { uint32_t N; } p = { (uint32_t)g_cfg.vocab };
+        gpu_arg_buf args[] = { last_row, ARG(argmax_buf), push_params(&p, sizeof p) };
+        gpu_cmdbuf_dispatch(cb, pso_argmax, args, 3, 1, 1, 1, 1, 1, 1);
+        if (!gpu_cmdbuf_commit_wait(cb, &err)) {
+            fprintf(stderr, "prefill argmax: %s\n", err ? err : "?"); return 1;
+        }
+    }
+    int next_id = ((int32_t*)gpu_buf_contents(argmax_buf))[0];
+
+    // ---- decode loop ----
+    int n_emitted = 0;
+    for (int t = 0; t < max_tokens; t++) {
+        // emit
+        int blen = 0;
+        const char* b = tk_token_bytes(tk, next_id, &blen);
+        if (b && blen > 0) { fwrite(b, 1, (size_t)blen, stdout); fflush(stdout); }
+        n_emitted++;
+        if (next_id == g_cfg.eos_id) break;
+        if (t + 1 == max_tokens)     break;
+
+        // 1-token embed → x_buf row 0
+        {
+            int32_t* p = (int32_t*)gpu_buf_contents(ids_buf);
+            p[0] = next_id;
+            reset_params();
+            gpu_cmdbuf* cb = gpu_cmdbuf_new(g_ctx);
+            d_embed(cb, ids_buf, g_embed_w, x_buf, 1u, (uint32_t)g_cfg.hidden);
+            if (!gpu_cmdbuf_commit_wait(cb, &err)) {
+                fprintf(stderr, "decode embed: %s\n", err ? err : "?"); return 1;
+            }
+        }
+
+        forward(Lp + t, 1);
+
+        // argmax row 0
+        {
+            reset_params();
+            gpu_cmdbuf* cb = gpu_cmdbuf_new(g_ctx);
+            struct { uint32_t N; } p = { (uint32_t)g_cfg.vocab };
+            gpu_arg_buf args[] = { ARG(logits_buf), ARG(argmax_buf),
+                                   push_params(&p, sizeof p) };
+            gpu_cmdbuf_dispatch(cb, pso_argmax, args, 3, 1, 1, 1, 1, 1, 1);
+            if (!gpu_cmdbuf_commit_wait(cb, &err)) {
+                fprintf(stderr, "decode argmax: %s\n", err ? err : "?"); return 1;
+            }
+        }
+        next_id = ((int32_t*)gpu_buf_contents(argmax_buf))[0];
+    }
+    fputc('\n', stdout);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    fprintf(stderr, "[stats] prompt=%d gen=%d in %.2fs\n", Lp, n_emitted, sec);
+
+    tk_free(tk);
+    st_close(g_arch);
+    return 0;
+}
