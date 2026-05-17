@@ -7,8 +7,11 @@ spine. Skim once; come back when something looks off.
 ## Naive style
 
 The naive port style is **one thread per output element**, no tiling,
-no threadgroup memory, no SIMD-group operations. Read inputs, compute,
-write output. Match the C kernel's loop nest exactly.
+no threadgroup memory, no SIMD-group operations, no vector loads
+(`bfloat4` / `float4` / packed types). Read inputs, compute, write
+output. Match the C kernel's loop nest exactly. `optimize-metal`
+introduces vector loads, simdgroup ops, and tiling later — at this
+stage they only obscure bugs.
 
 - Use `bfloat` for storage, `float` for accumulators.
 - Bundle all dims AND scalars (`eps`, `scale`, `alpha`, `limit`) into

@@ -230,7 +230,7 @@ For each kernel in `src-cpu/kernels.{c,h}`, in **forward-pass order**:
 #### 2a. Write the MSL kernel
 
 Naive translation: **one thread per output element**, no tiling, no
-threadgroup memory, no SIMD-group ops. Pass scalar parameters via a
+threadgroup memory, no SIMD-group ops, no vector loads. Pass scalar parameters via a
 small "dims" `constant` struct in a single `[[buffer(K)]]` slot.
 
 Example (RMSNorm) — note how `eps` is bundled into the dims struct:
@@ -312,6 +312,13 @@ g_params_buf = gpu_buf_new(ctx, g_params_cap);
 
 Budget: ~40 layers × ~30 dispatches × ~64 B ≈ 80 KB per forward(). 4 MB
 is comfortable headroom.
+
+If you call `gpu_cmdbuf_commit_wait` *inside* `forward()` (e.g. to
+host-sync between a prefill chunk and a per-token decode step), you
+can also `reset_params()` at that point — once the GPU has finished
+the previous cmdbuf, those arena slots are free to overwrite. Simpler
+in practice is to just reset once at the top of `forward()` and size
+the arena for the whole pass.
 
 #### 2c. Validate the kernel against the C reference
 
