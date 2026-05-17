@@ -49,6 +49,9 @@ the same symptoms again.
 | 39 | Aspect-ratio routing: K > N matmuls need MORE TGs (use the smaller BM)    | GEMM tuning |
 | 40 | `newBufferWithBytesNoCopy:` per-tensor fails on 8-byte-aligned safetensors offsets | Startup |
 | 41 | Per-SG register budget is set by WN — `WN=4` unlocks larger BK     | GEMM tuning |
+| 42 | Don't fuse two kernels that the concurrent encoder is overlapping | Fusion / encoder |
+| 43 | `id<MTLBuffer>` conforms to `id<MTLAllocation>` but you must declare `__strong` | macOS 15+ API |
+| 44 | `_exit(0)` doesn't help short-lived Metal CLIs much — the cost is pre-`main()` | Startup |
 
 ---
 
@@ -542,13 +545,61 @@ with the number of distinct MTLBuffers (2090 in our case).
   appears to invalidate residency on concurrent CPU writes, so the
   subsequent real prefill re-pays the residency cost.
 
-**Workable mitigation**: do the full forward(Lq=1) warmup AFTER copy
+**Workable mitigation (TTFT only)**: do the full forward(Lq=1) warmup AFTER copy
 finishes. It shifts the 1.4s out of the user-visible "prefill" phase
 (time-to-first-token) but does not reduce total wall time. Only use
 this if TTFT matters more than total time.
 
-**Conclusion**: this is a fixed cost. Beating MLX on total wall time
-comes from saving I/O time, not from removing this 1s.
+**Better mitigation (macOS 15+): `MTLResidencySet` + async overlap**.
+macOS 15 added `MTLResidencySet` — an explicit resident-set API. Pre-paying
+via `[device newResidencySetWithDescriptor:...]` + `[set addAllocations:...]`
++ `[set commit]` + `[set requestResidency]` + `[queue addResidencySet:]`
+*before* the first real cmdbuf eliminates the in-cmdbuf wait entirely.
+`requestResidency` itself is blocking (~85 ms for ~12 GB on M4 Max), so
+doing it synchronously just moves the cost to startup — no total-wall
+win. The real win is dispatching the residency request on a background
+`dispatch_async(QOS_CLASS_USER_INITIATED, ...)` queue **immediately
+after MTLBuffer allocation**, so it overlaps with parallel pread. On
+Dream-7B (M4 Max, 14 GB weights, 4 shards): -90 ms total wall, GPU
+utilization 94% → 99%, prefetch wall 190 → 100 ms.
+
+Skeleton (Objective-C, macOS 15+):
+
+```objc
+#if defined(__MAC_15_0)
+  if (@available(macOS 15.0, *)) {
+      MTLResidencySetDescriptor* d = [MTLResidencySetDescriptor new];
+      d.label = @"weights";
+      d.initialCapacity = n_bufs;
+      NSError* e = nil;
+      id<MTLResidencySet> set =
+          [device newResidencySetWithDescriptor:d error:&e];
+      __strong id<MTLAllocation>* allocs =
+          (__strong id<MTLAllocation>*)calloc(n_bufs, sizeof(id<MTLAllocation>));
+      for (size_t i = 0; i < n_bufs; i++) allocs[i] = bufs[i]; // id<MTLBuffer>
+                                                               // conforms to
+                                                               // id<MTLAllocation>
+      [set addAllocations:allocs count:n_bufs];
+      for (size_t i = 0; i < n_bufs; i++) allocs[i] = nil;
+      free(allocs);
+      [set commit];
+      [set requestResidency];      // ← BLOCKS for ~85 ms / 12 GB; put on bg
+      [queue addResidencySet:set]; // wire to the command queue
+  }
+#endif
+```
+
+The previous "concurrent warmup vs CPU pread" race (above) is also
+avoided: `MTLResidencySet` operates on **already-allocated** buffers
+*after* their content writes — CPU writes via `[buf contents]` to
+shared-storage buffers don't invalidate the residency the way the
+warmup-cmdbuf path did.
+
+**Conclusion (revised)**: this is *not* a fixed cost on macOS 15+.
+The combined recipe (parallel pread + async MTLResidencySet)
+saves both the I/O time *and* the residency wiring time, hiding
+~85 ms inside the pread tail. Treat it as a standard optimization
+for any large-working-set Metal workload.
 
 # 31. Premature multi-SG SDPA hides the real SDPA win
 
@@ -906,3 +957,90 @@ Three Dream-7B commits hinge on this realization:
 Without the WN=4 understanding, BK=64 looks impossible (spills at
 WN=2 default). With it, BK=64 is the new optimum tile dimension on
 M4 Max for Dream-7B's refine GEMMs.
+
+# 42. Don't fuse two kernels that the concurrent encoder is overlapping
+
+**Symptom**: you spot a small elemwise kernel between two heavy
+GEMMs (e.g. `silu_mul` between `gate_proj` and `down_proj`) and
+think "I can fuse the silu into the up_proj epilogue to remove
+~20 µs/layer × 28 layers = 560 µs/forward". You implement it. The
+benchmark **regresses by 30–50 ms** instead of saving the expected
+560 µs.
+
+**Cause**: with a concurrent encoder + explicit barriers (gotcha #26
++ catalog A5), `gate_proj` and `up_proj` were running in parallel
+on the GPU because they have no RAW dependency on each other. The
+encoder happily issues both immediately. Fusing `silu(g) * v` into
+`up_proj`'s epilogue forces `gate_proj` to complete **before**
+`up_proj` can read `g`, serializing the two GEMMs. Each GEMM is
+much larger (a few ms) than the silu_mul savings (560 µs).
+
+**Diagnostic**: before fusing across any pair of kernels, check
+whether they are concurrent in the dispatch graph:
+- read `forward()` (or wherever the cmdbuf is built),
+- list the kernels between consecutive `cmdbuf_barrier()` calls,
+- if both target kernels are in the same "no-barrier" block, they
+  are concurrent — fusion will serialize them.
+
+**Rule of thumb**: fusion is only safe when the two kernels would
+have been serialized anyway (e.g. a small elemwise *after* the GEMM
+it consumes from, where the next GEMM already needs the elemwise's
+output). Inter-GEMM fusion across the GPU's intrinsic parallelism is
+almost always a regression.
+
+**Concrete example (Dream-7B)**: `silu_mul` fusion into the
+`up_proj` epilogue cost 50 ms wall while removing 28 silu_mul
+dispatches that totaled only ~15 ms GPU. The `gate || up` parallel
+overlap was worth more than the elemwise we removed. Reverted.
+
+# 43. `id<MTLBuffer>` conforms to `id<MTLAllocation>` but you must declare `__strong`
+
+When using `MTLResidencySet`'s `-[addAllocations:count:]` API
+(gotcha #30) under ARC, the C array of `id<MTLAllocation>` you
+pass in must be declared `__strong id<MTLAllocation>*`, not the
+default `id<MTLAllocation>*`:
+
+```objc
+// WRONG — Clang errors:
+//   "pointer to non-const type 'id<MTLAllocation>' with no explicit ownership"
+id<MTLAllocation>* allocs = calloc(n, sizeof(id<MTLAllocation>));
+
+// RIGHT:
+__strong id<MTLAllocation>* allocs =
+    (__strong id<MTLAllocation>*)calloc(n, sizeof(id<MTLAllocation>));
+for (size_t i = 0; i < n; i++) allocs[i] = bufs[i];  // id<MTLBuffer>
+                                                      // conforms
+[set addAllocations:allocs count:n];
+for (size_t i = 0; i < n; i++) allocs[i] = nil;  // release ARC refs
+                                                  // BEFORE free()
+free(allocs);
+```
+
+Also note: `requestResidency` blocks (~85 ms for ~12 GB on M4 Max)
+despite the name suggesting an async operation. Dispatch it on a
+background queue if you want it to overlap with weight load.
+
+# 44. `_exit(0)` doesn't help short-lived Metal CLIs much — the cost is pre-`main()`
+
+It's tempting to bypass C-library cleanup with `_exit(0)` at the
+end of a short-lived Metal CLI tool to skip the ~80 ms of MTLBuffer
+shared-memory teardown that happens at process exit. In practice
+this saves **very little** wall time on macOS because:
+
+1. The C-library destructors and MTLBuffer tear-down often happen
+   *concurrently* with the shell's command-substitution drain, so
+   they're already hidden from `time`.
+2. The visible "gap" between your last log line and the shell prompt
+   is often dyld/framework **load** time at the *start* of the
+   process (Foundation + Metal init), not cleanup at the end.
+3. macOS aggressively defers `mmap` unmap and `MTLBuffer` page
+   release.
+
+**Diagnostic**: instrument both the first instruction of `main()`
+(`t_start`) and the very last line before `return`. If `t_end - t_start`
+matches `real time - 50 ms`, the 50 ms is pre-`main()` dyld init,
+which `_exit` can't help with.
+
+**Conclusion**: try `_exit(0)` but measure before keeping it. If it
+saves <5 ms, revert — the maintenance cost (skipped destructors,
+no atexit handlers) isn't worth it.

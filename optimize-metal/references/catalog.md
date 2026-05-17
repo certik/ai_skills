@@ -152,6 +152,36 @@ API gives you the residency budget.
 
 **Commit**: 6361113.
 
+### A7b. Async `MTLResidencySet` to hide first-cmdbuf residency tax (macOS 15+)
+
+**What**: Pre-pay the first-cmdbuf residency-wiring cost on a
+background queue while parallel pread runs. Replaces gotcha #30's
+"this is a fixed cost" with an actual mitigation.
+
+**Why**: The first cmdbuf to touch a multi-GB working set of
+MTLBuffers blocks for ~80–100 ms inside its commit→GPUStart gap
+(invisible to encoder timing — it shows up only as a `gpu_busy/wall`
+ratio drop). On macOS 15+, `MTLResidencySet` + `requestResidency`
+removes this. The blocking ~85 ms `requestResidency` call must run
+on a `dispatch_async(QOS_CLASS_USER_INITIATED, ...)` queue so it
+overlaps with the (typically longer) weight-pread phase. After
+pread finishes, you `dispatch_group_wait` the residency block and
+call `[queue addResidencySet:]` to bind it.
+
+**When**: Always, on macOS 15+, for any LLM that loads weights from
+disk into MTLBuffers and runs a forward pass shortly after. The
+larger the model the bigger the win.
+
+**Speedup**: gen wall -5%, GPU utilization 94% → 99%, total wall
+-90 ms on Dream-7B (M4 Max). Cost is fully hidden inside pread.
+
+**Catch**: `addAllocations:count:` takes a C array of
+`id<MTLAllocation>`; under ARC, declare it `__strong id<MTLAllocation>*`
+(see gotcha #43). `id<MTLBuffer>` conforms to `id<MTLAllocation>` on
+macOS 15+. Skeleton in gotcha #30.
+
+**Commit**: 87e9e02.
+
 ### A8. Parallel independent computation chains (END-GAME WIN)
 
 **What**: With concurrent encoder enabled (A5), look for SUBGRAPHS that
