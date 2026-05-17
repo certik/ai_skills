@@ -32,6 +32,46 @@ The largest single jump in a typical naive port comes from eliminating
 host-side breaks (H1 / glue kernels). You can see this happen
 immediately as `gpu_busy / wall` ratio jumping from ~30% to ~95%.
 
+## Diffusion samplers: add `host_post` as a third number
+
+Some samplers — notably block-refinement diffusion LLMs (Dream, LLaDA,
+fastdllm) — do meaningful per-step work on the CPU AFTER the forward
+pass. For a refine step it might be: read logits, compute softmax over
+V at each of BL positions, find argmax + confidence per position, pick
+which positions to commit, build the next step's input ids.
+
+That work happens between `commit_wait()` and the next dispatch, so
+the GPU is idle but the CPU is not. It shows up as a gap in `wall -
+gpu_busy` that LOOKS like a host-scheduling problem (A/H family) but
+isn't — it's a sampler problem (F3).
+
+Add a third accumulator:
+
+```c
+double host_post_wall = 0.0;
+// ... inside the sampler step, after commit_wait but before the next dispatch:
+clock_gettime(...t_pp0);
+// CPU softmax + argmax + confidence loop here
+clock_gettime(...t_pp1);
+host_post_wall += (t_pp1 - t_pp0);
+```
+
+And print the three-number breakdown:
+
+```
+refine: 1.31s wall (64 steps; gpu_busy=1.03s; host_post=0.25s)
+```
+
+The mental model becomes:
+
+```
+wall ≈ gpu_busy + host_post + encode_gap
+```
+
+If `host_post` is more than ~5% of wall, attack F3 (move the per-row
+softmax/argmax to the GPU as a single kernel). For a Dream-7B port,
+F3 dropped `host_post` 0.25 → 0.00 s and `wall` 2.90 → 2.63 s.
+
 ## KPROF — per-kernel GPU time (optional)
 
 `KPROF=1` wraps each dispatch in its own cmdbuf with commit+wait so you

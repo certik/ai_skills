@@ -43,6 +43,9 @@ the same symptoms again.
 | 33 | Forgetting GQA when SG handles a (token, head) pair                  | SDPA bug    |
 | 34 | Fused-residual epilogue shifts the bf16 round point                  | Fusion / numerics |
 | 35 | Persistent param buffer + 2-deep pipeline = race; duplicate the ring | Pipeline    |
+| 36 | Per-step CPU sampler work is invisible to `gpu_busy` — track host_post | Profiling |
+| 37 | `gpu_buf_contents()` is zero-copy but per-step CPU reads still hit caches | Sampler perf |
+| 38 | Two M shapes → two PSOs with different (BM, BK); pad workspaces to max BM | GEMM tuning |
 
 ---
 
@@ -610,3 +613,81 @@ params, but cmdbuf N is still reading the OLD params on the GPU. Race.
 **Fix**: duplicate the param ring — `gpu_param_buf[slot]` with
 `slot ∈ {0, 1}` swapping per cmdbuf. Same fix as the id-buffer ring
 (gotcha #16), applied to all per-cmdbuf scratch the host writes into.
+
+# 36. Per-step CPU sampler work is invisible to `gpu_busy` — track host_post
+
+Diffusion-LLM samplers (Dream, LLaDA, fastdllm) and any sampler with
+non-trivial per-step CPU logic do work between `commit_wait()` and the
+next dispatch:
+
+- per-position softmax over V,
+- argmax + confidence per position,
+- threshold-based selection of which mask positions to commit,
+- building next step's input ids.
+
+Wall time contains this CPU work but `gpu_busy` does NOT. So you see a
+large `wall - gpu_busy` gap and reach for the host-scheduling toolbox
+(A4 / H1) — but those won't help, because there are no GPU dispatches
+to overlap with the CPU work; the host loop is genuinely the gap.
+
+**Fix the diagnostic first**: add a third accumulator (see
+`references/profiling.md` "host_post" section). Print
+`wall / gpu_busy / host_post`. If `host_post` is more than ~5% of
+wall, attack F3 (move the per-row softmax+argmax+confidence to the GPU
+as a single kernel).
+
+In a Dream-7B port `host_post` was 0.25 s of 2.90 s wall. F3 dropped
+it to ~0 s and wall to 2.63 s — closing more than half the remaining
+gap to MLX in one commit. Without tracking `host_post` separately we'd
+have spent the same effort hunting non-existent host-scheduling bugs.
+
+# 37. `gpu_buf_contents()` is zero-copy but per-step CPU reads still hit caches
+
+On Apple Silicon unified memory, `gpu_buf_contents()` returns a CPU
+pointer to the same physical page the GPU just wrote — there is no
+copy. So in principle reading a few KB of logits per step is free.
+
+But per refine step you might read `BL × V × sizeof(bfloat)` bytes —
+e.g., for Dream-7B with BL=16 and V=152064 that's 4.7 MB per step.
+Across 64 steps × N decode batches that's hundreds of MB of CPU cache
+reads on top of the per-position softmax computation itself.
+
+**Symptom**: `host_post` is bigger than you'd predict from raw
+arithmetic. CPU `top` shows your process at 60–90% on one core during
+"GPU phase".
+
+**Fix**: same as #36 — move the per-row reduction to the GPU (F3) so
+the only host-side reads are the `M × 8 bytes` of
+`(argmax_idx, confidence)`. Even at BL=16 that's 128 bytes/step, which
+truly is free.
+
+# 38. Two M shapes → two PSOs with different (BM, BK); pad workspaces to max BM
+
+A diffusion-LLM port has two very different shapes for the same matmul
+kernel:
+
+- **Prefetch**: one full forward at `M = L` (e.g., 89). The host
+  consumes only one or two rows of the output.
+- **Refine**: many forwards at `M = BL` (e.g., 16).
+
+A single (BM, BK) tile is suboptimal for both. The best tile at M=16
+typically has BM=16 + aggressive BK=16 unroll; at M=89 it's BM=32 +
+modest BK=8 (BK=16 spills the A register footprint at TM=4).
+
+**Strategy**: compile two PSOs — one per (BM, BK) combo — and pick at
+dispatch time:
+
+```c
+gpu_pipeline* pso = (M > 16) ? pso_gemm_bm32 : pso_gemm_bm16_bk16;
+```
+
+**Buffer caveat**: when ANY path uses BM=32, ALL workspace buffers
+(intermediate activations, the lm_head input, etc.) must be padded to
+`(L + 31) & ~31` rows. The BM=32 path's tail TG reads rows [L, L+31)
+unconditionally; if the buffer ends at row L you get a GPU page fault
+or corrupted neighbouring data. The smaller tile (BM=16) needs
+`(L + 15) & ~15` padding; use the LCM.
+
+This won us ~5–8% on Dream-7B refine on top of the dual-tile dispatch.
+The cost is one extra PSO compile at startup and one extra weight
+buffer view (no copy — same backing store).

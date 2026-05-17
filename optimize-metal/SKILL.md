@@ -9,9 +9,13 @@ description: >
   persistent + const param buffers, concurrent encoder, fused residual
   epilogues, decode/prefill split, GPU glue kernels for host-side
   breaks (often the biggest single decode win), SG-per-(row,dim) for
-  RNN/SSM recurrences. Validates tokens against the C reference after
-  each change. Triggers: optimize metal, speed up metal, match mlx
-  speed, gpu optimization, metal performance, kernel tuning.
+  RNN/SSM recurrences. Also handles diffusion-LLM samplers
+  (Dream / LLaDA / fastdllm): GPU per-row softmax+argmax+confidence
+  (replaces the host_post loop), single-row output pruning via X
+  offset, dual-tile (BM, BK) GEMM dispatch by M. Validates tokens
+  against the C reference after each change. Triggers: optimize metal,
+  speed up metal, match mlx speed, gpu optimization, metal performance,
+  kernel tuning, diffusion LLM (Dream / LLaDA / fastdllm) on metal.
 ---
 
 # optimize-metal — make the Metal port fast (match MLX ±5%)
@@ -138,6 +142,15 @@ chase:
 host-side breaks (H1 / glue kernels).** You can see this happen
 immediately as `gpu_busy / wall` ratio jumping from ~30% to ~95%.
 
+**Diffusion-LLM samplers need a third number.** If your sampler does
+non-trivial per-step CPU work (per-position softmax + argmax +
+confidence over V at every refine step — typical of Dream / LLaDA /
+fastdllm), also accumulate `host_post`. A large `wall - gpu_busy` gap
+on these models often looks like a host-scheduling problem (A/H) but
+is actually a sampler problem (F3): there's nothing to overlap with,
+the CPU is genuinely the gap. See `references/profiling.md` and
+`references/diffusion-llm.md`.
+
 Use `mlx_lm`-equivalent timing (`tps = (n_gen - 1) / decode_time`,
 exclude the first decode step) so you can compare apples to apples with
 MLX, AND use ≥64 tokens AND best-of-3 runs: short runs on busy machines
@@ -211,6 +224,37 @@ applying for code hygiene but don't expect headline speedups.)
 - C1/C2/C3 (GEMM MMA for prefill) — only relevant if your goal is to
   match prefill speed.
 
+### Diffusion LLMs (Dream / LLaDA / fastdllm)
+
+These are NOT autoregressive decoders. The forward pass runs twice
+per generated block: once at `M = L` (prefetch, populates the KV
+cache) and many times at `M = BL` (refine, iteratively unmasks
+positions). The naive host post-processing — per-position softmax +
+argmax + confidence over V — dominates the gap to MLX in a way the
+A/H techniques can't reach.
+
+The empirical order is different. Most A/H techniques (A4 2-deep
+pipeline, B5 fused residual, A8 parallel chains) do less work or
+don't help at all. The wins, in order:
+
+1. **F3** — per-row softmax+argmax+confidence on GPU. Replaces the
+   host loop that shows up as a large `host_post` invisible to
+   `gpu_busy`. In one port: 0.25 s → 0.00 s, wall 2.90 → 2.63 s.
+2. **H3** — single-row output pruning for the prefetch path. Saves
+   most of one full lm_head streaming pass.
+3. **C2 dual-tile-by-M** — two PSOs with different (BM, BK), picked by
+   `M > 16` at dispatch. Best (BM, BK) for refine ≠ best for prefetch.
+4. **C2 BK=16** — unroll two K-bands per loop iter in the BM=16 GEMM.
+   Doesn't fit BM=32 (TM=4 doubles the A register footprint).
+5. **B5 fused residual** — same as for autoregressive, modest win.
+
+Skip A4 (no usable overlap — refine step N+1's ids depend on step N's
+argmax). Skip A8 (the forward chain is mostly serial — Q/K/V→SDPA→o→
+gate/up→down — with very little independent work to interleave).
+
+See `references/diffusion-llm.md` for the full worked Dream-7B example
+(naive ~3.04 s → 2.63 s, beating MLX's 2.74 s by 4%).
+
 ## The optimization catalog
 
 The catalog is organised by bottleneck category, lettered A–I. Browse
@@ -226,9 +270,9 @@ details.
 | C       | GEMM (prefill Linear)       | simdgroup_matrix MMA · tile-size sweep · fused-op templates           |
 | D       | SDPA (attention)            | parallel softmax · online softmax · multi-SG · sliding KV cache       |
 | E       | MoE                         | decode qmv4 · fused gate_up_swiglu · prefill sorted-gather GEMM · fused combine_scatter |
-| F       | Reductions                  | parallel argmax · parallel topk softmax                               |
+| F       | Reductions                  | parallel argmax · parallel topk softmax · per-row softmax+argmax (F3, diffusion samplers) |
 | G       | Decode/Prefill split        | two implementations, dispatch by Lq                                   |
-| H       | Host/GPU boundary cleanup   | glue kernels (H1, often biggest single win) · embed+forward+argmax merge |
+| H       | Host/GPU boundary cleanup   | glue kernels (H1, often biggest single win) · embed+forward+argmax merge · output-row pruning via X offset (H3) |
 | I       | Recurrent / SSM             | SG-per-(state_row, state_dim)                                         |
 
 Each catalog entry points to a code snippet under `patterns/` — those
@@ -305,6 +349,15 @@ optimization:
 - **Persistent param buffer + 2-deep pipeline = race.** Duplicate the
   param ring (`gpu_param_buf[slot]`, `slot ∈ {0,1}`) the same way you
   duplicated the id ring. (gotcha #35)
+- **Diffusion-LLM samplers do CPU work invisible to `gpu_busy`.** If
+  your per-step CPU loop computes softmax / argmax / confidence over V
+  for many positions, that time shows up only in wall, not gpu_busy.
+  Add a third accumulator `host_post`; if > ~5% of wall, apply F3.
+  (gotcha #36)
+- **Two M shapes need two PSOs.** When prefetch (M=L) and refine
+  (M=BL) differ by 4–5×, compile two GEMM PSOs with different
+  `(BM, BK)` and switch at dispatch by `M > 16`. Pad workspace buffers
+  to the larger `BM`. (gotcha #38)
 
 ## Commit strategy
 
@@ -395,6 +448,8 @@ patterns/
 ├── moe_sorted_gather_qmm.metal          (E3 MMA quantized GEMM)
 ├── argmax_parallel.metal                (F1)
 ├── topk_parallel_router.metal           (F2)
+├── softmax_argmax_per_row.metal         (F3 — diffusion samplers)
+├── gemm_x_offset_row_prune.c            (H3 — single-row output pruning)
 ├── glue_kernels_no_host_break.metal     (H1 — often biggest single win)
 └── recurrent_state_sg_per_row.metal     (I1 for SSM/RNN)
 ```
@@ -406,12 +461,13 @@ Loaded on demand — read the one your situation calls for.
 ```
 references/
 ├── catalog.md                  Full A–I optimization catalog (the menu).
-├── profiling.md                wall vs gpu_busy diagnostic, KPROF, variance discipline.
+├── profiling.md                wall vs gpu_busy diagnostic, host_post for samplers, KPROF, variance discipline.
 ├── debugging.md                Symptom → recipe table + late-stage barrier checklist.
-├── gotchas.md                  30 numbered war stories. Has its own TOC.
+├── gotchas.md                  38 numbered war stories. Has its own TOC.
 ├── decode-prefill-split.md     G — when and how to maintain two kernel paths.
 ├── parallel-chains.md          A8 — the late-decode end-game win.
-└── sliding-kv-cache.md         D4 — rotating fixed-size KV cache index math.
+├── sliding-kv-cache.md         D4 — rotating fixed-size KV cache index math.
+└── diffusion-llm.md            Diffusion-LLM (Dream / LLaDA / fastdllm) attack order, what works, what doesn't.
 ```
 
 When you start the skill, **read `references/gotchas.md` first** — many

@@ -24,9 +24,9 @@ each section the entries are roughly in the order you'd apply them.
 - [C. GEMM (prefill Linear)](#c-gemm--prefill-time-linear-layers) — simdgroup_matrix MMA, tile sweep, fused-op templates
 - [D. SDPA](#d-sdpa--attention) — parallel softmax, online softmax, multi-SG, sliding KV
 - [E. MoE](#e-moe--typically-the-biggest-bottleneck) — decode qmv4, fused gate_up_swiglu, prefill sorted-gather, fused combine_scatter
-- [F. Reductions](#f-reductions--small-but-pesky-kernels) — parallel argmax, parallel topk softmax
+- [F. Reductions](#f-reductions--small-but-pesky-kernels) — parallel argmax, parallel topk softmax, per-row softmax+argmax (diffusion samplers)
 - [G. Decode/Prefill split](#g-decodeprefill-split--only-when-techniques-diverge)
-- [H. Host/GPU boundary cleanup](#h-hostgpu-boundary-cleanup--often-the-biggest-single-win) — glue kernels, embed+forward+argmax merge
+- [H. Host/GPU boundary cleanup](#h-hostgpu-boundary-cleanup--often-the-biggest-single-win) — glue kernels, embed+forward+argmax merge, prune unused output rows
 - [I. Recurrent / state-update kernels](#i-recurrent--state-update-kernels) — SG-per-(row,dim) for RNN/SSM
 
 ---
@@ -323,21 +323,57 @@ SIMD group computes a `BM × BN` output tile via these primitives.
 **Commits**: dd9aee3 (vendor MLX steel headers), 28afb2e (POC),
 3fce46d (qmm_t_gather_rhs MMA), 6316747 (BM=16 BN=32 WM=1 WN=2).
 
-### C2. Tile-size sweep (BM, BN, WM, WN)
+### C2. Tile-size sweep (BM, BN, BK, WM, WN)
 
-**What**: With `simdgroup_matrix`, you tile across two axes — across
-threadgroups (BM × BN), and within threadgroup across warps (WM × WN
-SIMD-groups). Best tile size depends on the matmul shape and the
-hardware. The gpt-oss reference impl found `BM=16 BN=32 WM=1 WN=2`
-matches MLX's "non-NAX" tile sizes for the gpt-oss MoE shapes.
+**What**: With `simdgroup_matrix`, you tile across three axes — output
+rows (BM), output cols (BN), and reduction depth (BK) — and within
+each threadgroup further across SIMD-groups (WM × WN). The full knob
+set is `(BM, BN, BK, WM, WN)`. Best tile depends on the matmul shape
+AND the hardware.
 
-**When**: After C1. Sweep `(BM, BN, WM, WN) ∈ {(8,16,1,1), (16,16,1,2),
-(16,32,1,2), (32,32,2,2), ...}` and pick the fastest for each kernel
-shape.
+- The `gpt-oss` reference impl found `BM=16 BN=32 BK=8 WM=1 WN=2`
+  matches MLX's "non-NAX" tile for the gpt-oss MoE shapes.
+- The Dream-7B reference port found `BM=16 BN=64 BK=16 WM=1 WN=2` for
+  refine (M=16) and `BM=32 BN=64 BK=8 WM=1 WN=2` for prefetch (M=89)
+  on M4 Max. BK=16 at BM=32 spills registers (TM=4 doubles the A
+  footprint).
+
+**When**: After C1. Sweep `(BM, BN, BK, WM, WN)` and pick the fastest
+for each kernel shape.
 
 **Speedup**: 1.10–1.30× per kernel.
 
-**Commit**: 6316747.
+**Knobs and gotchas**:
+
+- **BM**: output rows per TG. Larger BM amortises W streaming (W is
+  loaded once per row-band) but TM = BM/(WM*8) registers grow as `TM²`.
+- **BN**: output cols per TG. TN = BN/(WN*8). Larger BN amortises X
+  streaming but TN registers grow as `TN²`. TN=8 overflows on M4 Max
+  for bf16 (port-c-to-metal target).
+- **BK**: K-bands processed per loop iter. BK=8 is one 8×8 MMA per K
+  step; BK=16 unrolls two 8×8 MMAs per step. Halves the K-loop count
+  and improves ILP at the cost of doubling A/Bt mma temp registers.
+  Worked at BM=16 in our reference port; at BM=32 the A footprint
+  (`TM × (BK/8)` mma tiles) overflowed. The win was 5–8% on refine.
+- **WM**: SIMD-groups stacked in M. Forces Bt to be redundant across
+  WM SGs (each loads the same Bt tile). Usually pick `WM=1` so that A
+  is shared (small) and Bt is split (large).
+- **WN**: SIMD-groups stacked in N. Forces A to be redundant across
+  WN SGs. Pick `WN=2` for 64 threads/TG.
+
+**Dual-tile dispatch**: If your model has two distinct `M` values
+(e.g., diffusion-LLM prefetch M=89 vs refine M=16), compile two PSOs
+with different `BM`/`BK`. Pick at dispatch time:
+
+```c
+gpu_pipeline* pso = (M > 16) ? pso_gemm_bm32 : pso_gemm_bm16_bk16;
+```
+
+Buffer padding must round up to the larger BM (use `(L + 31) & ~31`
+if any path is BM=32) so out-of-range row loads stay in-buffer.
+
+**Commits**: 6316747 (gpt-oss), 697baaa + 80f26b2 (Dream-7B dual-tile +
+BK=16).
 
 ### C3. Template kernels over fused-op flags
 
@@ -544,6 +580,37 @@ Bigger for larger E or K.
 
 **Commit**: 2177f38 (Qwen3.6 parallel top-K, +25%).
 
+### F3. Per-row softmax + argmax + confidence (diffusion samplers)
+
+**What**: For each of `M` logits rows, compute `(argmax_idx,
+softmax_confidence)` in a single kernel. Output is just `M × 8 bytes`.
+One threadgroup per row, two-pass:
+
+1. Find `max + argmax` over V (SG-wide `simd_max`, then cross-SG via
+   TG-mem reduction with `simd_min` on lane indices for stable
+   tiebreak).
+2. Sum `exp(logit - max)` over V (`simd_sum` + cross-SG reduction);
+   `conf = 1 / sum_exp`.
+
+**When**: Your sampler is a diffusion-LLM block-refinement sampler
+(Dream / LLaDA / fastdllm) where each refine step needs the confidence
+of every position to decide which mask tokens to commit. The host
+version of this loop ran `BL × V × 3` scalar ops per step on the CPU
+and showed up as a large `host_post` time invisible to `gpu_busy`.
+
+In one port the host loop was `host_post = 0.25 s` out of `wall =
+2.90 s`; replacing it with this kernel dropped `host_post` to `0.00 s`
+and `wall` to `2.63 s` — closing more than half the remaining gap to
+MLX in one commit.
+
+**Speedup**: For diffusion samplers, 1.05–1.15× depending on
+`BL × V × steps`. Negligible for autoregressive decoders (they read
+one row at a time; F1 already covers that case).
+
+**Snippet**: `patterns/softmax_argmax_per_row.metal`
+
+**Commit**: df3d9d1 (Dream-7B fastdllm reference port).
+
 ---
 
 ## G. Decode/Prefill split — only when techniques diverge
@@ -606,6 +673,48 @@ Was 3 commit_waits per token, now 1.
 **When**: Always, after H1.
 
 **Speedup**: 1.02–1.05× decode (a few ms saved per step).
+
+### H3. Prune unused output rows in the final linear
+
+**What**: When the host only consumes a small subset of the final
+linear's output rows (e.g., a diffusion-LLM prefetch reads ONE
+`lm_head` row out of `L=89`), dispatch that final linear with `M`
+restricted to the rows the host actually needs. The trick is to pass a
+byte-offset into the input buffer so you reuse the same kernel:
+
+```c
+// Compute lm_head for just one row of h_buf, output to logits_buf[0].
+size_t x_off = (size_t)needed_row * H * sizeof(bfloat);
+gpu_arg_buf args[] = {
+    { h_buf, x_off },  // <-- offset into the same buffer
+    ARG(W), ARG(B), ARG(logits_buf), push_params(&pp, 1, K, N), ...
+};
+gpu_cmdbuf_dispatch(cb, pso_gemm, args, n, ...);
+```
+
+The kernel reads from `h_buf + x_off` as if it were the start of the
+input, computes `M=1` rows, and writes to `logits_buf[0]`. The host
+reads from row 0, skipping the per-row shift logic.
+
+**When**: The final linear is huge in `N` (e.g., `V=152064` for
+`lm_head`) AND the host only consumes a few rows. Most autoregressive
+decoders already only do `M=1`, so this is irrelevant there — it's a
+diffusion-LLM specific win.
+
+**Speedup**: Saves `(M_full / M_used) - 1` weight-streaming passes of
+`W`. For `lm_head` with `N=152k K=3584` at `BM=32`, dropping
+M=89 → M=1 saves ~3 row-bands of streaming ≈ 2 GB. Wall savings:
+20–50 ms per prefetch call on M4 Max.
+
+**Caveat**: The semantics of "what row is needed" may depend on
+sampler-specific shift conventions. Trace the host code carefully —
+the off-by-one between "logits row for position p comes from hidden
+state at position p-1" trips up most refactors.
+
+**Snippet**: `patterns/gemm_x_offset_row_prune.c` — shows the
+`d_linear_full_off` host-side dispatch helper.
+
+**Commit**: 304484b (Dream-7B fastdllm reference port).
 
 ---
 
