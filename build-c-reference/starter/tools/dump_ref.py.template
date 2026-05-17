@@ -185,9 +185,12 @@ def run_mlx(args, layers_to_dump):
 # ===========================================================================
 
 def run_pytorch(args, layers):
-    tok = AutoTokenizer.from_pretrained(args.model)
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    # Use AutoModel (with trust_remote_code=True for non-mainline architectures
+    # like discrete-diffusion LMs); fall back to AutoModelForCausalLM otherwise.
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="cpu")
+        args.model, torch_dtype=torch.bfloat16, device_map="cpu",
+        trust_remote_code=True)
     model.eval()
     messages = [
         {"role": "system", "content": args.system or "You are a helpful assistant."},
@@ -200,6 +203,8 @@ def run_pytorch(args, layers):
     captures = {}
     def hook(name):
         def f(_mod, _inp, out):
+            # Attention layers may return a (output, weights, past_kv) tuple;
+            # most other modules return a plain Tensor.
             arr = (out[0] if isinstance(out, tuple) else out).detach().float().cpu().numpy()
             captures[name] = arr
         return f
@@ -212,7 +217,12 @@ def run_pytorch(args, layers):
         layer.self_attn.v_proj.register_forward_hook(hook(f"v_proj_{li}"))
         # [MODEL] add more hooks: o_proj, router, gate_up, swiglu, down, etc.
 
-    with torch.inference_mode():
+    # IMPORTANT: PyTorch CPU's default SDPA backend for bf16 is
+    # FLASH_ATTENTION, which disagrees with the textbook math by
+    # mean|d|~0.004 / max|d|~0.9. Force MATH so the dumped oracle
+    # matches what a naive C SDPA kernel computes.
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    with torch.inference_mode(), sdpa_kernel([SDPBackend.MATH]):
         out = model.generate(ids, max_new_tokens=1, do_sample=False)
     save_bin(f"{args.out}/next_id.bin",
              np.array([out[0, ids.shape[1]].item()], dtype=np.int32), "i32")

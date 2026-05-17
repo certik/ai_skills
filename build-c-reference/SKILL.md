@@ -120,16 +120,20 @@ Ask the user for (if not already provided / discoverable):
     └── test_kernels.c     # one test fn per kernel; CLI-selectable
 ```
 
-Plus the **only** remaining Python tool, kept outside `src-cpu/`:
+Plus the **only** remaining Python tools, kept outside `src-cpu/`:
 
 ```
 ./tools/
-└── dump_ref.py         # runs the Python reference, dumps refs/*.bin
+├── dump_ref.py            # runs the Python reference, dumps refs/*.bin
+└── run_ref_<sampler>.py   # runs the Python reference's sampler with
+                           # deterministic config — produces token IDs
+                           # to diff against C output for Phase 5/6.
 ```
 
 Note: `src-cpu/` is fully Python-free. The inference build needs only
-clang + libc + libm. Python is used only to regenerate oracle dumps in
-`refs/` for the per-kernel correctness tests.
+clang + libc + libm. Python is used only to (a) regenerate oracle dumps
+in `refs/` for the per-kernel correctness tests, and (b) produce a
+reference token sequence for end-to-end token-equivalence checks.
 
 ## Starter files (in this skill's `starter/`)
 
@@ -261,14 +265,27 @@ Then the model-shared model-format readers:
    regex may need swapping later (see "Common pitfalls").
 
 2. Build and run the C tokenizer-bin generator on your model's
-   `tokenizer.json`:
+   tokenizer files:
    ```
    make tokenizer MODEL_DIR=/path/to/model
    ```
    This produces `src-cpu/tokenizer.bin` (a compact, mmap'd blob the
    runtime tokenizer reads). For **byte-level BPE** tokenizers (Qwen,
-   Llama 3, GPT-2, gpt-oss/o200k) `build_tokenizer.c` is drop-in. For
-   sentencepiece-based families, rewrite `decode_vocab_key`.
+   Llama 3, GPT-2, gpt-oss/o200k) `build_tokenizer.c` is drop-in
+   provided the model ships a `tokenizer.json`. For sentencepiece-based
+   families, rewrite `decode_vocab_key`.
+
+   **Older HF tokenizer format** (Qwen ≤ 2.5, Llama 1, some older
+   community models): no `tokenizer.json`. Instead, two files:
+   - `vocab.json`: flat `{token_string: id}` (GPT-2 byte-encoded keys)
+   - `added_tokens.json`: flat `{name: id}` for special tokens
+
+   Modify `build_tokenizer.c` to read BOTH and merge them: emit one
+   entry per id, with `added_tokens` ids getting empty BPE strings so
+   the merge engine never picks them as merge candidates. Total id
+   range is `max(vocab.json ids, added_tokens.json ids) + 1`. The
+   tiktoken trick (merge priority == vocab id) still works — no
+   `merges.txt` needed.
 
 3. Author `<chattmpl>.{c,h}` (e.g., `harmony.{c,h}`, `qwen_chat.{c,h}`,
    `llama3_chat.{c,h}`) that builds the prompt token sequence. **Tip**:
@@ -330,9 +347,25 @@ Author `tools/dump_ref.py` (start from
    attn_out_0.bin
    o_proj_0.bin
    ...
+   logits.bin              # full [L, vocab] logits — for Phase 5 validate-forward
+   argmax_per_pos.bin      # per-position argmax — easier acceptance metric
    ```
 
-5. **Commit**: `tools/dump_ref.py + initial oracle dump`.
+5. **For the PyTorch backend**, wrap both the full forward and any
+   manual-replay SDPA calls in `sdpa_kernel([SDPBackend.MATH])`. The
+   CPU default `FLASH_ATTENTION` backend disagrees with the textbook
+   math on bf16 by `mean|d|~0.004 / max|d|~0.9`, which will cause your
+   per-kernel SDPA test to fail at 0.9 absolute even when your kernel
+   is correct. See "PyTorch / HF gotchas".
+
+6. **For ops not natural to hook** (RoPE'd q/k, raw SDPA output, fused
+   silu*up): the PyTorch `forward_hook` only fires at module
+   boundaries. Add a small **"manual layer-0 replay"** section that
+   reuses the captured `q_proj_0` etc., re-applies RoPE / SDPA / silu
+   manually, and saves the intermediates. The starter template shows
+   the MLX equivalent (which always requires manual walking).
+
+7. **Commit**: `tools/dump_ref.py + initial oracle dump`.
 
 ### Phase 4: Implement kernels one at a time
 
@@ -475,24 +508,64 @@ chain dumps later: layer 0 input → layer 0 output → layer 1 input → ...
      activations through workspace buffers.
    - Manages per-layer KV cache (mmap'd or malloc'd, sized to
      `MAX_CTX * N_KVHEADS * HEAD_DIM * sizeof(bf16)`).
+   - For **non-causal / diffusion-style models**, there is no KV cache:
+     `forward(L)` runs over the entire sequence each call. See
+     "Discrete-diffusion / masked LMs" below.
 
-2. Add the AR decode loop:
+2. Add the AR decode loop (or diffusion sampler):
    - Embed prompt → run `forward(0, Lp)` for prefill → argmax
    - Loop: embed one id → run `forward(Lp+i, 1)` for decode → argmax →
      emit token → break on stop.
 
-3. End-to-end run with the same prompt as the Python reference:
+3. **Add a `--validate-forward REFS_DIR` mode BEFORE running E2E**:
+   - Load `refs/input_ids.bin` (saved by the oracle dumper).
+   - Run `embed_gather` then `forward(L)` over those ids.
+   - Per-position, compute argmax over `logits_bf16[p, :]` and compare
+     against `refs/argmax_per_pos.bin`. Also report global max|d| vs
+     `refs/logits.bin`.
+   - This catches "all kernels pass individually but `forward()` is
+     stitched wrong" bugs in **one forward** (tens of seconds) instead
+     of waiting for a multi-minute end-to-end run that produces
+     mysterious wrong tokens.
+   - Acceptance: N/N argmax positions match. Raw logits max|d| may be
+     0.5–1.5 after 28+ layers — that's drift, not a bug, as long as
+     argmax is preserved. See "Tolerance setting for bf16".
+
+4. End-to-end run with the same prompt as the Python reference:
    ```
    ./<BIN> --prompt "Hello, who are you?" --max-tokens 16
    ```
    Compare generated token IDs against the reference. They must match.
 
-4. If they don't match: dump intermediates from the C run (e.g., add a
-   `--dump-c-refs` flag that writes the same `refs/*.bin` files as the
-   Python oracle does), and binary-diff against the Python refs. The
-   first divergence localizes the bug.
+5. **Write a small `tools/run_ref_<sampler>.py`** that runs the Python
+   reference with **identical sampler config** (T=0, greedy, no
+   sampling-rng-dependent algs) and prints the generated ids. This is
+   what you diff against your C output. Two pitfalls:
+   - Some references quietly use a non-deterministic backend (e.g.
+     PyTorch CPU's default `SDPBackend.FLASH_ATTENTION` for bf16, which
+     diverges from textbook math by mean|d|≈0.004 / max|d|≈0.9 — see
+     "PyTorch CPU SDPA backend gotcha"). Force the deterministic /
+     textbook backend in this Python helper.
+   - Some sampler algs (e.g. `alg=origin` in Dream's diffusion) draw
+     from `torch.rand` and can't be matched in C. Pick a deterministic
+     alg (Dream: `alg=entropy`).
 
-5. **Commit**: `src-cpu: end-to-end forward + AR decode (N/N tokens match ref)`.
+6. If tokens don't match: dump intermediates from the C run (e.g., add
+   a `--dump-c-refs` flag that writes the same `refs/*.bin` files as
+   the Python oracle does), and binary-diff against the Python refs.
+   The first divergence localizes the bug. Most often: a missing bf16
+   round-trip in one of the per-element kernels — see "Numerical
+   drift".
+
+7. **Budget**: naive scalar bf16 on a single CPU core runs the
+   bf16-7B-class forward at ~1–2 GFLOPS/s after `bf16_to_f32` overhead.
+   For e.g. Dream 7B at L=25 that's ~85 s/forward, ~15 min for an
+   8-step diffusion. **Don't be surprised** if a full diffusion or AR
+   loop takes 10+ minutes per run — it's the price of "no SIMD, no
+   threads, naive scalar". `port-c-to-metal` and `optimize-metal` will
+   cut this to under a second.
+
+8. **Commit**: `src-cpu: end-to-end forward + decode (N/N tokens match ref)`.
 
 ### Phase 6: Acceptance
 
@@ -587,6 +660,56 @@ reductions are linear and bf16 only has 8 mantissa bits. But:
 - For RoPE with yarn / mscale, the multiplication order between
   `cos/sin`, `mscale`, and the input affects the last mantissa bit.
   Match the reference.
+
+#### Per-element bf16 rounding patterns ("hidden casts")
+
+This is the **#1 cause of 1–4 ULP per-element kernel mismatches**.
+When the reference is written in PyTorch / MLX / etc., each `tensor op
+tensor` in the model dtype (bf16) **rounds the intermediate to bf16**
+even when the surrounding math looks like one fused fp32 expression. A
+naive C kernel that runs the whole expression in fp32 and rounds only
+at the final store will be 1–2 ULP off per element.
+
+The canonical examples in a vanilla decoder block:
+
+| Reference code                        | What it really does (bf16 storage)               | Naive C bug                                                    |
+|---------------------------------------|--------------------------------------------------|----------------------------------------------------------------|
+| `w * x_normalized.to(input_dtype)`    | cast `x_normalized` to bf16, then `w * bf16`     | `y = w * x_normalized` (no cast) ⇒ 1 ULP off                   |
+| `F.silu(gate) * up`                   | `silu(g)` in bf16, then `bf16 * bf16`            | `y = silu(g_f32) * u` ⇒ 1 ULP off                              |
+| `cos.to(query.dtype); q*cos + ...`    | cast cos/sin to bf16 first, then per-mul rounds  | use fp32 cos/sin ⇒ 1–2 ULP off                                 |
+| `(q*cos) + (rotate_half(q)*sin)`      | each multiply rounds to bf16, then add rounds    | `f32_to_bf16(a*c - b*s)` fuses ⇒ 1–2 ULP off                   |
+| `softmax(logits, dtype=fp32).to(bf16)`| softmax in fp32, then cast back to bf16 before V | run softmax fp32 and use fp32 probs in V matmul ⇒ small drift  |
+
+The fix is mechanical: wherever the reference would have a `.to(dtype)`
+or a `bf16 op bf16` boundary, insert `bf16_to_f32(f32_to_bf16(v))` in
+the C kernel. Examples:
+
+```c
+// rmsnorm: weight multiply happens in input dtype (bf16).
+float v   = bf16_to_f32(x[d]) * rrms;
+float vb  = bf16_to_f32(f32_to_bf16(v));        // <- mirror .to(input_dtype)
+float out = bf16_to_f32(W[d]) * vb;
+y[d] = f32_to_bf16(out);
+
+// silu_mul: silu(g) rounds to bf16 before * up.
+float g = bf16_to_f32(gate[i]);
+float u = bf16_to_f32(up[i]);
+float s = bf16_to_f32(f32_to_bf16(siluf_(g))); // <- mirror F.silu(g) returning bf16
+out[i]  = f32_to_bf16(s * u);
+
+// RoPE: cos/sin cast to bf16; each per-mul rounds; then add rounds.
+float c  = bf16_to_f32(f32_to_bf16(cosf(pos * inv_freqs[k])));
+float s  = bf16_to_f32(f32_to_bf16(sinf(pos * inv_freqs[k])));
+float ac = bf16_to_f32(f32_to_bf16(a * c));   // bf16 mul
+float bs = bf16_to_f32(f32_to_bf16(b * s));   // bf16 mul
+row[k]   = f32_to_bf16(ac - bs);              // bf16 add
+```
+
+Whether you need this for *every* kernel or only some depends on how
+strict your tolerance is. For per-kernel oracle matching at `max|d| ≈ 0`
+(exact bit-equivalent), insert all of them. If you're willing to live
+with 1–2 ULP per element and let drift accumulate, skip them — but
+expect the global logit drift to be 2–3× larger after L layers.
 
 ### `-ffast-math` warning
 
@@ -700,6 +823,11 @@ just the *starting* template. Newer models add:
 - **Tied vs untied lm_head**: `tie_word_embeddings: true` means
   `logits = embed_tokens.as_linear(x)`. Otherwise it's a separate
   `lm_head` weight.
+- **Bidirectional attention** (`is_causal=False`): discrete-diffusion
+  and masked LMs (Dream, LLaDA, MDLM, ...) use BERT-style bidirectional
+  attention. SDPA collapses to `softmax(QK/√D) @ V` with no mask, no
+  sinks, no window. The whole "AR decode loop" goes away — see
+  "Discrete-diffusion / masked LMs" below.
 
 #### Hybrid linear-attention / SSM models
 
@@ -728,6 +856,63 @@ What they have in common (and what the C reference needs to handle):
    usually does.
 4. **Output normalization gated by an input projection** (e.g.,
    `silu(z) * rms_norm(y, weight)`): two kernels, not fused.
+
+#### Discrete-diffusion / masked LMs
+
+Discrete-diffusion LMs (Dream, LLaDA, MDLM, ...) replace the AR decode
+loop with an iterative denoising sampler. Important consequences for
+the C reference:
+
+1. **Bidirectional attention** (`is_causal=False`). No causal mask, no
+   sliding window, no sinks. SDPA is just `softmax(QK/√D) @ V`. No
+   q_offset, no per-token attention window — every position attends to
+   every position.
+2. **No KV cache**. Each denoising step re-runs the full forward over
+   `[L = prompt_len + max_new_tokens]`. Allocate workspaces once at
+   size `L` and clobber them per step.
+3. **Mask-token padding**. The initial sequence is
+   `[prompt_ids..., MASK, MASK, ...]` where MASK is a special id
+   (e.g., 151666 for Dream). Each step replaces some masks with the
+   model's predictions.
+4. **Logits-shift trick** (per `generation_utils._sample` in many of
+   these models): the logits used at position `p` are actually the row
+   computed for position `p-1` (`logits = cat(logits[:,:1], logits[:,:-1], dim=1)`).
+   In C, mirror this by scoring position `p` with row `(p == 0 ? 0 : p - 1)`.
+5. **Confidence-based scheduling**. Each step picks the top-K most
+   confident masked positions and unmasks them. Common confidence
+   metrics: `maskgit_plus` (top-1 prob), `topk_margin` (top1 − top2),
+   `entropy` (negative entropy). At `temperature=0` all three are
+   deterministic — pick one (e.g., `entropy`) for E2E validation.
+6. **Skip RNG-dependent algs**. Some samplers offer an `alg=origin` or
+   `alg=random` mode that draws from `torch.rand`; you cannot match
+   these in C without reimplementing PyTorch's Philox / Mersenne RNG.
+   Stick to deterministic algs.
+7. **Validation prompt has to leave room for output**. If
+   `max_new_tokens=8` is too few and the model decides everything is
+   `<eos>`, your "matching" output is `[eos]*8` on both sides — still
+   valid bit-equivalent proof, but trivially so. Bump to ≥16 to see a
+   real response.
+
+The forward kernels are identical to a vanilla decoder (just
+`is_causal=False` in SDPA). What changes is the **outer driver loop**
+in `main.c`:
+
+```c
+// Pseudocode for a diffusion sampler driver.
+for (i = 0; i < steps; i++) {
+    n_mask = count(x == MASK);
+    if (!n_mask) break;
+    embed_gather(x, ..., x_buf);
+    forward(L);                          // bidirectional, full sequence
+    for each p with x[p] == MASK:
+        src = (p == 0) ? 0 : p - 1;
+        (id, conf) = score_row(logits[src], alg);
+        cand_id[p] = id; cand_conf[p] = conf;
+    n_transfer = (i == steps-1) ? n_mask : (int)(n_mask * (1 - s/t));
+    topk_indices = topk_desc(cand_conf, n_transfer);
+    for each idx in topk_indices: x[idx] = cand_id[idx];
+}
+```
 
 ### MLX-specific gotchas
 
@@ -770,6 +955,112 @@ codebase is small and easy to read. But it has a few footguns:
    frequency table, not the implicit `1 / base^(2k/D)` form. The two
    are equivalent, but the C side needs to precompute the same table:
    `inv_freqs[k] = 1 / base ** (2k / D_rot)`.
+
+### PyTorch / HF-specific gotchas
+
+The PyTorch / HF transformers stack is the more common fallback when
+no MLX port exists. Its footguns:
+
+1. **`SDPBackend.FLASH_ATTENTION` on CPU is not bit-equivalent to
+   the textbook math** for bf16 inputs. On CPU, PyTorch's default for
+   `torch.nn.functional.scaled_dot_product_attention(..., is_causal=False)`
+   with bf16 q/k/v is `FLASH_ATTENTION`, which disagrees with
+   `SDPBackend.MATH` by `mean|d| ≈ 0.004`, `max|d| ≈ 0.93` on a typical
+   7B model. Your naive C SDPA implements the textbook math, so:
+
+   ```python
+   from torch.nn.attention import SDPBackend, sdpa_kernel
+   with torch.inference_mode(), sdpa_kernel([SDPBackend.MATH]):
+       out = model(input_ids=ids, ...)  # oracle dump
+   ```
+
+   Apply this both in `tools/dump_ref.py` (so the oracle matches what
+   your C SDPA computes) AND in `tools/run_ref_<sampler>.py` (so the
+   reference's generated tokens are comparable to your C output).
+   Without this, your per-kernel SDPA test will fail by ~0.9 absolute
+   (real divergence, not precision drift) and end-to-end tokens may
+   differ.
+
+2. **`AutoModel` may wrap the base class**. For HF models, the
+   `architectures` field in `config.json` tells you which class
+   `AutoModel.from_pretrained` returns. For LM-headed wrappers
+   (`<X>ForCausalLM`, `<X>ForMaskedLM`, etc.) the returned object has
+   the `lm_head` AND its `.forward()` returns a `*Output` dataclass with
+   a `.logits` field — not `.last_hidden_state`. Check `type(model)`
+   and read the model's `.forward` signature once.
+
+3. **`num_logits_to_keep=0` slices the full sequence**, not zero. Many
+   HF causal-LM heads default to `num_logits_to_keep=0`, which is then
+   used as `hidden[:, -0:, :]`. Because `-0 == 0` in Python, this is
+   `hidden[:, 0:, :]` = the full sequence. So the default returns
+   all-position logits, not just the last. (No action needed; just
+   don't be confused.)
+
+4. **Older HF tokenizer files (Qwen ≤ 2.5, llama-1)**: don't have
+   `tokenizer.json`. Instead they ship two files:
+   - `vocab.json`: flat `{token_string: id}`, where strings are
+     GPT-2-byte-encoded (printable ASCII passes through; control bytes
+     map to U+0100..U+0142).
+   - `added_tokens.json`: flat `{name: id}` for special tokens.
+
+   `build_tokenizer.c` must read BOTH and merge into the
+   `tokenizer.bin` format the runtime expects. Total id range is
+   `max(vocab.json ids, added_tokens.json ids) + 1` (HF tokenizers
+   reserve special-token ids past `len(vocab)` and may leave gaps).
+   For ids owned by `added_tokens.json`, emit an empty BPE entry so
+   the merge engine never picks them as merge candidates. **Do not**
+   need `merges.txt` for any byte-level BPE — the tiktoken trick
+   (merge priority == vocab id) works as long as the vocab was built
+   in merge order, which is true for all Qwen / Llama / GPT-2-family
+   tokenizers.
+
+5. **`forward_hook` payload shape varies**. For most simple
+   `nn.Linear` / `nn.LayerNorm` modules the hook output is a single
+   tensor. For attention blocks the output may be a tuple of
+   `(attn_output, attn_weights, past_kv)`. Always check
+   `isinstance(out, tuple)` and pick `out[0]`:
+
+   ```python
+   def hook(name):
+       def f(_m, _i, out):
+           t = out[0] if isinstance(out, tuple) else out
+           captures[name] = t.detach().float().cpu().numpy()
+       return f
+   ```
+
+6. **`torch_dtype=torch.bfloat16` on CPU is slow**. A 7B bf16 forward
+   over L=25 tokens takes ~15–60 s on a modern CPU (depending on how
+   well the BLAS path handles bf16). Don't be surprised. The whole
+   point of this skill is the C reference; speed comes later.
+
+7. **`model.config` vs `tokenizer.special_tokens_map`**: the eos used
+   by `model.generate()` (= `model.generation_config.eos_token_id`) is
+   not always the same as `tokenizer.eos_token_id`. For Dream they're
+   both 151643; for some Qwen variants the generation eos is
+   `<|im_end|>` (151645) while the tokenizer eos is `<|endoftext|>`
+   (151643). The **C reference's stop condition** must match whatever
+   the Python sampler actually stops on. Read the relevant
+   `generation_utils.py` / `_sample` path.
+
+8. **`trust_remote_code=True` loads model code from the model dir**.
+   For models like Dream whose architecture isn't in mainline
+   transformers, `modeling_<name>.py` lives in the HF model directory
+   (alongside `config.json`) and is imported on load. To find the
+   class definitions referenced by `dump_ref.py.template` (e.g.,
+   `apply_rotary_pos_emb`, `repeat_kv`), use:
+
+   ```python
+   cls = type(model)
+   modeling_mod = sys.modules[cls.__module__]
+   apply_rotary_pos_emb = getattr(modeling_mod, "apply_rotary_pos_emb")
+   repeat_kv             = getattr(modeling_mod, "repeat_kv")
+   ```
+
+9. **`do_sample=False` + `temperature=0.0` warning is benign**.
+   HF prints "temperature is set to 0.0 but do_sample=False" but the
+   generation_config in some shipped models has both set, so suppress
+   or ignore the warning. The effective behaviour with `do_sample=False`
+   is greedy, regardless of temperature.
 
 ### Multi-modal config.json parsing
 
@@ -829,8 +1120,35 @@ tens. Use `tol_eff = abs_tol + rel_tol * |want|` in your tester (the
 If a test fails by a small margin and the values are large, suspect
 the *tolerance*, not the kernel.
 
+#### End-to-end logit drift (the "1 ULP per kernel × N layers" rule)
+
+Even with **every** per-kernel test passing at `max|d| ≤ 1` bf16 ULP,
+the final logits after `N` layers can drift by `O(1)`. On Dream 7B
+(28 layers, kernels at `max|d| ≤ 0.008`) the global raw-logit `max|d|`
+is `~0.8`. This is **expected**: per-element error compounds through
+each matmul-and-add.
+
+The correct E2E acceptance metric is **argmax stability**, not raw
+logit equality: for each position `p`, does the C `argmax(logits[p,:])`
+equal the Python reference's argmax at the same position? On Dream 7B
+all 25/25 positions match despite raw-logit drift, because the winning
+logit's margin over the runner-up is far larger than the drift.
+
+For the `--validate-forward` test (Phase 5), aim for **100% argmax
+positions match**. Do not gate on raw-logit `max|d|` — it's
+uninformative and will fail at a tolerance that allows real bugs to
+slip through. If even one argmax mismatches, dig: most likely one
+kernel has a bf16 round-trip missing (see "Per-element bf16 rounding
+patterns").
+
 ## Common pitfalls
 
+- **PyTorch CPU SDPA defaults to FLASH**, not MATH, and FLASH gives
+  different bf16 results. Force `SDPBackend.MATH` in oracle dumps AND
+  in any end-to-end Python comparison run. See "PyTorch / HF gotchas".
+- **Missing per-element bf16 round-trips**: causes 1–2 ULP drift per
+  kernel even when "the math is right". See "Numerical drift /
+  Per-element bf16 rounding patterns".
 - **W transpose**: HF safetensors typically stores Linear weights as
   `[out_features, in_features]`. So `Y = X @ W.T` becomes `Y[m,n] = Σ_k
   X[m,k] * W[n,k]`. Get this wrong and EVERY linear is off.
