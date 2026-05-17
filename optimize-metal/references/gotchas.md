@@ -38,6 +38,11 @@ the same symptoms again.
 | 28 | macOS `madvise(MADV_WILLNEED)` is BLOCKING — never use it on big files | Startup |
 | 29 | mmap + memcpy is page-fault-bound at ~1 GB/s — use parallel pread    | Startup     |
 | 30 | First Metal cmdbuf pays ~1 s residency wiring per ~30 GB of buffers  | Startup     |
+| 31 | Premature multi-SG SDPA hides the real SDPA win                      | SDPA strategy |
+| 32 | Tile-size cargo-culting — MLX tiles for M2 ≠ optimal for M4/M1       | GEMM tuning |
+| 33 | Forgetting GQA when SG handles a (token, head) pair                  | SDPA bug    |
+| 34 | Fused-residual epilogue shifts the bf16 round point                  | Fusion / numerics |
+| 35 | Persistent param buffer + 2-deep pipeline = race; duplicate the ring | Pipeline    |
 
 ---
 
@@ -490,7 +495,7 @@ speedup, and brings startup time to **below MLX's**.
   - mmap + dispatch_apply(per-tensor) memcpy:  8s
   - parallel pread per shard:                   3.5s   ← winner
 
-# 30. First Metal cmdbuf pays ~1s residency wiring per ~30 GB of buffers
+# 30. First Metal cmdbuf pays ~1 s residency wiring per ~30 GB of buffers
 
 The very first cmdbuf submitted to Metal that references a large
 working set of MTLBuffers blocks for ~1s before the GPU starts work.
@@ -523,3 +528,85 @@ this if TTFT matters more than total time.
 
 **Conclusion**: this is a fixed cost. Beating MLX on total wall time
 comes from saving I/O time, not from removing this 1s.
+
+# 31. Premature multi-SG SDPA hides the real SDPA win
+
+**Symptom**: you split a head across multiple SGs (D3) before fixing
+the dumb 1-thread-per-(query, head) SDPA. You measure +5–10%, conclude
+"SDPA isn't worth optimizing", and move on.
+
+**Fix**: apply D1 first (parallel softmax via SIMD reductions). The
+serial softmax inside the 1-thread baseline is what's hiding the win.
+Once each (query, head) pair is handled by a full SG with parallel
+softmax, multi-SG splitting (D3) gives the real 1.5–2× on long context.
+
+The order matters: D1 → D2 (online softmax) → D3 (multi-SG). Doing
+D3 first measures a fraction of the available speedup and is misleading.
+
+# 32. Tile-size cargo-culting — MLX tiles for M2 ≠ optimal for M4/M1
+
+`BM=16 BN=32 WM=1 WN=2` happens to match MLX's "non-NAX" GEMM path for
+gpt-oss-style shapes on M4 Max. **It is NOT a universal sweet spot.**
+
+Tile sizes are sensitive to (model shapes, Apple GPU generation,
+whether MLX is using its NAX path). Always sweep
+`(BM, BN, WM, WN) ∈ {(16,16,1,1), (16,32,1,2), (32,32,2,2), (32,64,2,4)}`
+on your target machine and your model's actual K-dim.
+
+The cost of sweeping is one afternoon. The cost of not sweeping can be
+30%+ left on the floor in prefill.
+
+# 33. Forgetting GQA when SG handles a (token, head) pair
+
+When the SDPA tile assigns one SG per `(query_token, head_q)` pair, the
+K/V head index is **not** `head_q`. With grouped-query attention,
+
+    head_kv = head_q / (N_q / N_kv);
+
+Many tile refactorings get this right the first time, then break it
+during a follow-up restructure (e.g., switching from "one SG per query
+token" to "one SG per (query_token, head_q)"). Symptom: tokens diverge
+after layer 1, with output that *looks* numerical but is actually
+reading the wrong K head.
+
+**Fix**: keep `head_kv = head_q / GROUP_SIZE` recomputed inside the
+kernel; never reuse `head_q` as the K index.
+
+# 34. Fused-residual epilogue shifts the bf16 round point
+
+When you fuse `y = (W·x + residual)` instead of doing
+`tmp = W·x` (bf16 round) followed by `y = tmp + residual` (bf16 round),
+the residual is now added inside the same f32 accumulator. The bf16
+round happens once at the end, not twice. **Token output may differ.**
+
+This is correct (one fewer rounding step), but:
+
+1. The first-N-tokens-match check against the unfused C reference may
+   fail at token ~10–50 even though the kernel is "right".
+2. The diff vs an ORACLE dump (MLX or HF) typically *shrinks* (fewer
+   rounds = closer to f32).
+3. Per-element tolerance vs the unfused C ref may need to loosen from
+   1e-2 to ~5e-2 absolute on residual-stream tensors.
+
+**Fix**: ALSO regenerate the C-reference oracle dump with the
+equivalent fused-rounding kernel, OR loosen the tolerance and re-verify
+the first N tokens match the model's actual greedy output (e.g., MLX
+greedy on the same prompt).
+
+# 35. Persistent param buffer + 2-deep pipeline = race; duplicate the ring
+
+You have:
+
+- ONE persistent `gpu_param_buf` that the host writes layer params into
+  before each cmdbuf.
+- 2-deep pipelining (cmdbuf N+1 encoded while N runs).
+
+Then while encoding cmdbuf N+1, you overwrite `gpu_param_buf` with new
+params, but cmdbuf N is still reading the OLD params on the GPU. Race.
+
+**Symptom**: tokens diverge at layer boundaries; reverting to
+1-cmdbuf-deep "fixes" it. You blame the pipeline.
+
+**Fix**: duplicate the param ring — `gpu_param_buf[slot]` with
+`slot ∈ {0, 1}` swapping per cmdbuf. Same fix as the id-buffer ring
+(gotcha #16), applied to all per-cmdbuf scratch the host writes into.

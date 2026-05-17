@@ -192,6 +192,9 @@ you most of the exploration cost.
     MLX parity — usually the BIGGEST single late-stage commit. See
     `references/parallel-chains.md`.
 
+Steps 9–14 took the Qwen3.6-35B-A3B reference port from 41.5 → 69.5
+tok/s, hitting MLX parity (MLX runs at ~70.1 tok/s on the same M4 Max).
+
 ### Optimizations that often land in the noise band
 
 (Validated on Qwen3.6-35B-A3B; may differ on your model. Still worth
@@ -271,7 +274,8 @@ optimization:
   (look for `commit_wait` inside `forward()`); apply H1 glue kernels.
   Usually the single biggest win. (gotcha #9)
 - **Argmax over VOCAB=200k single-threaded** is by far the most common
-  "why is decode capped at <5 tok/s" answer. Apply F1 immediately.
+  "why is decode capped at <5 tok/s" answer (also caps mid-pipeline
+  decode at ~40 tok/s once everything else is in). Apply F1 immediately.
 - **K_OUT in qmv4 has a sweet spot.** 4 wins for q8 affine dequant; 8
   hurts (41 → 31 tok/s in one port) due to register spills. Measure
   before scaling up. (gotcha #8)
@@ -283,6 +287,24 @@ optimization:
   kernel at a time) but fails end-to-end. (gotchas #18, #26)
 - **bfloat4 alignment.** Load `bfloat4` only at 8-byte-aligned
   addresses, or you'll get garbage on some Apple GPU generations.
+- **Premature multi-SG SDPA hides the real SDPA win.** Apply D1 (parallel
+  softmax) BEFORE D3 (multi-SG split), or you'll measure +5–10% and
+  conclude SDPA isn't worth optimizing. (gotcha #31)
+- **Tile-size cargo-culting.** MLX's tile sizes for M2 are not optimal
+  for M4 or M1. Always sweep `(BM, BN, WM, WN)` on your target
+  machine. (gotcha #32)
+- **Forgetting GQA in the SDPA tile.** When each SG handles a
+  `(query_token, head_q)` pair, the K/V head index is
+  `head_kv = head_q / (Nq/Nkv)` — not `head_q`. Easy to break during
+  tile refactorings. (gotcha #33)
+- **Fused-residual epilogue shifts the bf16 round point.** Fusing
+  `y = W·x + residual` rounds once (in f32) instead of twice. Token
+  output may legitimately differ; regenerate the oracle dump with the
+  same fusion OR loosen tolerance and verify against MLX greedy.
+  (gotcha #34)
+- **Persistent param buffer + 2-deep pipeline = race.** Duplicate the
+  param ring (`gpu_param_buf[slot]`, `slot ∈ {0,1}`) the same way you
+  duplicated the id ring. (gotcha #35)
 
 ## Commit strategy
 
