@@ -94,37 +94,19 @@ build-c-reference  →  port-c-to-metal  →  optimize-metal
 
 Single, repeating cycle:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. Profile current build                                        │
-│    - measure decode + prefill tok/s                              │
-│    - print BOTH wall and gpu_busy (the key diagnostic)           │
-│    - identify hottest kernel (GEMV for decode, GEMM for          │
-│      prefill, MoE for both, SSM step if present)                 │
-│                                                                  │
-│ 2. Pick next technique                                           │
-│    - look up the bottleneck kernel category in the catalog       │
-│    - choose the next applicable, not-yet-applied technique       │
-│                                                                  │
-│ 3. Implement the technique on a branch / WIP commit              │
-│    - apply ONLY the one technique                                │
-│                                                                  │
-│ 4. Validate                                                      │
-│    - per-kernel correctness against C reference (~1e-2 abs bf16) │
-│    - end-to-end tokens against C reference for fixed prompt      │
-│    - first N tokens must match exactly                           │
-│    - if regression: revert; try a different technique            │
-│                                                                  │
-│ 5. Measure                                                       │
-│    - if speedup ≥ 1.02× on the dominant phase (decode or         │
-│      prefill) it's a win — commit                                │
-│    - if neutral or slowdown: revert                              │
-│                                                                  │
-│ 6. Check stop condition                                          │
-│    - if within ±5% of MLX on both prefill and decode → done      │
-│    - else: back to step 1                                        │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. **Profile** current build — decode + prefill tok/s, print BOTH
+   wall and gpu_busy (the key diagnostic); identify hottest kernel.
+2. **Pick** next technique — look up the bottleneck category in the
+   catalog; choose the next applicable, not-yet-applied entry.
+3. **Implement** ONLY that one technique on a WIP commit.
+4. **Validate** — per-kernel correctness against C reference; first
+   N tokens (N ≥ 16 ideally) match exactly end-to-end. If regression,
+   revert; try a different technique.
+5. **Measure** — speedup ≥ 1.02× on the dominant phase → commit.
+   Otherwise revert.
+6. **Stop** when both prefill and decode are within ±5% of MLX
+   (and total wall too, if startup is a meaningful fraction).
+   Otherwise back to step 1.
 
 ## Profiling — the key diagnostic
 
@@ -260,80 +242,45 @@ applying for code hygiene but don't expect headline speedups.)
 
 ### Diffusion LLMs (Dream / LLaDA / fastdllm)
 
-These are NOT autoregressive decoders. The forward pass runs twice
-per generated block: once at `M = L` (prefetch, populates the KV
-cache) and many times at `M = BL` (refine, iteratively unmasks
-positions). The naive host post-processing — per-position softmax +
-argmax + confidence over V — dominates the gap to MLX in a way the
-A/H techniques can't reach.
+These are NOT autoregressive. The forward runs twice per block: once
+at `M = L` (prefetch) and many times at `M = BL` (refine). The naive
+host post-processing — per-position softmax + argmax + confidence — 
+dominates the MLX gap, and most A/H techniques (A4, A8) do less work
+or don't help. **Total wall (load + gen) matters as much as gen
+tok/s** — gen is only ~1 s, so a slow loader loses on `time ./binary`
+even with faster gen.
 
-The empirical order is different. Most A/H techniques (A4 2-deep
-pipeline, B5 fused residual, A8 parallel chains) do less work or
-don't help at all. **Total wall (load + gen) matters as much as
-gen tok/s on these models** — gen is only ~1 s so a slow weight
-loader can easily make the whole process slower than MLX even with
-faster gen. The wins, in order:
+The wins, in order (see `references/diffusion-llm.md` for details and
+per-step Dream-7B numbers):
 
-0. **A9 parallel pread weight loader** — even more important than for
-   autoregressive ports, because diffusion gen is short (~1 s on
-   short benches), so weight load is a comparable fraction of total
-   wall. On Dream-7B (4 shards, 14 GB, M4 Max): naive 1.71 s →
-   parallel pread 0.82 s, total wall 3.08 s → 2.17 s beating MLX's
-   2.67 s by 19% even before any gen-side optimization on the BL=32
-   bench.
-1. **F3** — per-row softmax+argmax+confidence on GPU. Replaces the
-   host loop that shows up as a large `host_post` invisible to
-   `gpu_busy`. In one port: 0.25 s → 0.00 s, wall 2.90 → 2.63 s.
-2. **H3** — single-row output pruning for the prefetch path. Saves
-   most of one full lm_head streaming pass.
-3. **C2 dual-tile-by-M** — two PSOs with different (BM, BK), picked by
-   `M > 16` at dispatch. Best (BM, BK) for refine ≠ best for prefetch.
-4. **C2 BK=16 (and beyond) with WN tuning** — unroll multiple K-bands
-   per loop iter in the BM=16 GEMM. BK=16 is the easy first step. On
-   Dream-7B refine, BK=32 and BK=64 are also viable once you double
-   WN from 2 → 4 (which halves per-SG register pressure — see gotcha
-   #41 and the register-budget formula in catalog C2). Cumulative
-   gains: BK=32 at WN=4 was -1.6% / -2.5% wall in the two tile paths;
-   BK=64 at WN=4 in the BN=32 path was **-10% wall** (the single
-   biggest mid-stage win on this port). At WN=2 BK=64 catastrophically
-   spills — don't lower BK before trying WN=4 first.
-5. **B5 fused residual** — same as for autoregressive, modest win.
-6. **C4 aspect-ratio dispatch (K > N, BL ≥ 32 only)** — extend C2
-   with `use_bm32 = (M > 16) && (K <= N)`. The MLP down_proj (K=I,
-   N=H, I >> H) is the only K > N matmul; at BM=32 BN=64 it has too
-   few N-tiles to fill the GPU, collapsing effective bandwidth.
-   Routing it to BM=16 doubles TG count. In our Dream-7B BL=32 port:
-   down_proj 1082us → 741us, wall 1.72 s → 1.52 s (12% win, beats MLX
-   1.56 s).
-7. **C5 aspect-ratio dispatch (small-N refine)** — N-axis sibling of
-   C4. Even within the BM=16 path, refine matmuls with N=3584 at
-   BN=64 produce only 56 N-tiles — under the M4 Max ~80 TG-slot
-   target. Extend the dispatcher with `use_bn32 = (M <= 16) && (N <
-   5120)`. Affects qkv, o_proj, down_proj in Dream-7B refine. -5.4%
-   wall on the BL=16 bench. (Compose with C4: 3-way routing —
-   prefetch-wide → BN=64 BM=32; refine small-N → BN=32 BM=16; else →
-   BN=64 BM=16.)
-8. **D5 SDPA K-per-iter ILP unrolling** — even after D1 (parallel
-   softmax), the inner `lk` loop has a serial dependency chain
-   between K-fetch and `simd_sum`. Unroll the QK and AV phases by
-   N ∈ {2, 4, 8} K-vectors per outer iter with N independent
-   accumulators. On Dream-7B refine: -22% per call at N=2, -33% on
-   top at N=4, -57% on top at N=8 (cumulative -81%, 224 µs → 42 µs
-   per call, ~7% of wall). Three commits, each safely revertable.
-9. **F4 Multi-SG-per-row RMSNorm** — at M=BL=16 the 1-SG-per-row
-   rmsnorm launches only 16 SGs total, well below the GPU's
-   capacity. Spawn N_SGs ∈ {4, 16} SGs per row, merge partials via
-   TG-mem. On Dream-7B (D=3584): 4 SGs/row -4% wall, then 16
-   SGs/row -3% wall on top. Per-call: 62 µs → 9 µs (-85%). Same
-   principle as D3 (multi-SG SDPA), different kernel category.
+0. **A9 parallel pread weight loader** — biggest user-visible win.
+   Dream-7B load 1.71 → 0.82 s, total 3.08 → 2.17 s, beats MLX 19%
+   on `time ./dream`. Apply FIRST.
+1. **F3 GPU per-row softmax + argmax + confidence** — replaces the
+   host `host_post` loop (often 0.25 s, invisible in `gpu_busy`).
+2. **H3 single-row prefetch lm_head** — output pruning via X offset.
+3. **C2 dual-tile-by-M** — two PSOs with different (BM, BK), picked
+   by `M > 16`. Refine ≠ prefetch best tile.
+4. **C2 BK ∈ {16, 32, 64} with WN tuning** — the "BK=16 maximum"
+   rule is a `WN=2` artifact. At `WN=4`, BK=64 fits at BM=16. Sweep
+   BK × WN; biggest mid-stage Dream-7B win was BK=64 WN=4 in BN=32
+   (-10% wall). See gotcha #41 + catalog C2.
+5. **B5 fused residual** — modest win, same as autoregressive.
+6. **C4 K > N aspect-ratio (BL ≥ 32)** — `use_bm32 = (M>16) && (K<=N)`.
+   Routes MLP down_proj to BM=16, doubles TG count. -12% wall BL=32.
+7. **C5 small-N aspect-ratio (refine)** — `use_bn32 = (M<=16) &&
+   (N<5120)`. -5.4% wall on Dream-7B BL=16.
+8. **D5 SDPA K-per-iter ILP unrolling** — process 8 K-vectors per
+   iter with 8 independent accumulators. -81% cumulative SDPA.
+9. **F4 multi-SG-per-row RMSNorm** — at M=BL=16, 1-SG-per-row spawns
+   only 16 SGs. Use 4 or 16 SGs/row. -7% cumulative wall.
 
-Skip A4 (no usable overlap — refine step N+1's ids depend on step N's
-argmax). Skip A8 (the forward chain is mostly serial — Q/K/V→SDPA→o→
-gate/up→down — with very little independent work to interleave).
+Skip A4 (refine step N+1 depends on step N argmax — no usable overlap)
+and A8 (the forward chain is mostly serial).
 
-See `references/diffusion-llm.md` for the full worked Dream-7B example
-(naive ~10 s wall → 1.68 s gen / 2.17 s total wall on the BL=16
-long bench, 39% faster than MLX gen / 19% faster than MLX total).
+`references/diffusion-llm.md` has the full worked Dream-7B example
+(naive ~10 s wall → 1.68 s gen / 2.17 s total on BL=16 long bench —
+39% faster than MLX gen, 19% faster on total wall).
 
 ## The optimization catalog
 
@@ -439,164 +386,109 @@ optimization:
   `(BM, BK)` and switch at dispatch by `M > 16`. Pad workspace buffers
   to the larger `BM`. (gotcha #38)
 - **K > N matmuls are TG-starved at BM=32.** A LLaMA-style MLP
-  down_proj (K=I, N=H with I >> H) at BM=32 BN=64 produces only N/BN
-  TGs — often well below the GPU's TG-slot capacity, collapsing
-  effective bandwidth to ~30% of peak. Extend the dual-tile dispatch
-  with `use_bm32 = (M > 16) && (K <= N)` so K > N shapes route to the
-  smaller BM and double their TG count. 12% wall win on Dream-7B BL=32
-  refine from a single-line change. (gotcha #39, catalog C4)
-- **Small-N REFINE matmuls are also TG-starved — but on the N-axis.**
-  The N-axis sibling of the above: refine (M ≤ 16, already in BM=16)
-  with small N (3584 etc.) at BN=64 produces too few N-tiles to fill
-  the GPU. Extend the dispatcher with `use_bn32 = (M <= 16) && (N <
-  5120)` to halve BN and double N-tiles. -5.4% wall on Dream-7B BL=16
-  refine bench. (catalog C5)
-- **"BK=16 is the maximum" is a WN=2 artifact, not a fundamental
-  ceiling.** Per-SG register pressure (which sets the spill ceiling)
-  drops by ~half when you go `WN=2` → `WN=4`, often unlocking BK=32 or
-  BK=64. -6% to -10% wall on Dream-7B refine from this realization,
-  per tile. Always sweep BK ∈ {16, 32, 64} with the matching WN. (gotcha
-  #41, catalog C2 + register-budget formula)
-- **SDPA K-per-iter ILP unrolling is a separate axis from D1/D2/D3.**
-  Even after parallel/online/multi-SG SDPA, the inner `lk` loop has a
-  serial dependency chain. Unrolling 8 K-vectors per iter with 8
-  independent dot accumulators lets the compiler interleave loads and
-  arithmetic. -81% cumulative SDPA per-call on Dream-7B refine across
-  three commits (N=2→4→8). (catalog D5)
-- **1-SG-per-row rmsnorm undersubscribes the GPU when M is small.**
-  At `M = BL = 16`, 1 SG/row launches only 16 SGs total — vs M4 Max's
-  ~160 SG-slot capacity. The kernel becomes memory-latency-bound
-  (62 µs/call when peak BW says < 1 µs). Spawn 4 or 16 SGs/row, merge
-  the per-SG partials through TG-mem. -7% wall on Dream-7B refine
-  cumulative (4 SGs/row + later 16 SGs/row). Same principle as D3 for
-  SDPA, different kernel. (catalog F4)
-- **Weight loading via `mmap + memcpy` is page-fault-bound at ~1 GB/s
-  on macOS.** Even with `dispatch_apply` parallelism, you cap around
-  4 GB/s aggregate because the macOS VM fault handler serializes on
-  per-page locks. Use **parallel `pread()` per shard** (A9) — one fd
-  per shard, sequential reads inside, `dispatch_apply` across shards.
-  Brings startup below MLX on the same machine. Especially important
-  for diffusion LLMs / short benches where gen is comparable in size
-  to load. (gotcha #29, catalog A9)
-- **`newBufferWithBytesNoCopy:` per-tensor isn't a shortcut.** It
-  looks attractive (skip the bulk copy entirely!) but tensor data
-  offsets inside a safetensors shard are typically 8-byte aligned,
-  not the 16 KB page-aligned that `newBufferWithBytesNoCopy:` requires
-  on Apple Silicon. The only viable zero-copy approach is wrap the
-  *whole shard* as one Metal buffer + plumb per-tensor byte offsets
-  through every dispatch helper, which is invasive. Parallel pread
-  (A9) is simpler and already beats MLX. (gotcha #40)
+  down_proj at BM=32 BN=64 produces only N/BN TGs. Extend dual-tile
+  dispatch with `use_bm32 = (M > 16) && (K <= N)`. (gotcha #39, C4)
+- **Small-N REFINE matmuls are TG-starved on the N-axis.** N-axis
+  sibling of K>N: at M≤16 BM=16 N<5120 BN=64 there are too few N-tiles.
+  Add `use_bn32 = (M <= 16) && (N < 5120)`. (catalog C5)
+- **"BK=16 is the maximum" is a `WN=2` artifact.** At `WN=4` per-SG
+  register pressure halves, unlocking BK=32/BK=64. Always sweep
+  BK ∈ {16,32,64} × WN ∈ {2,4} with the register-budget formula.
+  (gotcha #41, catalog C2)
+- **SDPA inner-loop ILP unrolling is separate from D1/D2/D3.**
+  Process 8 K-vectors/iter with 8 independent accumulators. -81%
+  cumulative SDPA on Dream-7B. (catalog D5)
+- **1-SG-per-row rmsnorm undersubscribes GPU at small M.** At M=BL=16
+  you spawn 16 SGs vs M4 Max's ~160 capacity — kernel becomes
+  memory-latency-bound. Use 4–16 SGs/row, merge via TG-mem. (catalog F4)
+- **`mmap + memcpy` is page-fault-bound at ~1 GB/s on macOS.** Even
+  with `dispatch_apply` parallelism you cap ~4 GB/s aggregate (VM
+  fault handler serializes on per-page locks). Use parallel `pread`
+  per shard — one fd per shard, sequential reads, dispatch_apply
+  across shards. Critical for diffusion / short benches. (gotcha #29, A9)
+- **`newBufferWithBytesNoCopy:` per-tensor doesn't work.** Safetensors
+  tensor offsets are 8-byte aligned, not the 16 KB page-aligned that
+  `newBufferWithBytesNoCopy:` requires. Use parallel pread (A9). (gotcha #40)
 
 ## Commit strategy
 
-One commit per technique. Each commit message should include:
+One commit per technique. Each commit message names the technique and
+the measured speedup, so a future bisect can find regressions fast:
 
 ```
 src-metal: <technique short name> (decode +X.X%, prefill +Y.Y%)
 
-- describe the change in 1–3 lines
-- mention the bottleneck-before kernel
-- mention the kernel-after improvement
-- include before/after tok/s if material
+- 1–3 lines: what changed, before/after kernel, before/after tok/s
 ```
 
-Examples from real ports:
+Examples:
 
 ```
-src-metal: gemv_bf16_4 — 4 outputs/simdgroup, 64 threads/TG (mlx qmv_fast pattern)
+src-metal: gemv_bf16_4 — 4 outputs/simdgroup (mlx qmv_fast pattern)
 SDPA: simdgroup-per-(head,token) parallelism (1.96x decode)
 src-metal: BM=16 BN=32 WM=1 WN=2 — match MLX non-NAX tile sizes (+26%)
-src-metal: pipeline decode (depth=2) — overlap CPU encode with GPU compute
-decode: 8-X register tile in bf16 GEMV (q/k/v/o/router/lm_head)
-src-metal: fuse res_attn into gemm_bf16 (template DO_ADD); drop residual_add kernel
+src-metal: fuse res_attn into gemm_bf16 (template DO_ADD)
 ```
 
-These commit messages tell you exactly what was changed AND give the
-expected speedup, so when you bisect a regression later you can find
-it fast.
+## Hand-off / stop condition
 
-## Hand-off / wrap-up
-
-When the skill is done:
-
-1. `./src-metal/PERF.md` documents final tok/s vs MLX on the target
-   machine.
-2. The optimized `./src-metal/` still passes per-kernel correctness
-   against `./src-cpu/` within tolerance.
-3. End-to-end tokens match `./src-cpu/` for the validation prompt for
-   at least the first 16 tokens.
-4. Each optimization is its own commit, individually revertable.
-
-Optional follow-ups (out of scope for this skill):
-
-- Port the optimized src-metal/ to CUDA / ROCm / Vulkan / TPU (each
-  its own future skill, starting from the C reference, not from this
-  Metal implementation).
-- Add batch>1 support.
-- Add longer-context / paged-KV cache.
-- Add sampling beyond greedy.
-
-## Stop condition
-
-When both prefill and decode are within ±5% of MLX on the validation
-prompt, you are done. Document the final tok/s and machine in a
-`src-metal/PERF.md` and write a summary commit:
+Done when both prefill and decode are within ±5% of MLX (plus total
+wall, if startup is a meaningful fraction — see Success criteria).
+Document final tok/s and machine in `./src-metal/PERF.md` and write
+a summary commit:
 
 ```
 src-metal: optimization complete (prefill X.X tok/s vs MLX Y.Y, decode A.A vs B.B)
 ```
 
+The optimized `./src-metal/` still passes per-kernel correctness
+against `./src-cpu/` and end-to-end tokens match for the validation
+prompt for at least the first 16 tokens. Each optimization is its
+own commit, individually revertable.
+
+Optional follow-ups (out of scope): port to CUDA/ROCm/Vulkan/TPU
+(future skills, starting from the C reference), batch>1, longer-
+context / paged-KV cache, sampling beyond greedy.
+
 ## Bundled material
 
 ### Code-shaped reference (`patterns/`)
 
-Each catalog entry's "Snippet" points here. Files are working kernels /
-shim snippets lightly annotated; each has a header block describing
-what / when / expected speedup / original commit.
+Each catalog entry's "Snippet" points here. Files are working kernel /
+shim snippets with a header describing what / when / expected speedup /
+original commit. Adapt to your model's shapes — these are inspiration,
+not drop-ins.
 
-```
-patterns/
-├── cmdbuf_batch_dispatches.c            (A1)
-├── cmdbuf_pipeline_2deep.c              (A4)
-├── cmdbuf_pipeline_2deep_id_swap.c      (A4 with id-swap)
-├── concurrent_encoder.c                 (A5)
-├── load_parallel_pread.c                (A9 — startup beats MLX)
-├── param_buf_persistent.c               (A2)
-├── param_buf_const.c                    (A3)
-├── gemv_simdgroup_per_output.metal      (B1, B2 variant inline)
-├── gemv_qmv4_register_tile.metal        (B3)
-├── gemv_with_residual_epilogue.metal    (B5)
-├── gemm_simdgroup_matrix_mma.metal      (C1)
-├── sdpa_sg_per_head_decode.metal        (D1 — first SDPA win)
-├── sdpa_online_softmax.metal            (D2)
-├── sdpa_multi_sg_online_merge.metal     (D3 — endgame SDPA)
-├── mxfp4_qmv4_decode.metal              (E1)
-├── mxfp4_gate_up_swiglu_fused.metal     (E2)
-├── moe_sorted_gather_glue.metal         (E3 glue kernels)
-├── moe_sorted_gather_qmm.metal          (E3 MMA reduced-precision GEMM)
-├── argmax_parallel.metal                (F1)
-├── topk_parallel_router.metal           (F2)
-├── softmax_argmax_per_row.metal         (F3 — diffusion samplers)
-├── gemm_x_offset_row_prune.c            (H3 — single-row output pruning)
-├── glue_kernels_no_host_break.metal     (H1 — often biggest single win)
-└── recurrent_state_sg_per_row.metal     (I1 for SSM/RNN)
-```
+- **A** (host scheduling): `cmdbuf_batch_dispatches.c`,
+  `cmdbuf_pipeline_2deep.c` (+`_id_swap` variant), `concurrent_encoder.c`,
+  `load_parallel_pread.c`, `param_buf_persistent.c`, `param_buf_const.c`.
+- **B** (GEMV): `gemv_simdgroup_per_output.metal` (incl. B2),
+  `gemv_qmv4_register_tile.metal`, `gemv_with_residual_epilogue.metal`.
+- **C** (GEMM): `gemm_simdgroup_matrix_mma.metal`.
+- **D** (SDPA): `sdpa_sg_per_head_decode.metal`,
+  `sdpa_online_softmax.metal`, `sdpa_multi_sg_online_merge.metal`.
+- **E** (MoE): `mxfp4_qmv4_decode.metal`,
+  `mxfp4_gate_up_swiglu_fused.metal`, `moe_sorted_gather_glue.metal`,
+  `moe_sorted_gather_qmm.metal`.
+- **F** (reductions): `argmax_parallel.metal`,
+  `topk_parallel_router.metal`, `softmax_argmax_per_row.metal`.
+- **H** (host/GPU boundary): `glue_kernels_no_host_break.metal`,
+  `gemm_x_offset_row_prune.c`.
+- **I** (recurrent): `recurrent_state_sg_per_row.metal`.
 
 ### Long-form references (`references/`)
 
 Loaded on demand — read the one your situation calls for.
 
-```
-references/
-├── catalog.md                  Full A–I optimization catalog (the menu).
-├── profiling.md                wall vs gpu_busy diagnostic, host_post for samplers, KPROF, variance discipline.
-├── debugging.md                Symptom → recipe table + late-stage barrier checklist.
-├── gotchas.md                  38 numbered war stories. Has its own TOC.
-├── decode-prefill-split.md     G — when and how to maintain two kernel paths.
-├── parallel-chains.md          A8 — the late-decode end-game win.
-├── sliding-kv-cache.md         D4 — rotating fixed-size KV cache index math.
-└── diffusion-llm.md            Diffusion-LLM (Dream / LLaDA / fastdllm) attack order, what works, what doesn't.
-```
+- `catalog.md` — full A–I optimization catalog (the menu).
+- `profiling.md` — wall vs gpu_busy diagnostic, host_post for samplers,
+  KPROF, variance discipline, startup phase-breakdown.
+- `debugging.md` — symptom → recipe table + late-stage barrier checklist.
+- `gotchas.md` — 41 numbered war stories with TOC.
+- `decode-prefill-split.md` — G category.
+- `parallel-chains.md` — A8 late-decode endgame.
+- `sliding-kv-cache.md` — D4 rotating KV cache.
+- `diffusion-llm.md` — Dream / LLaDA / fastdllm attack order + worked example.
 
 When you start the skill, **read `references/gotchas.md` first** — many
 of the gotchas there will save you from rediscovering them the hard
