@@ -216,13 +216,37 @@ bound** on macOS (the VM lock serializes faults at ~1 GB/s, even with
 parallel threads). The fix is to skip mmap for the bulk copy entirely
 and use **parallel `pread()` per shard**:
 
-1. Pre-allocate one MTLBuffer per array (serial — alloc isn't
-   guaranteed thread-safe).
+1. Pre-allocate one MTLBuffer **per shard** (not per tensor — see the
+   "shard-sized MTLBuffer + per-tensor views" variant below, gotcha #50).
 2. Bucket arrays by `shard_idx`, preserving order so each shard's
    reads are sequential on disk.
-3. `dispatch_apply(n_shards)`: each iteration opens one fd and
-   `pread`s its arrays directly into the matching MTLBuffer's host
-   pointer (`gpu_buf_contents`).
+3. `dispatch_apply(n_shards × SHARD_SPLIT)`: each iteration opens one
+   fd, takes a *contiguous slice* of that shard's tensor list, and
+   `pread`s sequentially. Multiple workers per fd is OK as long as
+   each worker's reads are sequential within its slice (gotcha #29
+   warns about scattered offsets inside one fd disabling readahead).
+
+`SHARD_SPLIT` must be **co-tuned** with bg compile + residency_async
+threads: target `n_shards × SHARD_SPLIT ≈ P_cores`. On M4 Max
+(12 P-cores, 4 shards) `SHARD_SPLIT=3` is optimal; `SHARD_SPLIT=4`
+regresses because bg compile starves. See gotcha #45 for the table.
+
+**Companion wins (apply together for full startup savings)**:
+
+- **Drop `madvise(MADV_WILLNEED)`** — it's blocking on macOS, costs
+  ~340 ms for 14 GB. Gotcha #28.
+- **Start compile async** before `cache_weights()` via
+  `gpu_init_async()` + `gpu_init_finish()`. The 74 ms first-ever
+  compile hides inside the pread tail; warm-run `lib_join` is 0.
+  Use `QOS_CLASS_USER_INITIATED` (not `USER_INTERACTIVE` — gotcha
+  #46). -20 ms on cold compile, free on warm.
+- **Async `MTLResidencySet requestResidency`** on a bg dispatch
+  queue right after MTLBuffer allocation, overlapping with pread.
+  Hides the ~85 ms residency-wiring tax. Gotcha #30.
+- **Shard-sized MTLBuffer + per-tensor views** (one MTLBuffer per
+  safetensors shard, each tensor is a `(parent, offset, size)`
+  wrapper). Residency set shrinks N_tensors → N_shards (e.g.
+  339 → 4 on Dream-7B). Gotcha #50.
 
 Also: **delete any `madvise(MADV_WILLNEED)` calls** — on macOS that's
 blocking, adding ~5s for 35 GB (see `references/gotchas.md` #28).
@@ -233,20 +257,21 @@ weights / total. If `weights` is 30%+ of `total`, A9 will pay off
 significantly:
 
 ```
-[startup] tokenizer=0.003s config=0.000s metal=0.035s weights=0.817s total=0.856s
+[startup] tokenizer=0.003s config=0.000s metal=0.017s lib_join=0.000s weights=0.340s total=0.398s
 ```
 
 **Why not zero-copy `newBufferWithBytesNoCopy:` per tensor?** Apple's
 API requires the host pointer AND length to be `vm_page_size`-aligned
 (16 KB on Apple Silicon). Inside a safetensors shard, individual
 tensor offsets are 8-byte aligned (set by the JSON header layout), so
-per-tensor wrap fails. The *whole shard* IS page-aligned (mmap
-guarantees this for the base ptr; round length up to a page), so you
-*can* wrap one buffer per shard and pass per-tensor byte offsets via
-`gpu_arg_buf.off_bytes` to every dispatch — but plumbing offsets
-through every weight reference is invasive and parallel pread (this
-section) already lands startup below MLX, so the refactor isn't worth
-it on shipping ports. See gotcha #40.
+per-tensor wrap fails (gotcha #40).
+
+**Why not zero-copy `newBufferWithBytesNoCopy:` per shard?** The shard
+*is* page-aligned (mmap guarantees it), so the API call succeeds —
+but on warm cache, the page-fault path that materializes the buffer
+on first GPU touch is ~20 GB/s, slower than pread's page-cache memcpy
+fast path at ~50 GB/s. Counter-intuitively, "zero copy" is slower
+here. Gotcha #47.
 
 **When**: From the very first port — startup is the most user-visible
 "wait" and it's trivial to fix.
@@ -256,11 +281,16 @@ it on shipping ports. See gotcha #40.
 - 1.71 s → 0.82 s weights (Dream-7B, 4 shards × ~3.5 GB, M4 Max),
   total wall 3.08 s → 2.17 s — beats MLX (2.67 s) on a short
   diffusion bench by 19%.
+- With full companion stack (sub-shard split, async compile,
+  async residency, shard-buffer-views, no madvise): startup
+  ~0.40 s on Dream-7B (14 GB) and total wall 1.43 s, leaving
+  gen time as the only remaining knob (M4 Max, fastdllm BL=32).
 
 Both beat MLX's `ParallelFileReader` on the same machine. See
-`references/gotchas.md` #28, #29, #40.
+`references/gotchas.md` #28, #29, #40, #45, #46, #47, #50.
 
-**Snippet**: `patterns/load_parallel_pread.c`
+**Snippet**: `patterns/load_parallel_pread.c` — includes both the
+single-thread-per-shard form and the sub-shard splitting variant.
 
 ---
 

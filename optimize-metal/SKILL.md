@@ -78,11 +78,10 @@ build-c-reference  →  port-c-to-metal  →  optimize-metal
 - Decode tok/s within ±5% of MLX on the same prompt + machine.
 - Prefill tok/s within ±5% of MLX on the same prompt.
 - **Total wall time within ±5% of MLX** when startup latency is a
-  meaningful fraction of total (e.g., short benchmarks, diffusion LLMs
-  where gen is ~1 s — load can be 30–50% of total). This is what the
-  user sees from `time ./your_binary`. Hitting per-token parity but
-  losing on total because weight load is 2× slower than MLX is a real
-  failure mode that the tok/s metric hides.
+  meaningful fraction of total (short benches, diffusion LLMs where
+  gen is ~1 s — load can be 30–50% of total). Hitting per-token
+  parity but losing total because weight load is 2× slower is a real
+  failure mode the tok/s metric hides.
 - First N generated tokens (N ≥ 4, ideally 16) match the C reference
   exactly. Later tokens may diverge due to pure numerical drift; that
   is acceptable as long as the divergence is *purely numerical* (no
@@ -134,13 +133,10 @@ chase:
 host-side breaks (H1 / glue kernels).** You can see this happen
 immediately as `gpu_busy / wall` ratio jumping from ~30% to ~95%.
 
-**Diffusion-LLM samplers need a third number.** If your sampler does
-non-trivial per-step CPU work (per-position softmax + argmax +
-confidence over V at every refine step — typical of Dream / LLaDA /
-fastdllm), also accumulate `host_post`. A large `wall - gpu_busy` gap
-on these models often looks like a host-scheduling problem (A/H) but
-is actually a sampler problem (F3): there's nothing to overlap with,
-the CPU is genuinely the gap. See `references/profiling.md` and
+**Diffusion-LLM samplers need a third number — `host_post`.** Per-step
+softmax + argmax + confidence over V often looks like a scheduling
+problem (A/H) but is actually a sampler problem (F3): the CPU is
+genuinely the gap. See `references/profiling.md` and
 `references/diffusion-llm.md`.
 
 **Print a phase-breakdown line at startup.** Before any tok/s
@@ -156,9 +152,11 @@ fprintf(stderr,
 If `weights` dominates startup (almost always does — it's GB of I/O),
 apply **A9 parallel pread weight loader** immediately. On Dream-7B
 (14 GB, 4 shards, M4 Max) this dropped `weights` from 1.71 s → 0.82 s
-and total wall from 3.08 s → 2.17 s, beating MLX's 2.67 s by 19% on a
-short fastdllm bench where gen is only 1.18 s. See catalog A9 and
-gotcha #29.
+and total wall from 3.08 s → 2.17 s, beating MLX's 2.67 s by 19%.
+The full A9 stack (sub-shard split + async compile + async residency
++ shard-buffer-views + no madvise) takes startup to 0.40 s and total
+wall to 1.43 s on the same prompt. See catalog A9 and gotchas #28–30,
+#45–47, #50.
 
 Use `mlx_lm`-equivalent timing (`tps = (n_gen - 1) / decode_time`,
 exclude the first decode step) so you can compare apples to apples with
@@ -226,14 +224,12 @@ tok/s, hitting MLX parity (MLX runs at ~70.1 tok/s on the same M4 Max).
 
 ### Optimizations that often land in the noise band
 
-(Validated on Qwen3.6-35B-A3B; may differ on your model. Still worth
-applying for code hygiene but don't expect headline speedups.)
+(Validated on Qwen3.6-35B-A3B; may differ on your model.)
 
 - bfloat4 vector loads in isolation (baked into B1 already).
-- qmv4 K_OUT=4 register tile (q8 dequant is bandwidth-bound, not
-  register-bound; K_OUT=8 actually regressed).
-- Concurrent encoder ALONE without barrier surgery — most barriers are
-  needed; A8 is where the big win lives.
+- qmv4 K_OUT=4 (q8 dequant is BW-bound, not register-bound; K_OUT=8
+  regressed).
+- Concurrent encoder ALONE without barrier surgery — A8 is the win.
 
 ### Skip for decode-only goals
 
@@ -364,33 +360,28 @@ optimization:
 - **Tile-size cargo-culting.** MLX's tile sizes for M2 are not optimal
   for M4 or M1. Always sweep `(BM, BN, WM, WN)` on your target
   machine. (gotcha #32)
-- **Forgetting GQA in the SDPA tile.** When each SG handles a
-  `(query_token, head_q)` pair, the K/V head index is
-  `head_kv = head_q / (Nq/Nkv)` — not `head_q`. Easy to break during
+- **Forgetting GQA in the SDPA tile.** The K/V head index is
+  `head_kv = head_q / (Nq/Nkv)`, not `head_q`. Easy to break during
   tile refactorings. (gotcha #33)
-- **Fused-residual epilogue shifts the bf16 round point.** Fusing
-  `y = W·x + residual` rounds once (in f32) instead of twice. Token
-  output may legitimately differ; regenerate the oracle dump with the
-  same fusion OR loosen tolerance and verify against MLX greedy.
+- **Fused-residual epilogue shifts the bf16 round point.** `y = W·x +
+  residual` rounds once (in f32) instead of twice; tokens may
+  legitimately differ — regenerate the oracle or loosen tolerance.
   (gotcha #34)
 - **Persistent param buffer + 2-deep pipeline = race.** Duplicate the
   param ring (`gpu_param_buf[slot]`, `slot ∈ {0,1}`) the same way you
   duplicated the id ring. (gotcha #35)
-- **Diffusion-LLM samplers do CPU work invisible to `gpu_busy`.** If
-  your per-step CPU loop computes softmax / argmax / confidence over V
-  for many positions, that time shows up only in wall, not gpu_busy.
-  Add a third accumulator `host_post`; if > ~5% of wall, apply F3.
-  (gotcha #36)
+- **Diffusion-LLM samplers do CPU work invisible to `gpu_busy`.**
+  Per-step softmax/argmax/confidence over V shows up only in wall.
+  Add `host_post`; if > ~5% of wall, apply F3. (gotcha #36)
 - **Two M shapes need two PSOs.** When prefetch (M=L) and refine
   (M=BL) differ by 4–5×, compile two GEMM PSOs with different
   `(BM, BK)` and switch at dispatch by `M > 16`. Pad workspace buffers
   to the larger `BM`. (gotcha #38)
-- **K > N matmuls are TG-starved at BM=32.** A LLaMA-style MLP
-  down_proj at BM=32 BN=64 produces only N/BN TGs. Extend dual-tile
-  dispatch with `use_bm32 = (M > 16) && (K <= N)`. (gotcha #39, C4)
-- **Small-N REFINE matmuls are TG-starved on the N-axis.** N-axis
-  sibling of K>N: at M≤16 BM=16 N<5120 BN=64 there are too few N-tiles.
-  Add `use_bn32 = (M <= 16) && (N < 5120)`. (catalog C5)
+- **GEMM aspect-ratio routing — both K>N and small-N need attention.**
+  K>N matmuls at BM=32 BN=64 produce only N/BN TGs (`use_bm32 =
+  (M > 16) && (K <= N)`); small-N refine matmuls at M≤16 BM=16 N<5120
+  BN=64 are TG-starved on the N-axis (`use_bn32 = (M <= 16) &&
+  (N < 5120)`). (gotcha #39, catalog C4 + C5)
 - **"BK=16 is the maximum" is a `WN=2` artifact.** At `WN=4` per-SG
   register pressure halves, unlocking BK=32/BK=64. Always sweep
   BK ∈ {16,32,64} × WN ∈ {2,4} with the register-budget formula.
@@ -406,9 +397,27 @@ optimization:
   fault handler serializes on per-page locks). Use parallel `pread`
   per shard — one fd per shard, sequential reads, dispatch_apply
   across shards. Critical for diffusion / short benches. (gotcha #29, A9)
-- **`newBufferWithBytesNoCopy:` per-tensor doesn't work.** Safetensors
-  tensor offsets are 8-byte aligned, not the 16 KB page-aligned that
-  `newBufferWithBytesNoCopy:` requires. Use parallel pread (A9). (gotcha #40)
+- **`newBufferWithBytesNoCopy:` per-tensor doesn't work; per-shard
+  works but is slower than pread on warm cache.** Per-tensor fails on
+  8-byte alignment (#40); per-shard is API-valid but page-fault BW
+  (~20 GB/s) loses to pread's page-cache memcpy fast path (~50 GB/s).
+  Counter-intuitive trap. (gotchas #40, #47)
+- **Co-tune `SHARD_SPLIT` against bg compile + residency_async.**
+  pread workers + bg compile + bg residency all contend for P-cores.
+  Target `n_shards × SHARD_SPLIT ≈ P_cores` (12 on M4 Max). Going
+  higher regresses by starving bg compile. (gotcha #45)
+- **Async kernel compile QoS matters.** Start compile + PSO creation
+  on a bg dispatch queue *before* `cache_weights()`. Use
+  `QOS_CLASS_USER_INITIATED`, not `USER_INTERACTIVE` (steals from
+  pread). Metal compile is system-cached cross-process (~3 ms warm),
+  so the overlap is essentially free. (gotcha #46)
+- **Shard-sized MTLBuffer + per-tensor views.** One MTLBuffer per
+  safetensors shard; each tensor is a `(parent, offset, size)` view.
+  Residency set shrinks N_tensors → N_shards (339 → 4). Small but
+  consistent wall win. (gotcha #50)
+- **At decode, GEMM is W-bandwidth bound, not M.** Halving M
+  (row-selective compute) when `M ≪ K` saves <1% — the W read
+  dominates. Only worth it on compute-bound kernels. (gotcha #49)
 
 ## Commit strategy
 
@@ -457,24 +466,19 @@ context / paged-KV cache, sampling beyond greedy.
 Each catalog entry's "Snippet" points here. Files are working kernel /
 shim snippets with a header describing what / when / expected speedup /
 original commit. Adapt to your model's shapes — these are inspiration,
-not drop-ins.
+not drop-ins. Full inventory in `references/catalog.md`. Highlights:
 
-- **A** (host scheduling): `cmdbuf_batch_dispatches.c`,
-  `cmdbuf_pipeline_2deep.c` (+`_id_swap` variant), `concurrent_encoder.c`,
-  `load_parallel_pread.c`, `param_buf_persistent.c`, `param_buf_const.c`.
-- **B** (GEMV): `gemv_simdgroup_per_output.metal` (incl. B2),
-  `gemv_qmv4_register_tile.metal`, `gemv_with_residual_epilogue.metal`.
-- **C** (GEMM): `gemm_simdgroup_matrix_mma.metal`.
-- **D** (SDPA): `sdpa_sg_per_head_decode.metal`,
+- **A** (host scheduling) — `cmdbuf_*.c`, `concurrent_encoder.c`,
+  `load_parallel_pread.c` (incl. sub-shard + shard-buffer-view variants),
+  `param_buf_*.c`.
+- **B/C** (GEMV/GEMM) — `gemv_*.metal`, `gemm_simdgroup_matrix_mma.metal`.
+- **D** (SDPA) — `sdpa_sg_per_head_decode.metal`,
   `sdpa_online_softmax.metal`, `sdpa_multi_sg_online_merge.metal`.
-- **E** (MoE): `mxfp4_qmv4_decode.metal`,
-  `mxfp4_gate_up_swiglu_fused.metal`, `moe_sorted_gather_glue.metal`,
-  `moe_sorted_gather_qmm.metal`.
-- **F** (reductions): `argmax_parallel.metal`,
+- **E** (MoE) — `mxfp4_*.metal`, `moe_sorted_gather_*.metal`.
+- **F** (reductions) — `argmax_parallel.metal`,
   `topk_parallel_router.metal`, `softmax_argmax_per_row.metal`.
-- **H** (host/GPU boundary): `glue_kernels_no_host_break.metal`,
-  `gemm_x_offset_row_prune.c`.
-- **I** (recurrent): `recurrent_state_sg_per_row.metal`.
+- **H/I** — `glue_kernels_no_host_break.metal`,
+  `gemm_x_offset_row_prune.c`, `recurrent_state_sg_per_row.metal`.
 
 ### Long-form references (`references/`)
 
@@ -484,7 +488,7 @@ Loaded on demand — read the one your situation calls for.
 - `profiling.md` — wall vs gpu_busy diagnostic, host_post for samplers,
   KPROF, variance discipline, startup phase-breakdown.
 - `debugging.md` — symptom → recipe table + late-stage barrier checklist.
-- `gotchas.md` — 41 numbered war stories with TOC.
+- `gotchas.md` — 50 numbered war stories with TOC.
 - `decode-prefill-split.md` — G category.
 - `parallel-chains.md` — A8 late-decode endgame.
 - `sliding-kv-cache.md` — D4 rotating KV cache.

@@ -52,6 +52,12 @@ the same symptoms again.
 | 42 | Don't fuse two kernels that the concurrent encoder is overlapping | Fusion / encoder |
 | 43 | `id<MTLBuffer>` conforms to `id<MTLAllocation>` but you must declare `__strong` | macOS 15+ API |
 | 44 | `_exit(0)` doesn't help short-lived Metal CLIs much — the cost is pre-`main()` | Startup |
+| 45 | Sub-shard pread + bg compile + residency_async all compete for cores — tune `SHARD_SPLIT` against bg work | Startup |
+| 46 | `newLibraryWithSource:` and PSO creation are system-cached cross-process — async with `USER_INITIATED` not `USER_INTERACTIVE` | Startup |
+| 47 | `newBufferWithBytesNoCopy:` *per shard* works on macOS but is slower than pread on warm runs (page-fault BW < page-cache memcpy BW) | Startup |
+| 48 | Parallel JSON-header parse helps `st_open` in isolation but is absorbed by bg compile overlap on warm runs | Startup |
+| 49 | At decode (M ≪ K), GEMM is W-bandwidth bound — halving M saves <1%; row-selective compute only helps compute-bound kernels | Strategy |
+| 50 | Shard-sized MTLBuffer + per-tensor views — replaces N_tensor MTLBuffers with N_shard, shrinks residency set | Startup |
 
 ---
 
@@ -1044,3 +1050,280 @@ which `_exit` can't help with.
 **Conclusion**: try `_exit(0)` but measure before keeping it. If it
 saves <5 ms, revert — the maintenance cost (skipped destructors,
 no atexit handlers) isn't worth it.
+
+# 45. Sub-shard pread + bg compile + residency_async all compete for cores — tune `SHARD_SPLIT` against bg work
+
+You have **three** kinds of parallel work running concurrently during
+startup once everything is overlapped:
+
+1. **pread workers** — `dispatch_apply(n_shards × SHARD_SPLIT, ...)` —
+   one fd per shard, each shard split into `SHARD_SPLIT` contiguous
+   tensor groups (each group is sequential on disk so kernel readahead
+   still engages — see gotcha #29's "scattered offsets" warning).
+2. **bg Metal compile + PSO creation** — `gpu_init_async()` started
+   before pread; usually 16–32 PSOs created in parallel via
+   `dispatch_apply` (gotcha #46).
+3. **bg `[MTLResidencySet requestResidency]`** — kicked off on a bg
+   queue right after MTLBuffer allocation, overlapping with pread
+   (gotcha #30, catalog A9).
+
+All three contend on the same P-core pool. The naive instinct is
+"more pread threads = faster pread", but on M4 Max (12 P-cores) the
+sweet spot is `n_shards × SHARD_SPLIT ≤ ~12`. Confirmed numbers
+(Dream-7B, 4 shards, fastdllm validation prompt):
+
+| `SHARD_SPLIT` | pread workers | pread time | total wall | notes |
+|---|---|---|---|---|
+| 1 | 4  | 421 ms | ~2.5 s | bg compile + residency_async starve pread |
+| 1 | 4  | 67 ms  | (microbench) | isolated, no bg work — theoretical ceiling |
+| 3 | 12 | 340 ms | 1.43 s | **optimal** (12 == P-core count) |
+| 4 | 16 | 332 ms | 1.55 s | bg compile contention — `lib_join` grows to 30–74 ms |
+
+Counter-intuitive result: `SHARD_SPLIT=1` can in principle hit
+225 GB/s (67 ms / 14 GB on M4 Max) but in the **real binary** it
+performs *worse* than `SHARD_SPLIT=3` because the single-stream pread
+sleeps on I/O and gives the scheduler room to wake the bg compile
+threads, which then displace the pread thread when it tries to
+resume. The 12-way fan-out keeps a hot pread thread on every P-core
+and starves bg work into the residency_async wait gaps.
+
+**Rule of thumb**: `SHARD_SPLIT ≈ P_cores / n_shards`, rounded *down*
+on M-Max-class chips where bg compile is heavy. Always measure the
+**total wall** (not just pread time) at 2–3 candidate values
+(`SHARD_SPLIT ∈ {1, 2, 3, 4}`) on warm cache and pick the best.
+
+Why "sub-shard splitting" instead of more pread per shard or
+splitting individual tensors into 64 MB chunks: scattered offsets
+inside one fd disable kernel readahead. The trick is to keep each
+thread's reads **sequential** within its tensor group. Split the
+*tensor list* of each shard into K contiguous halves; each thread
+preads its half left-to-right. That's the magic.
+
+**Implementation** (see also `patterns/load_parallel_pread.c`):
+
+```c
+#define SHARD_SPLIT 3  // tune for your CPU vs bg-work mix
+dispatch_apply(n_shards * SHARD_SPLIT, q, ^(size_t job) {
+    size_t s = job / SHARD_SPLIT, k = job % SHARD_SPLIT;
+    int fd = open(shard_path[s], O_RDONLY);
+    size_t i0 =  k    * sh_n[s] / SHARD_SPLIT;
+    size_t i1 = (k+1) * sh_n[s] / SHARD_SPLIT;
+    for (size_t i = i0; i < i1; i++) {
+        // pread tensors[shard_idx[s][i]] sequentially
+    }
+    close(fd);
+});
+```
+
+Real measurement on the production binary (Dream-7B, M4 Max,
+SHARD_SPLIT=3): pread 472 → 340 ms, total wall 2.19 → 2.05 s.
+Combined with the rest of the load stack (parallel pread + async
+compile + async residency_async + dropped madvise), startup is
+0.40 s on a 14 GB model.
+
+# 46. `newLibraryWithSource:` and PSO creation are system-cached cross-process — async with `USER_INITIATED`
+
+Metal caches compiled shader libraries and pipeline state objects
+across processes, keyed by a hash of the source plus build options.
+First-ever compile of a given source: ~74 ms (`newLibraryWithSource`)
++ ~98 ms per-PSO. Any subsequent process running on the same machine
+with identical source: **~3 ms** for the library, **~2 ms** for each
+PSO. The cache lives at the OS level (not per-process), so cold
+starts of "fresh" CLI invocations actually hit a warm cache.
+
+**Implication 1**: don't waste effort optimizing Metal compile in
+isolation. The interesting question is "does the compile overlap
+with weight load?" not "is the compile fast?" — on warm runs the
+compile *is* fast (~3 ms).
+
+**Implication 2 (the win)**: start the compile **before** weight
+load via `gpu_init_async()` and join after `cache_weights()`. On
+cold-cache invocations the 74 ms compile is fully hidden inside the
+~500 ms pread; on warm runs the join is a no-op (`lib_join=0.000s`).
+
+```c
+gpu_init_async(ctx, msl_source, pso_names, n_psos);  // bg dispatch
+cache_weights(ctx, ...);                              // parallel pread
+gpu_init_finish(ctx);                                 // join bg
+```
+
+**Implication 3 (the trap)**: choose the bg queue's QoS carefully.
+
+| QoS | Effect |
+|---|---|
+| `USER_INTERACTIVE` | `lib_join` → 0, but **steals P-cores from pread**; pread workers get time-sliced; **net regression** ~50 ms |
+| `USER_INITIATED`   | `lib_join` ranges 0–30 ms (depending on contention) but pread runs full-speed; **net win**: -20–80 ms |
+| `DEFAULT`          | similar to USER_INITIATED on macOS; works |
+| `UTILITY`/`BACKGROUND` | bg compile gets starved; `lib_join` can spike to 100+ ms; regression |
+
+Use `QOS_CLASS_USER_INITIATED`. Same goes for the `dispatch_apply`
+that creates the PSOs — match the QoS.
+
+# 47. `newBufferWithBytesNoCopy:` *per shard* works on macOS but is slower than pread on warm runs
+
+Gotcha #40 ruled out `newBufferWithBytesNoCopy:` *per tensor* (the
+8-byte-aligned offset doesn't satisfy the 16 KB-page alignment
+requirement). But the **whole shard** *is* page-aligned (mmap
+guarantees it for the base pointer), so wrapping one MTLBuffer per
+shard around an `mmap`'d file-backed region is **valid**:
+
+```objc
+void* p = mmap(NULL, shard_size, PROT_READ, MAP_PRIVATE, fd, 0);
+id<MTLBuffer> buf = [device newBufferWithBytesNoCopy:p
+                                              length:shard_size_pageround
+                                             options:MTLResourceStorageModeShared
+                                         deallocator:^(void* ptr, NSUInteger len) {
+                                             munmap(ptr, len);
+                                         }];
+```
+
+The pitch is "zero copy disk → MTLBuffer". On paper it should beat
+pread because there's no `memcpy` step. **In practice it is slower
+on warm runs.**
+
+Why: when the GPU (or `requestResidency`, or the first cmdbuf) first
+touches the buffer pages, macOS materializes each 16 KB page via the
+VM fault handler. The fault handler's effective bandwidth is
+~20 GB/s on M4 Max — *slower* than pread, which goes through the
+kernel's `vfs_read` → `memcpy_from_pagecache` fast path at ~50 GB/s
+when the file is already in the unified buffer cache.
+
+Measured (Dream-7B, 14 GB, M4 Max, warm cache):
+
+| Method | Wall (first touch) |
+|---|---|
+| Parallel pread, SHARD_SPLIT=3, 4 shards | 340 ms |
+| `mmap`+`newBufferWithBytesNoCopy:` per shard, then `requestResidency` | ~1100 ms |
+| `mmap`+`newBufferWithBytesNoCopy:` per shard, page-touch loop in `dispatch_apply` | ~755 ms |
+
+The "zero copy" framing is misleading: you trade an explicit
+`memcpy` for an *implicit* page-fault path that is bandwidth-limited
+at a *lower* rate than the explicit copy. Stay with parallel pread.
+
+This trap is particularly easy to fall into because the same
+technique works *brilliantly* on Linux with `MAP_POPULATE | MAP_HUGETLB`
+on a real NVMe device — the optimization just doesn't transfer to
+macOS's pmap.
+
+# 48. Parallel JSON-header parse helps `st_open` in isolation but is absorbed by bg compile overlap
+
+`st_open` does an `open` + `mmap` + JSON header parse per shard.
+Naive serial implementation is ~22 ms for 4 Dream-7B shards.
+`dispatch_apply` across shards drops it to ~10 ms. That's a real
+12 ms saving — except: by the time you've applied gotcha #46
+(async compile started before `st_open`), the compile is *already*
+overlapping with `st_open` on bg threads, so the host wall time of
+`st_open` doesn't appear in the critical path. The 12 ms saving
+just shifts the bottleneck to `lib_join`.
+
+**Lesson**: before parallelizing any startup-phase host-side work,
+check what's already overlapping. On a port where:
+
+- `gpu_init_async` runs concurrently with `st_open` + `cache_weights`,
+- pread saturates 12 P-cores,
+
+…the host-side parse of `st_open` is hidden inside the bg-thread
+budget that `gpu_init_async` would have used anyway. Parallel
+`st_open` is architecturally cleaner but **does not move total wall**
+on warm cache. Skip it unless you have a profile that says metal
+compile is short and `st_open` dominates the host critical path.
+
+If you do parallelize, make sure the merge of per-shard tensor
+arrays into the unified archive is **shard-order-stable** — the
+shard_idx field on each tensor must match the actual file the data
+came from, or pread reads from the wrong shard.
+
+# 49. At decode (M ≪ K), GEMM is W-bandwidth bound — halving M saves <1%
+
+A common late-stage optimization idea on diffusion LLMs ("Dream's
+refine step only updates ~M_active rows of the residual, why not
+compute only those rows?") looks intuitively appealing: M=BL=32 →
+M_active=16 should be 2× faster.
+
+**It isn't.** For a `(M × N) = (M × K) · (K × N)` matmul where
+`M ≪ K, N`, the GPU time is dominated by *reading W* (= K × N
+weight entries). Halving M reduces the X read (M × K) and Y write
+(M × N), which together are tiny vs the W read:
+
+```
+T_total ≈ (M*K + M*N + K*N) * dtype / BW
+       ≈ K*N * dtype / BW           when M ≪ K, M ≪ N
+
+speedup_from_M_halving ≈ M / (M + K + ...)
+                       ≈ 32 / (32 + 18944)  ≈ 0.2%
+```
+
+For Dream-7B's down_proj at decode (M=32, K=18944, N=3584): halving
+M saves ~0.4% of total per-call wall. Row-selective compute is
+**only worth it on compute-bound kernels** (e.g., `gate_up` on M4
+Max, where the simdgroup_matrix MMA pipeline is the bottleneck and
+fewer M-tiles = fewer dispatches). For everything BW-bound (which is
+most of decode), focus on weight-reuse and quantization (E1, E2)
+instead.
+
+Quick diagnostic: if `GPU_time × BW > weight_size_GB`, the kernel is
+compute-bound, M-reduction might help. If `GPU_time × BW ≈
+weight_size_GB`, you're BW-bound — M-reduction won't.
+
+# 50. Shard-sized MTLBuffer + per-tensor views — fewer-but-bigger buffers
+
+The naive port produces one MTLBuffer per tensor (e.g., 339
+MTLBuffers for Dream-7B). This is fine functionally but has costs
+that grow with `n_tensors`:
+
+- **Residency set** (gotcha #30) has 339 entries; building it is
+  ~5 ms; iterating it adds tiny per-cmdbuf overhead.
+- **pread** sees 339 small `gpu_buf_contents` pointers, each backed
+  by its own VM region; small per-tensor fixed overhead per pread
+  call (~30 µs × 339 ≈ 10 ms).
+- **Memory fragmentation**: each MTLBuffer is page-rounded, so
+  small tensors (1 K embeddings, RMSNorm vectors) waste up to
+  16 KB each.
+
+The clean fix: **one MTLBuffer per safetensors shard**, and each
+"tensor" is a lightweight wrapper:
+
+```c
+struct gpu_buf {
+    id<MTLBuffer> mtl;     // shared parent (one per shard)
+    size_t        offset;  // byte offset into parent
+    size_t        size;
+    void*         host;    // = [parent contents] + offset
+};
+
+gpu_buf* gpu_buf_new_view(gpu_buf* parent, size_t off, size_t bytes) {
+    gpu_buf* v = calloc(1, sizeof(*v));
+    v->mtl = parent->mtl;
+    v->offset = parent->offset + off;
+    v->size = bytes;
+    v->host = (char*)parent->host + off;
+    return v;
+}
+
+// In dispatch:
+// [encoder setBuffer:buf->mtl offset:(buf->offset + per_arg_off) atIndex:i];
+```
+
+Pass `parent->offset + per_arg_offset` to `setBuffer:offset:`. The
+parent MTLBuffer is registered in the residency set just once; views
+are tracked but don't appear there.
+
+Real impact (Dream-7B):
+- Residency set: 339 entries → 4 entries.
+- Per-tensor pread fixed overhead: ~10 ms → negligible.
+- Total startup: -15–20 ms (small, but consistent and architecturally
+  cleaner).
+
+This is what MLX does internally with its `array::strided_view`
+plumbing — the structural form is "one big buffer per file, many
+zero-copy views". It also makes `st_open` cleaner: you allocate
+shard buffers up front (one alloc per shard) and create views as you
+parse the JSON header.
+
+**Caveat**: `gpu_buf_contents()` on a view returns a pointer into the
+*parent's* shared-storage region. CPU writes from a per-step sampler
+must respect the parent's lifetime; don't free the parent while
+views are live.
+
+**Commit reference** (Dream-7B): `005b20a` — full diff is small,
+~100 lines.
