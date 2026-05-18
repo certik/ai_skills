@@ -1,25 +1,22 @@
 ---
 name: optimize-metal
 description: >
-  Optimize a working but naive Apple-GPU Metal LLM implementation (from
-  the port-c-to-metal skill, in ./src-metal/) to match MLX speed within
-  ±5% on BOTH per-token tok/s AND total wall time (including weight
-  load). Catalog: SIMD-group-per-output GEMV, bfloat4 loads, qmv4
-  register tiling, simdgroup_matrix MMA for prefill, sorted-gather MoE,
-  online-softmax SDPA, multi-SG SDPA, parallel argmax, 2-deep cmdbuf
-  pipeline, persistent + const param buffers, concurrent encoder, fused
-  residual epilogues, decode/prefill split, GPU glue kernels for
-  host-side breaks (often the biggest single decode win),
+  Optimize a naive Apple-GPU Metal LLM implementation (./src-metal/
+  from port-c-to-metal) to match MLX speed within ±5% on per-token
+  tok/s AND total wall time. Catalog: SIMD-group-per-output GEMV,
+  bfloat4 loads, qmv4 register tiling, simdgroup_matrix MMA for
+  prefill, sorted-gather MoE, online-softmax + multi-SG SDPA, parallel
+  argmax, 2-deep cmdbuf pipeline, persistent/const buffers, concurrent
+  encoder, fused residual epilogues, decode/prefill split, GPU glue
+  kernels for host-side breaks (often the biggest decode win),
   SG-per-(row,dim) for RNN/SSM recurrences, parallel pread weight
-  loader (one fd per shard via dispatch_apply — beats mmap+memcpy 2–3×
-  and brings startup below MLX). Also handles diffusion-LLM samplers
-  (Dream / LLaDA / fastdllm): GPU per-row softmax+argmax+confidence
-  (replaces the host_post loop), single-row output pruning via X
-  offset, dual-tile (BM, BK) GEMM dispatch by M. Validates tokens
-  against the C reference after each change. Triggers: optimize metal,
-  speed up metal, match mlx speed, gpu optimization, metal performance,
-  kernel tuning, startup latency, weight loading, total wall time,
-  diffusion LLM (Dream / LLaDA / fastdllm) on metal.
+  loader (one fd per shard via dispatch_apply, beats mmap+memcpy 2–3×).
+  Also handles diffusion-LLM samplers (Dream / LLaDA / fastdllm): GPU
+  per-row softmax+argmax+confidence, single-row output pruning,
+  dual-tile GEMM dispatch by M. Validates tokens against the C
+  reference after each change. Triggers: optimize metal, speed up
+  metal, match mlx speed, gpu optimization, kernel tuning,
+  startup latency, diffusion LLM on metal.
 ---
 
 # optimize-metal — make the Metal port fast (match MLX ±5%)

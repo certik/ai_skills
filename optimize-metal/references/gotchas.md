@@ -1258,7 +1258,7 @@ M saves ~0.4% of total per-call wall. Row-selective compute is
 **only worth it on compute-bound kernels** (e.g., `gate_up` on M4
 Max, where the simdgroup_matrix MMA pipeline is the bottleneck and
 fewer M-tiles = fewer dispatches). For everything BW-bound (which is
-most of decode), focus on weight-reuse and quantization (E1, E2)
+most of decode), focus on weight-reuse and precision reduction (E1, E2)
 instead.
 
 Quick diagnostic: if `GPU_time × BW > weight_size_GB`, the kernel is
