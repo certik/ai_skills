@@ -251,6 +251,17 @@ first; the bottleneck shifts dramatically after step 14.
     bumping `N_SG=4` → `N_SG=8` (`N_SG=16` ties at D=2048; sweep
     per-D). Qwen3.6: 101.5 → 102.5 tok/s (+1.0%). Cheap, free
     1-line change.
+19. **D3 N_SG sweep on LONG decode.** SDPA's relative cost grows
+    linearly with Lk, so short-bench picks (e.g. `N_SG=4` from 64-
+    token tests) become wrong at long context (1500+ tokens). On
+    Qwen3.6-35B-A3B M4 Max, 1500-tok decode picks `N_SG=20` (not 16
+    or 24) — see gotcha #54 and catalog D3 for the full sweep
+    (12=91.2 < 16=96.7 ≤ **20=97.5** > 24=95.6 > 28=94.2 tok/s).
+    Always re-sweep `N_SG ∈ {12, 16, 20, 24, 28}` once long-decode
+    becomes the goal. Update BOTH the kernel `constexpr` AND the
+    host dispatch `threads_per_threadgroup` in lock-step
+    (gotcha #53) — desync gives garbage tokens. Worth +1-2% on
+    long-context decode.
 
 After these, KPROF shows `linear_q8` family at ~77% of GPU at ~50%
 of theoretical W-BW peak — you're at the W-bandwidth floor on
@@ -268,6 +279,15 @@ each cap at <1% wall.
   bare q8 (41 → 31 tok/s) AND post-B6 uint4 layout (103 → 90.7
   tok/s). The sweet spot only moves DOWN with heavier inner
   loops. Stay at K_OUT=4. (gotcha #8 has the second datapoint.)
+- **B4 (TG-mem X-share) — risks regression once B6 is in.** The
+  catalog speedup (1.05-1.10×) was measured on early ports where
+  W-BW dominated and X-share saved 25% of DRAM. After B6 amortizes
+  S/B, Apple-Silicon's per-core L1/L2 effectively gives you X
+  sharing for free between adjacent SGs reading the same row, so
+  explicit TG-mem staging adds cooperative-load + barrier cost
+  with no DRAM savings. On Qwen3.6 M4 Max (K=2048), both WG=2 and
+  WG=4 regressed 1-2%. Try if profile says X-BW is dominant; revert
+  if it doesn't measure faster. (gotcha #56, catalog B4)
 - Concurrent encoder ALONE without barrier surgery — A8 is the win.
 - **Fusion across kernels that the concurrent encoder is already
   overlapping** — see gotcha #42. The Qwen3.6 fused
@@ -470,6 +490,38 @@ optimization:
 - **At decode, GEMM is W-bandwidth bound, not M.** Halving M
   (row-selective compute) when `M ≪ K` saves <1% — the W read
   dominates. Only worth it on compute-bound kernels. (gotcha #49)
+- **MSL position attributes must agree in dimensionality.** All
+  `[[thread_position_in_*]]` / `[[threadgroup_position_in_grid]]` /
+  `[[threads_per_threadgroup]]` parameters must be all-uint or
+  all-uint3 — mixing gives "expecting input declarations with either
+  all scalar types or all vector types". INDEX attrs (`sg_id`,
+  `lane`) are exempt. (gotcha #51)
+- **`dispatchThreads:` with `grid_x % tg_x != 0` makes the last TG
+  non-uniform.** Cooperative TG-mem loads using `stride = tg_x` then
+  leave most of TG-mem uninitialized. Either keep grid_x a multiple
+  of tg_x, or use `threads_per_threadgroup` dynamically inside the
+  kernel and handle the small case. (gotcha #52)
+- **SDPA `N_SG` constexpr and host `threads_per_threadgroup` MUST
+  match.** Desync (kernel `N_SG=12`, host dispatches `32 * 16`) →
+  SGs 12..15 overflow `sg_m[]` / `sg_o[]` → garbage tokens. Update
+  BOTH in lock-step when sweeping. (gotcha #53)
+- **Optimal SDPA `N_SG` is NOT the perfect-occupancy divisor.**
+  Always sweep `N_SG ∈ {12, 16, 20, 24, 28}` on LONG decode (not
+  short — at low Lk SDPA share is too small to discriminate). On
+  Qwen3.6 M4 Max 1500-tok decode, 20 wins; 16/20 within 1% of each
+  other but 12/28 are 5%+ worse. (gotcha #54, catalog D3)
+- **Stale binary / thermal trap.** User reports a tok/s regression
+  that you cannot reproduce. Common causes: thermally loaded GPU
+  (background process), stale `.o` files in build, or DYLD caches
+  from prior debug session. Fix: `make clean && make`, close GPU-
+  using apps, `sleep 60` before first bench, best-of-5 with
+  `sleep 30` between runs. (gotcha #55)
+- **B4 (TG-mem X-share) can REGRESS once B6 is in.** Apple-Silicon
+  cores effectively share X across SGs via L1/L2, so explicit
+  TG-mem staging adds barrier + load cost without saving DRAM BW.
+  Cataloged 1.05-1.10× was on early-stage W-dominant ports; after
+  B6 the ratio flips and B4 can lose 1-2%. Measure and revert if
+  it regresses. (gotcha #56, catalog B4)
 
 ## Commit strategy
 
@@ -541,7 +593,7 @@ Loaded on demand — read the one your situation calls for.
 - `profiling.md` — wall vs gpu_busy diagnostic, host_post for samplers,
   KPROF, variance discipline, startup phase-breakdown.
 - `debugging.md` — symptom → recipe table + late-stage barrier checklist.
-- `gotchas.md` — 50 numbered war stories with TOC.
+- `gotchas.md` — 56 numbered war stories with TOC.
 - `decode-prefill-split.md` — G category.
 - `parallel-chains.md` — A8 late-decode endgame.
 - `sliding-kv-cache.md` — D4 rotating KV cache.

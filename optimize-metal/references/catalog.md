@@ -364,7 +364,40 @@ SG re-reading X from device memory.
 **When**: After B3, if you bumped to multi-SG threadgroups for B5 or to
 better fill the GPU.
 
-**Speedup**: 1.05–1.10× on bandwidth-bound GEMVs.
+**Speedup**: 1.05–1.10× on bandwidth-bound GEMVs **when X is not
+already cache-resident across SGs**. On Apple-Silicon GPUs with shared
+per-core L1/L2 and many concurrent SGs reading the same X, the cache
+already serves X efficiently — explicit TG-mem staging then ADDS a
+cooperative load + `threadgroup_barrier` whose cost can exceed the
+saved DRAM BW.
+
+**Negative result — when B4 hurts**: Tried on Qwen3.6-35B-A3B
+(M4 Max, K=2048, post-B6 uint4 W loads) with WG=2 (TG=64) and
+WG=4 (TG=128) across all `linear_q8`/`linear_q8_add`/`linear_q8_gather`
+sites. Both **regressed ~1–2%** (96.7 → 95.0 at WG=4, → 93.5 at WG=2).
+Root cause: with B6 already amortizing `(s, b)` reads down to ~14% of
+traffic, W dominates the inner loop. X reads were ~29% of traffic but
+in practice nearly all X reads HIT in cache because adjacent SGs on
+the same core access the same `X[m, :]` close in time. The
+cooperative-load barrier overhead exceeded the marginal X-BW savings.
+B4 stays in the catalog because the win IS real on some chip/model
+combos (was originally validated on smaller models w/ different cache
+behavior), but **always measure before keeping it**. Revert if it
+regresses; the kernel changes alone (dynamic WG via
+`threads_per_threadgroup`) are reusable for other techniques.
+
+**Implementation gotchas** (see `references/gotchas.md` #51, #52):
+- All thread-position attributes in the kernel signature must agree
+  in dimensionality — if you add `uint3 tg [[threadgroup_position]]`,
+  the existing `uint tid [[thread_position_in_threadgroup]]` and
+  `uint thr_per_tg [[threads_per_threadgroup]]` must become `uint3`
+  too. INDEX attributes (`sg_id`, `lane`) stay `uint` regardless.
+- `dispatchThreads:` with `grid_x % tg_x != 0` produces a non-uniform
+  last threadgroup. A cooperative TG-mem load with stride
+  `thr_per_tg` then only fills `actual_tg_x / 1` elements, leaving
+  most of `X_tg` uninitialized. Keep grid_x divisible by tg_x, OR
+  use dynamic WG via `threads_per_threadgroup` so the small-N sites
+  (e.g. `shared_expert_gate` with N=1, grid_x=32) fall back to WG=1.
 
 **Commit**: 86e542e.
 
@@ -776,6 +809,44 @@ reduction merges the per-SG online-softmax states via the
 busy per head.
 
 **Speedup**: 1.05–2.0× decode (cd2ec6b +5%, 11b7562 +96%, 2d59eed +3%).
+
+**N_SG sweep on long-context decode**: The optimal `N_SG` for SDPA is
+**NOT** the theoretical perfect-occupancy divisor of (cores × SGs/core).
+M4 Max nominally fits 16 cores × 24 SGs/core, so `N_SG ∈ {16, 24}`
+would "perfectly" tile the GPU at 1 TG/(query_token, head) — but that's
+not what wins. The TG-mem allocation grows with `N_SG`
+(`sg_o[N_SG][D]`, `sg_m[N_SG]`, `sg_s[N_SG]`), which competes with W
+caching, and the per-SG K-stripe shrinks at high N_SG to where the
+fixed per-SG overhead (Q load, sm reduce, alpha update) dominates.
+
+Empirical sweep on Qwen3.6-35B-A3B M4 Max, 1500-tok decode
+(best-of-5 with 30 s thermal cool-down):
+
+| N_SG | tok/s | Δ vs 16 |
+|------|-------|---------|
+| 12   | 91.2  | -5.7%   |
+| 16   | 96.7  | baseline|
+| **20** | **97.5** | **+0.8%** (best) |
+| 24   | 95.6  | -1.1%   |
+| 28   | 94.2  | -2.6%   |
+
+The sweep is **flat near the optimum** (16 and 20 within 1% of each
+other) but **steep on either side**. Always sweep
+`N_SG ∈ {12, 16, 20, 24, 28}` on YOUR long-decode bench, not a short
+one — at short Lk, SDPA's share is small and the optimum is fuzzy;
+at long Lk SDPA grows linearly and the choice matters.
+
+**Speedup**: 1.05–2.0× decode (cd2ec6b +5%, 11b7562 +96%, 2d59eed +3%).
+Late-stage N_SG retuning typically nets +1–2% on long decode.
+
+**CRITICAL — kernel `N_SG` constexpr and host dispatch
+`threads_per_threadgroup` MUST match**: see `references/gotchas.md`
+#53. The kernel sizes its TG-mem arrays as `sg_m[N_SG]`,
+`sg_o[N_SG][D]` from the constexpr. If the host dispatch threads/TG
+is `32 * 16` while the kernel constexpr is `12`, SGs 12..15 will
+overflow these arrays and write garbage (often visible as `-1` or
+NaN tokens). When sweeping N_SG, change BOTH the kernel constant
+AND every `gpu_cmdbuf_dispatch*` call to `32 * N_SG` in lock-step.
 
 **Snippet**: `patterns/sdpa_multi_sg_online_merge.metal`
 

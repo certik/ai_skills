@@ -57,7 +57,13 @@ the same symptoms again.
 | 47 | `newBufferWithBytesNoCopy:` *per shard* works on macOS but is slower than pread on warm runs (page-fault BW < page-cache memcpy BW) | Startup |
 | 48 | Parallel JSON-header parse helps `st_open` in isolation but is absorbed by bg compile overlap on warm runs | Startup |
 | 49 | At decode (M ≪ K), GEMM is W-bandwidth bound — halving M saves <1%; row-selective compute only helps compute-bound kernels | Strategy |
-| 50 | Shard-sized MTLBuffer + per-tensor views — replaces N_tensor MTLBuffers with N_shard, shrinks residency set | Startup |
+| 50 | Shard-sized MTLBuffer + per-tensor views — replaces N_tensor MTLBuffers with N_shard, shrinks residency set | Startup     |
+| 51 | MSL kernel position attributes must agree in dimensionality — all `uint` or all `uint3`                              | MSL syntax  |
+| 52 | `dispatchThreads:` with `grid_x % tg_x != 0` makes the LAST TG non-uniform — breaks cooperative TG-mem loads          | Dispatch    |
+| 53 | SDPA `N_SG` constexpr and host dispatch `threads_per_threadgroup` must match — desync → garbage tokens                | SDPA bug    |
+| 54 | Optimal SDPA `N_SG` is NOT the theoretical perfect-occupancy divisor — sweep on LONG-decode, not short                | SDPA tuning |
+| 55 | Stale binary trap — user-reported tok/s regression that disappears on a clean rebuild is a thermal/binary cache artifact | Measurement |
+| 56 | B4 (TG-mem X-share) can REGRESS on chips with strong inter-SG cache reuse — measure, don't assume                    | GEMV tuning |
 
 ---
 
@@ -1370,3 +1376,257 @@ views are live.
 
 **Commit reference** (Dream-7B): `005b20a` — full diff is small,
 ~100 lines.
+
+# 51. MSL kernel position attributes must agree in dimensionality
+
+The Metal Shading Language compiler enforces that all kernel
+parameters with **position** semantic attributes use the SAME
+dimensionality — either all scalar (`uint`) or all vector (`uint3`).
+Mixing produces:
+
+    error: expecting input declarations with either all
+           scalar types or all vector types
+
+Position attributes are:
+- `[[thread_position_in_grid]]`
+- `[[threadgroup_position_in_grid]]`
+- `[[thread_position_in_threadgroup]]`
+- `[[threads_per_threadgroup]]`
+- `[[threads_per_grid]]`
+
+When adding a multi-dim grid kernel parameter (e.g. `uint3 tg
+[[threadgroup_position_in_grid]]` to access tg.x / tg.y / tg.z), you
+must promote the OTHER position attrs to uint3 even if you only need
+their `.x`:
+
+```metal
+// WRONG — mixes uint3 and uint position attrs:
+kernel void k(uint3 tg          [[threadgroup_position_in_grid]],
+              uint  tid         [[thread_position_in_threadgroup]],   // ERR
+              uint  thr_per_tg  [[threads_per_threadgroup]],          // ERR
+              uint  sg_id       [[simdgroup_index_in_threadgroup]],   // ok (INDEX, not POSITION)
+              uint  lane        [[thread_index_in_simdgroup]])        // ok (INDEX)
+
+// RIGHT — all POSITION attrs are uint3, INDEX attrs stay uint:
+kernel void k(uint3 tg          [[threadgroup_position_in_grid]],
+              uint3 tid_v       [[thread_position_in_threadgroup]],
+              uint3 thr_per_tg  [[threads_per_threadgroup]],
+              uint  sg_id       [[simdgroup_index_in_threadgroup]],
+              uint  lane        [[thread_index_in_simdgroup]])
+{
+    uint tid = tid_v.x;
+    uint tpt = thr_per_tg.x;
+    ...
+}
+```
+
+The two "index in simdgroup/threadgroup" attributes are a different
+attribute *category* (INDEX, not POSITION) and don't participate in
+this rule. They can stay `uint` regardless of what the position
+attrs do.
+
+Cost: 1–2 minutes of compile error if you've never seen this. Worth
+having in muscle memory because the error message says "expecting
+all scalar OR all vector" without pointing at which parameter is
+wrong, and a kernel with 5+ attributes makes it a hunt.
+
+# 52. dispatchThreads with grid_x not a multiple of tg_x → non-uniform last TG
+
+Metal's `[encoder dispatchThreads:MTLSizeMake(grid_x, ...)
+threadsPerThreadgroup:MTLSizeMake(tg_x, ...)]` is documented as
+launching `ceil(grid_x / tg_x)` threadgroups, with the **last
+threadgroup possibly smaller** (only `grid_x % tg_x` threads in it)
+when `grid_x` doesn't divide evenly.
+
+Inside the small last TG, kernels that assume "all `tg_x` threads
+exist" silently misbehave. The most common failure is **cooperative
+threadgroup-memory loads with stride = `tg_x`**:
+
+```metal
+// Cooperative X load — assumes ALL tg_x threads participate:
+for (uint i = tid; i < K4; i += thr_per_tg) {
+    X_tg[i] = X_dev[i];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+// ... now read from X_tg, but most entries are GARBAGE if the last
+// TG only has, say, 32 threads instead of the expected tg_x=128 ...
+```
+
+If `tg_x = 128` and the last TG has only 32 threads, the load
+fills `X_tg[0, 32, 64, 96, 128, 160, ...]` and leaves
+`X_tg[1..31, 33..63, ...]` uninitialized. The barrier doesn't help
+— there's nothing else to wait for.
+
+Two fixes:
+
+1. **Keep `grid_x` a multiple of `tg_x`.** Either pad N to the
+   nearest multiple OR fall back to a smaller `tg_x` for under-sized
+   dispatches.
+
+2. **Use dynamic `threads_per_threadgroup`** in the kernel and
+   compute work distribution from the runtime value. A kernel that
+   reads `[[threads_per_threadgroup]]` and does
+   `WG = thr_per_tg / 32; ...` works for both `tg_x = 32` (no
+   X-share, WG=1) and `tg_x = 128` (WG=4 SGs share X) without
+   recompiling — pick `tg_x` per dispatch site by `grid_x`'s
+   divisibility.
+
+Real example: Qwen3.6 has `shared_expert_gate` with N=1 → grid_x=32.
+Setting `tg_x=128` for it would launch 1 non-uniform 32-thread TG,
+and the cooperative X load would leave ~96/128 of `X_tg`
+uninitialized. Either keep that one site at `tg_x=32` or bump
+grid_x to 128 (pads with bounds-check work).
+
+# 53. SDPA N_SG constexpr and host dispatch threads_per_threadgroup MUST match
+
+The SDPA multi-SG kernel (`patterns/sdpa_multi_sg_online_merge.metal`)
+sizes its TG-mem reduction arrays from the compile-time constant
+`SDPA_N_SG`:
+
+```metal
+constant constexpr uint SDPA_N_SG = 20u;
+...
+threadgroup float sg_m[SDPA_N_SG];
+threadgroup float sg_s[SDPA_N_SG];
+threadgroup float sg_o[SDPA_N_SG][SDPA_SGO_D];
+```
+
+The host launches the kernel with:
+
+```c
+gpu_cmdbuf_dispatch_bar(cb, pso_sdpa, args, n,
+                        /* threads */ 32 * SDPA_N_SG * Nq * Lq, 1, 1,
+                        /* tg     */ 32 * SDPA_N_SG, 1, 1);
+```
+
+If the kernel constexpr is 20 but the host dispatches with
+`32 * 16`, only 16 SGs run per TG → kernel works but underuses TG-mem.
+If the kernel is 12 but the host dispatches with `32 * 16`, the **extra
+SGs** (sg_id 12..15) write past the end of `sg_m`, `sg_s`, `sg_o`. The
+overflows clobber adjacent TG-mem (the `scores[]` buffer, often), and
+the symptom is **token corruption** — often `-1` decoded immediately,
+or NaN propagation through the softmax merge.
+
+When sweeping `SDPA_N_SG`, **change BOTH places in lock-step**:
+
+1. `constant constexpr uint SDPA_N_SG = N;` in the .metal file
+2. Every `gpu_cmdbuf_dispatch*` site that launches `pso_sdpa` —
+   typically just one or two in main.c — must update its
+   `32 * N` factor in both the grid_x and the tg_x arguments.
+
+If you forget (2), the kernel re-compiles fine (no syntax error,
+just a different N), Metal launches with the OLD threads-per-TG,
+and you get silently wrong tokens.
+
+Recommended pattern: define `SDPA_N_SG` in main.c too (via a header
+shared between metal source and host) so a single edit point flows
+through. The catalog patterns ship with separate constants for
+simplicity, but in production this is worth deduplicating.
+
+# 54. Optimal SDPA N_SG is NOT the theoretical perfect-occupancy divisor
+
+It's tempting to pick `N_SG` from "perfect occupancy" math: M4 Max
+has 16 cores × 24 SGs/core = 384 SG slots; if you have 16 query
+heads × 1 token = 16 TGs/SDPA call, then `N_SG = 384/16 = 24` would
+"perfectly" fill the GPU at one wave per call.
+
+Empirically, that's not the win. On Qwen3.6-35B-A3B at M4 Max with
+1500-tok decode (Lk averaging ~750, best-of-5 with 30 s thermal
+cool-down between configs):
+
+```
+N_SG = 12   →  91.2 tok/s   (worst: K-stripe per SG too large, hurts ILP)
+N_SG = 16   →  96.7 tok/s   (baseline)
+N_SG = 20   →  97.5 tok/s   ← BEST (+0.8% over 16)
+N_SG = 24   →  95.6 tok/s   (TG-mem alloc bumps `sg_o[24][D]` = 24 KB; OS-loaded weights compete)
+N_SG = 28   →  94.2 tok/s
+```
+
+Why the perfect-occupancy math is wrong:
+- **TG-mem grows with N_SG**: `sg_o[N_SG][D=256]` is `4 * N_SG` KB
+  per TG. At N_SG=24, that's 24 KB — eating into the per-core L1
+  cache that W and X reads benefit from.
+- **Per-SG K-stripe shrinks at high N_SG**: at Lk=750 and N_SG=24,
+  each SG sees ~31 K-vectors. The fixed per-SG overhead (Q load
+  into registers, alpha/sm reduces) doesn't shrink, so per-K
+  efficiency drops.
+- **Apple-Silicon SG scheduling isn't strictly tile-per-core**:
+  the dispatcher can co-schedule TGs across cores, so under-tiled
+  (N_SG=12, fewer TGs than cores) doesn't fully waste the GPU; and
+  over-tiled (N_SG=24+) doesn't double-up cleanly either.
+
+Practical rule:
+- **Always sweep `N_SG ∈ {12, 16, 20, 24, 28}` on YOUR target
+  workload's LONG decode**, not a 16-token smoke test.
+- Use thermal cool-down between configs (M4 Max regresses ~25%
+  from back-to-back runs — see gotcha #6).
+- The optimum is usually flat across 2–3 adjacent values; pick the
+  one with the lowest run-to-run variance.
+
+# 55. Stale binary trap — measure FRESH after the user reports a regression
+
+User reports: "decode dropped from 95 to 70 tok/s — is there a
+regression?". You re-run on the SAME machine, you measure 95-97
+tok/s, the user re-runs and again sees 70.
+
+Common explanation (validated multiple times on Qwen3.6 / M4 Max):
+the user's binary is from a stale build, OR their machine is
+thermally loaded (background process / prior heavy GPU use), OR
+their shell still has stale env vars / DYLD paths from a debug
+session. The Metal runtime + macOS combined are extremely sensitive
+to all three.
+
+Recovery recipe:
+1. `make clean && make qwen35` (force fresh build — there have been
+   cases where stale `.o` files were keeping a prior kernel in the
+   binary).
+2. Close all other apps using the GPU (Slack, Chrome with hardware-
+   accelerated video, anything running an ML model).
+3. `sleep 60` to thermally cool the GPU before the first run.
+4. Best-of-5 with `sleep 30` between each.
+
+If the regression persists, `git bisect` is the right tool — but
+don't bisect on a single short run; each commit needs the same
+best-of-5 + thermal-cool-down treatment to be reliable. A "70 vs
+95" gap is BIGGER than this measurement's noise floor (±2-3% on a
+quiet machine), so if it survives the cool-down protocol it's real.
+
+# 56. B4 (TG-mem X share) can REGRESS — Apple cache is already good at sharing X
+
+The catalog says B4 is 1.05–1.10× on bandwidth-bound GEMVs. That
+range was measured on early-stage ports where W-BW was dominant and
+X-share saved 25% of memory traffic per call. Once **B6 (uint4 W
+loads w/ amortized scale/bias)** is in, the BW breakdown shifts:
+
+- W reads ≈ 57% of inner-loop bytes
+- X reads ≈ 29%
+- S+B reads ≈ 14%
+
+Even though "X-share = 29% savings" looks attractive, in practice
+multiple SGs on the same Apple-Silicon core reading the same `X[m,:]`
+close in time **hit in the per-core L1/L2 cache** for nearly all
+of those reads. The catalog speedup assumes the X read traffic
+genuinely goes to DRAM; on chips with good inter-SG cache reuse,
+it doesn't.
+
+Adding explicit TG-mem X-share THEN adds:
+- A cooperative load loop (`for (i = tid; i < K4; i += thr_per_tg)`)
+- A `threadgroup_barrier(mem_flags::mem_threadgroup)`
+- 2KB of TG-mem allocation per TG (reduces achievable SG occupancy
+  on cores where TG-mem is shared with weight cache).
+
+On Qwen3.6-35B-A3B (M4 Max, K=2048, post-B6) the net was **-1 to
+-2%** at both WG=2 and WG=4. Reverted.
+
+Heuristic for whether B4 will help on YOUR target:
+- **Apply B6 first.** If W is no longer the dominant traffic
+  source (B6 didn't change the picture much), B4 likely helps.
+- **Profile with KPROF.** If the linear_q8 kernel is still well
+  below the W-bandwidth floor (e.g. <40% of theoretical peak),
+  cache hits aren't yet saturating — B4 may help.
+- **If at the W-BW floor already**, B4 is risky. Try at WG=2
+  first (smaller barrier cost) before WG=4.
+
+Always **measure with best-of-5 + thermal cool-down**, not a
+single run. The catalog's 1.05–1.10× is a CHIP/MODEL/STAGE-
+specific figure, not a guarantee.
