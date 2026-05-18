@@ -161,6 +161,20 @@ Rule: if K_OUT=X helps but X+1 (or 2X) hurts, X is your sweet spot.
 Default to K_OUT=4 for q8/affine dequant. Revisit only for bf16 dense
 weights or after MMA has displaced GEMV.
 
+**Update — the rule survives the B6 uint4 amortization rewrite**:
+After applying catalog B6 (uint4 W loads, one (s,b) per 16 q8
+weights), the inner loop becomes much heavier — each lane now reads
+`4 X registers (x0..x3)` per iter and runs 4 dot-products against
+4 dequantized float4s per output. We re-tried K_OUT=8 hoping the
+much-shorter outer loop would amortize the bigger inner block.
+**It regressed again, harder**: Qwen3.6 decode 103 → 90.7 tok/s
+(-12% wall) despite the simpler outer loop. The register footprint
+of the uint4 inner block × K_OUT=8 (4 X regs + 8 acc regs + 8
+running W regs) sits well above the per-thread budget on M4 Max.
+Don't re-litigate K_OUT after any inner-loop rewrite that grows
+the per-iter register footprint; the sweet spot only moves DOWN
+with heavier inner loops, never up. **Stay at K_OUT=4.**
+
 # 9. Host-side breaks are the single biggest hidden cost
 
 A naive port has commit_wait + cb = new_cmdbuf() every time the host
@@ -998,6 +1012,35 @@ almost always a regression.
 `up_proj` epilogue cost 50 ms wall while removing 28 silu_mul
 dispatches that totaled only ~15 ms GPU. The `gate || up` parallel
 overlap was worth more than the elemwise we removed. Reverted.
+
+**Second example (Qwen3.6-35B-A3B, MoE)**: we tried fusing the per-
+expert `gate_proj + up_proj + silu_mul` gather chain into a single
+`linear_q8_gather_swiglu_bf16` kernel that computes `silu(g) * u`
+directly into its output. KPROF showed `silu_mul` at only 2.1% of
+GPU time, but the temptation was "fewer kernels = less dispatch
+overhead". The fused kernel was correct (tokens matched), but
+decode dropped from 98.4 → 98.1 tok/s — no win. Why: the
+concurrent encoder was already running the two gather dispatches
+(`gate_proj` and `up_proj` for the same expert) in parallel,
+because they read the same X and write to disjoint output buffers
+(no barrier between them in the dispatch graph). Fusing them
+serialized that overlap. The 2.1% we removed was less than the
+50% parallelism we destroyed.
+
+**General check before fusing ANY pair of kernels**: open
+`main.c`, find both dispatches, look at what's between them.
+- If there's a barrier between them, they're already serialized;
+  fusion can win (saves one dispatch + redundant memory traffic).
+- If they're in the same no-barrier block, the encoder is running
+  them concurrently; fusion will serialize them and you'll lose
+  the parallelism. Check that the savings (re-read of one input,
+  one dispatch overhead) exceeds whatever GPU time you currently
+  hide under the other kernel.
+
+The safe fusions are LINEAR_FUSED_WITH_ITS_OWN_EPILOGUE (residual,
+silu, gelu, scale) where the post-op consumes only the kernel's
+own output and can't run before it anyway. Inter-kernel fusion
+across `X || Y` parallel pairs is almost always negative.
 
 # 43. `id<MTLBuffer>` conforms to `id<MTLAllocation>` but you must declare `__strong`
 

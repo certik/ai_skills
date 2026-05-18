@@ -20,7 +20,7 @@ each section the entries are roughly in the order you'd apply them.
 ## Table of contents
 
 - [A. Host-side scheduling](#a-host-side-scheduling) — cmdbuf batching, param ring, pipeline, concurrent encoder, parallel weight loader
-- [B. GEMV (decode Linear)](#b-gemv--decode-time-linear-layers) — simdgroup-per-output, bfloat4, qmv4 register tile, TG-mem X share, residual epilogue
+- [B. GEMV (decode Linear)](#b-gemv--decode-time-linear-layers) — simdgroup-per-output, bfloat4, qmv4 register tile, TG-mem X share, residual epilogue, uint4 W loads w/ amortized (s,b) for q-affine dequant (B6)
 - [C. GEMM (prefill Linear)](#c-gemm--prefill-time-linear-layers) — simdgroup_matrix MMA, tile sweep (incl. WN as register-pressure relief), fused-op templates, aspect-ratio dispatch (K>N AND small-N axes)
 - [D. SDPA](#d-sdpa--attention) — parallel softmax, online softmax, multi-SG, K-per-iter ILP unrolling, sliding KV
 - [E. MoE](#e-moe--typically-the-biggest-bottleneck) — decode qmv4, fused gate_up_swiglu, prefill sorted-gather, fused combine_scatter
@@ -384,6 +384,106 @@ dispatch (see `references/gotchas.md` #21).
 **Snippet**: `patterns/gemv_with_residual_epilogue.metal`
 
 **Commits**: 130075a, 4e3bb14, ba83808.
+
+### B6. Amortize scale/bias across the quant group (uint4 W loads)
+
+**What**: In an affine-quantized GEMV (q8 with `group_size = 64`,
+or q4 with `group_size = 32`), the dequant cost in MLX-style ports
+is dominated by the **scale/bias loads**, not the W byte loads.
+The naive inner loop reads one uint32 of packed W per iter (4
+weights), then reloads `(scale, bias)` from device memory every
+iter even though all 4 weights share the same `(s, b)`. Two
+properties combine to make this wasteful:
+
+1. The quant group is wider than a single packed word (16
+   q8-weights fit inside one 64-element group; 8 q4-weights fit
+   inside one 32-element group).
+2. `(s, b)` is per-group — so a single `(s, b)` load can dequantize
+   a whole `uint4` of packed W (= 16 q8 weights or 32 q4 weights).
+
+Fix: load packed W as `uint4` (16 bytes) per outer iter instead of
+`uint32`. Reuse one `(s, b)` across all 16 weights. The outer loop
+iterates `K / 16` instead of `K / 4`, and you do 4× fewer device
+reads of `S[]` and `Bq[]` per output. Inside the iter, unpack the 4
+words with a small helper:
+
+```metal
+static inline float4 lq8_deq_word(uint w, float s, float b) {
+    float4 v;
+    v.x = float((w      ) & 0xffu) * s + b;
+    v.y = float((w >>  8) & 0xffu) * s + b;
+    v.z = float((w >> 16) & 0xffu) * s + b;
+    v.w = float((w >> 24) & 0xffu) * s + b;
+    return v;
+}
+
+for (uint u4 = lane; u4 < K_u4; u4 += SIMD_WIDTH) {
+    uint k4_base = u4 << 2;
+    float4 x0 = float4(xrow4[k4_base + 0]);  // 4 × bfloat4 X reads
+    float4 x1 = float4(xrow4[k4_base + 1]);  // reused across K_OUT
+    float4 x2 = float4(xrow4[k4_base + 2]);
+    float4 x3 = float4(xrow4[k4_base + 3]);
+    uint g = u4 >> 2;                        // same group for all 16 weights
+    for (uint o = 0; o < K_OUT; ++o) {
+        uint4 wv = w_rows4[o][u4];           // one uint4 = 16 q8 weights
+        float s = float(s_rows[o][g]);       // ONE (s,b) load per uint4
+        float b = float(b_rows[o][g]);
+        acc[o] += dot(x0, lq8_deq_word(wv.x, s, b));
+        acc[o] += dot(x1, lq8_deq_word(wv.y, s, b));
+        acc[o] += dot(x2, lq8_deq_word(wv.z, s, b));
+        acc[o] += dot(x3, lq8_deq_word(wv.w, s, b));
+    }
+}
+```
+
+**Why it wins**: Apple GPUs at decode are W-bandwidth bound, but the
+W-bandwidth budget includes `(s, b)` traffic. A per-uint32 loop reads
+`8 bytes` of `(s, b)` per `4 bytes` of W per output — `(s, b)` are
+half the traffic. Amortizing over 16 q8 weights drops `(s, b)` to
+1/8 of the W-byte traffic, putting the budget back on the W bytes
+where it should be.
+
+**When**: After B1–B3 are in. The signal is "linear_q8 (or your
+quantized GEMV family) is the dominant kernel by 70%+ in KPROF and
+it's at ~25-35% of theoretical W-BW peak". If you're already at
+~50%+ of theoretical W-BW peak, you're at the bandwidth floor and
+this technique has nothing left to give.
+
+**Speedup**: 1.15–1.20× decode on the whole pipeline when q8 GEMV
+is the dominant kernel family. Qwen3.6-35B-A3B (linear_q8 ≈ 75%
+of GPU): decode 82.8 → 98.4 tok/s (+18.7%). Bigger speedup on
+smaller models where linear_q8 is an even larger fraction.
+
+**Constraints**:
+- `K % 16 == 0` (or `K % (4 × pack_unit)` for q4; trivial for all
+  transformer K values).
+- W must be stored as `device const uint4*`, which is the natural
+  layout of `device const uint*` — no on-disk format change needed.
+  Just `reinterpret_cast` the pointer.
+- The helper compiles down to 4 byte extracts + 4 FMAs — no SIMD
+  shuffle, no extra ALU pressure.
+
+**Compose with**: B3 (K_OUT register tile) — they're independent and
+multiplicative. Apply both. Note that **K_OUT=8 still regresses even
+with uint4 W loads** — `4 X registers per uint4 × K_OUT=8 outputs ×
+4 acc lanes` exceeds the per-thread register budget; the compiler
+spills. Stick to K_OUT=4 with uint4 (gotcha #8).
+
+**Apply to**: every `linear_q8_*` kernel — bare, with-residual, and
+gather variants all benefit. Touched 3 kernels in Qwen3.6 in one
+commit.
+
+**Snippet**: `patterns/linear_q8_uint4_amortize_sb.metal`
+
+**Commit**: cba7169 (Qwen3.6 — `linear_q8 uint4 W loads (1 (s,b) load
+per 16 q8) — decode +18.7% (82.8→98.3 tok/s)`).
+
+**Generalization**: This is "amortize per-group state across the
+group". The same principle applies to q4 (one `(s, b)` per `uint`-of-
+packed-q4 = 8 weights), mxfp4 (one shared exponent per 32-byte
+group → load all 32 weights with one `uint8`-vector load), and any
+future block-quant format where the group is wider than the natural
+packed-word width.
 
 ---
 
@@ -863,6 +963,48 @@ argmax shows up as a fat slice in the profile.
 
 **Commit**: e34bf80.
 
+**Two flavors — pick by vocab size**:
+
+| Vocab `V`         | Flavor                          | Why                                                |
+|-------------------|---------------------------------|----------------------------------------------------|
+| ≤ ~64k            | **Single-TG, 256 threads**      | One TG fully saturates the lanes; no merge needed. |
+| ≥ ~100k (modern)  | **2-stage, `N_TG` TGs**         | One TG uses one GPU core; need `N_TG ≈ 64` to fill 40+ core M4 Max. |
+
+The 2-stage variant for huge V is a separate kernel pair, not a
+parameter tweak. **You will not notice the need for it in early
+optimization** — at 40 tok/s decode you'll celebrate F1 single-TG
+and move on. Re-profile once decode is mid-pipeline. If KPROF
+still shows argmax at 200+ µs/call on a single TG with `V > 100k`,
+that's a 1-core-bound kernel hiding inside an otherwise saturated
+pipeline.
+
+**Stage 1**: `N_TG` threadgroups (each 256 threads) each scan a
+contiguous tile of `V / N_TG` elements and write one
+`(max_val, max_idx)` partial to `part_max[tg_id]`, `part_idx[tg_id]`.
+
+**Stage 2**: 1 TG of 32 threads (one SG) reduces `N_TG` partials to
+a single index via `simd_max` + `simd_ballot` + `simd_shuffle`. No
+TG-mem needed at this scale.
+
+Buffer sizes are tiny (`N_TG × 8 bytes`); allocate once at startup.
+
+**Hazard**: stage 2 must read what stage 1 wrote, so they live in
+the SAME cmdbuf with a barrier (or in different cmdbufs — Metal
+queue order gives free RAW between cmdbufs, gotcha #13). Do NOT
+issue them concurrently.
+
+**Speedup of 2-stage vs single-TG**: Qwen3.6 (V=248320, 1 TG = 253
+µs/call → 2-stage ≈ 10 µs/call, -150 µs/token): decode 98.4 → 101.5
+tok/s (+3.2%). The win scales with `V` — bigger vocab = bigger win,
+because the 1-TG single-core ceiling stays at ~1 µs / 1000 elements
+regardless of GPU size.
+
+**Pattern updates**: see the `argmax_stage1_bf16` / `argmax_stage2_bf16`
+section at the bottom of `patterns/argmax_parallel.metal`.
+
+**Commit**: 6c49e38 (Qwen3.6 — `parallel argmax (2-stage) — decode
++3.2% (98.4→101.5 tok/s)`).
+
 ### F2. Parallel topk_softmax (router)
 
 **What**: SIMD-group-per-row router softmax + top-K. Each lane holds
@@ -983,6 +1125,44 @@ category, different reduction semantics.
 
 **Commits**: Dream-7B `src-metal` f6a3e44 (rmsnorm 4 SGs/row, -4%
 wall), fbd01fe (rmsnorm 16 SGs/row, -3% more on top, per-call -85%).
+
+**Autoregressive datapoint (M=1)**: F4 is not just for diffusion
+LLMs. In autoregressive decode, every row of the per-step rmsnorm
+is `M=1` and you launch a single 1-SG-per-row dispatch — that's
+**ONE SG total** for the whole rmsnorm call. On a 40-core M4 Max
+that's 2.5% utilization, and at `D=2048` it's still 23+ µs/call.
+With 60+ rmsnorm calls per forward (one before each of 24 attention
++ MLP blocks + a final), this is a meaningful slice — Qwen3.6-35B
+KPROF showed rmsnorm at 15% before F4, 2.8% after.
+
+For Qwen3.6 at `D=2048, M=1`: `N_SG=4` → +16.1% decode (71 → 83
+tok/s); bumping to `N_SG=8` → another +1% on top (101.5 → 102.5).
+`N_SG=16` was a tie — by then per-lane work is 8 elements, TG-mem
+merge overhead approaches the per-lane work. Sweep `N_SG ∈ {4, 8,
+16}` per D; pick the smallest that ties the largest (less TG-mem
+pressure, lower TG-size).
+
+**Where to dispatch the multi-SG variant**: ONLY at the call sites
+where `M` is small (i.e. decode `M=1` or diffusion `M=BL=16` per
+row). Keep the single-SG kernel for prefill `M ≥ Lq=16` and for
+in-attention rmsnorms with large effective `M` (e.g. `q_norm`,
+`k_norm` over all heads). Branch in `main.c` by `Lq` — this is a
+mini decode/prefill split (catalog G) on the rmsnorm-only axis.
+
+```c
+// Dispatch by phase: multi-SG only when launch shape would
+// undersubscribe the GPU.
+if (Lq < 8) {
+    // decode-style M=1: spawn N_SG SGs per row.
+    gpu_cmdbuf_dispatch(cb, pso_rmsnorm_msg, ..., (RMSNORM_MSG_NSG * 32, M, 1), ...);
+} else {
+    // prefill M >= 8: 1 SG per row already gives enough SGs total.
+    gpu_cmdbuf_dispatch(cb, pso_rmsnorm,     ..., (32, M, 1), ...);
+}
+```
+
+**Commit**: 46c7949 (Qwen3.6 — N_SG=4, decode +16.1%); dbd51e7
+(N_SG 4→8 follow-up, +1.0%).
 
 ---
 

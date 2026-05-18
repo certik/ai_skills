@@ -219,14 +219,61 @@ truth, but this list saves you most of the exploration cost.
 Steps 9–14 took the Qwen3.6-35B-A3B reference port from 41.5 → 69.5
 tok/s, hitting MLX parity (MLX runs at ~70.1 tok/s on the same M4 Max).
 
+### Second pass — pushing PAST MLX parity (~69.5 → ~102.5 tok/s for Qwen3.6)
+
+Once you're at MLX parity (or above) it's tempting to stop. But the
+parity bar is set by what MLX has been optimized for — modern Apple-
+silicon chips often have enough headroom for *another* 40–50%. Three
+techniques applied on top of MLX-parity Qwen3.6 took decode from
+71.3 → 102.5 tok/s (+44%, +46% over MLX). Re-profile with KPROF
+first; the bottleneck shifts dramatically after step 14.
+
+15. **F4 multi-SG rmsnorm AT M=1** (autoregressive). At decode the
+    rmsnorm dispatch is `M=1` → ONE SG total → 2.5% GPU
+    utilization. Bump to `N_SG=4`. Qwen3.6 `D=2048`: 71.3 → 82.8
+    tok/s (+16.1%). Branch in main.c by `Lq < 8` so prefill still
+    uses single-SG. F4 is in the catalog as a diffusion technique
+    — at M=1 it's an even bigger win because the under-subscription
+    is 4–16× worse.
+16. **B6 uint4 W loads in quantized GEMV.** Load packed W as
+    `uint4` instead of `uint32` → reuse one `(scale, bias)` load
+    per 16 q8 weights (the quant group). 4× fewer `(s, b)` device
+    reads = the dominant cost of MLX-style quant dequant.
+    Qwen3.6: 82.8 → 98.4 tok/s (+18.7%). Single biggest second-
+    pass commit. See catalog B6.
+17. **F1 2-stage parallel argmax FOR LARGE V.** Single-TG F1 still
+    uses ONE GPU core (~253 µs/call at V=248k). Split into 64 TGs
+    + 1 reducer TG (~10 µs total). Qwen3.6: 98.4 → 101.5 tok/s
+    (+3.2%). Only matters once V is huge and everything else is
+    optimized — but then the 1-core ceiling pops up clear as day.
+18. **F4 N_SG sweep — revisit AFTER B6 + F1.** Once the heavy
+    kernels shrink, the relative cost of rmsnorm grows back. Try
+    bumping `N_SG=4` → `N_SG=8` (`N_SG=16` ties at D=2048; sweep
+    per-D). Qwen3.6: 101.5 → 102.5 tok/s (+1.0%). Cheap, free
+    1-line change.
+
+After these, KPROF shows `linear_q8` family at ~77% of GPU at ~50%
+of theoretical W-BW peak — you're at the W-bandwidth floor on
+quantized weights, and further wins require *algorithmic* changes
+(mxfp4, different quant format, smaller weights). The remaining
+small kernels (sdpa 3.3%, gated_delta 3.4%, silu_mul 2.1%, etc.)
+each cap at <1% wall.
+
 ### Optimizations that often land in the noise band
 
 (Validated on Qwen3.6-35B-A3B; may differ on your model.)
 
 - bfloat4 vector loads in isolation (baked into B1 already).
-- qmv4 K_OUT=4 (q8 dequant is BW-bound, not register-bound; K_OUT=8
-  regressed).
+- qmv4 K_OUT=8 — regressed at every layout we tried, including
+  bare q8 (41 → 31 tok/s) AND post-B6 uint4 layout (103 → 90.7
+  tok/s). The sweet spot only moves DOWN with heavier inner
+  loops. Stay at K_OUT=4. (gotcha #8 has the second datapoint.)
 - Concurrent encoder ALONE without barrier surgery — A8 is the win.
+- **Fusion across kernels that the concurrent encoder is already
+  overlapping** — see gotcha #42. The Qwen3.6 fused
+  `gate+up+silu_mul` was a *correct* kernel that regressed by 0.3%
+  because it serialized a `gate || up` overlap. Cheap to try, but
+  check the dispatch graph FIRST.
 
 ### Skip for decode-only goals
 
@@ -286,7 +333,7 @@ details.
 | Section | Category                    | Key techniques                                                       |
 |---------|-----------------------------|----------------------------------------------------------------------|
 | A       | Host-side scheduling        | cmdbuf batching · param ring · 2-deep pipeline · concurrent encoder · parallel pread loader · parallel independent chains (A8) |
-| B       | GEMV (decode Linear)        | SG-per-output · bfloat4 · qmv4 register tile · TG-mem X share · residual epilogue |
+| B       | GEMV (decode Linear)        | SG-per-output · bfloat4 · qmv4 register tile · TG-mem X share · residual epilogue · uint4 W loads w/ amortized (s,b) for q-affine (B6) |
 | C       | GEMM (prefill Linear)       | simdgroup_matrix MMA · tile-size sweep (incl. WN as register-pressure relief) · fused-op templates · aspect-ratio dispatch K>N (C4) AND small-N (C5) |
 | D       | SDPA (attention)            | parallel softmax · online softmax · multi-SG · K-per-iter ILP unrolling · sliding KV cache       |
 | E       | MoE                         | decode qmv4 · fused gate_up_swiglu · prefill sorted-gather GEMM · fused combine_scatter |
@@ -342,7 +389,15 @@ optimization:
   decode at ~40 tok/s once everything else is in). Apply F1 immediately.
 - **K_OUT in qmv4 has a sweet spot.** 4 wins for q8 affine dequant; 8
   hurts (41 → 31 tok/s in one port) due to register spills. Measure
-  before scaling up. (gotcha #8)
+  before scaling up. The sweet spot only moves DOWN with heavier
+  inner loops (e.g. after applying B6 uint4 W loads, K_OUT=8
+  regressed AGAIN — 103 → 90.7 tok/s). Stay at 4. (gotcha #8)
+- **Quant GEMV: amortize `(scale, bias)` across the quant group.**
+  Naive q8 inner loops re-read `(s, b)` every uint32 even though
+  they're constant for the whole group. Load packed W as `uint4`
+  (16 q8 weights = one 64-elem group) → one `(s, b)` per uint4.
+  Single biggest second-pass win on Qwen3.6 — +18.7% decode.
+  Same trick generalizes to q4 and mxfp4. See catalog B6.
 - **The first generated token IS the prefill argmax.** When wiring up a
   2-deep pipeline that primes itself, it's easy to skip emitting this
   token, shifting all output by 1. (gotcha #10)
@@ -468,7 +523,8 @@ not drop-ins. Full inventory in `references/catalog.md`. Highlights:
 - **A** (host scheduling) — `cmdbuf_*.c`, `concurrent_encoder.c`,
   `load_parallel_pread.c` (incl. sub-shard + shard-buffer-view variants),
   `param_buf_*.c`.
-- **B/C** (GEMV/GEMM) — `gemv_*.metal`, `gemm_simdgroup_matrix_mma.metal`.
+- **B/C** (GEMV/GEMM) — `gemv_*.metal`, `gemm_simdgroup_matrix_mma.metal`,
+  `linear_q8_uint4_amortize_sb.metal` (B6, q-affine `(s,b)` amortization).
 - **D** (SDPA) — `sdpa_sg_per_head_decode.metal`,
   `sdpa_online_softmax.metal`, `sdpa_multi_sg_online_merge.metal`.
 - **E** (MoE) — `mxfp4_*.metal`, `moe_sorted_gather_*.metal`.
