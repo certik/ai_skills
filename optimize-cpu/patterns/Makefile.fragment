@@ -1,0 +1,35 @@
+# patterns/Makefile.fragment — recommended CC + CFLAGS + LDFLAGS for an
+# optimized CPU build.
+#
+# Drop these into your top-level Makefile, replacing the build-c-reference
+# defaults.
+
+# Use gcc explicitly. Plain `CC ?= gcc` allows Make's built-in CC=cc to
+# win, which can silently fall back to the system C compiler with different
+# optimization defaults. Use `:=` to lock it.
+CC := gcc
+
+# -O3 -march=native pulls in AVX2 + FMA + F16C on AMD EPYC 7763 (and
+#  similar AVX-512 on Sapphire Rapids / Sierra Forest). Without
+#  -march=native you're on the SSE2 baseline (4-wide instead of 8-wide).
+# -fopenmp parallelizes across cores.
+# -funroll-loops helps the inner FMA reduction.
+# -ffast-math allows the vectorizer to reorder additions — necessary for
+#  the K-tile linear_dot4 to actually vectorize. See SKILL.md "Validation
+#  discipline" for the token-drift tradeoff.
+# -flto inlines across translation-unit boundaries (worth ~10-12% on
+#  prefill; decode unaffected because it's bandwidth-bound).
+CFLAGS  := -std=gnu11 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
+           -O3 -march=native -mtune=native -funroll-loops -ffast-math \
+           -fopenmp -flto \
+           -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+           -Isrc-cpu
+
+# LTO must be passed to BOTH compile and link, plus -fopenmp at link
+# time to bring in libgomp.
+LDFLAGS := -lm -fopenmp -flto
+
+# Override LINEAR_TILE_K from the command line if you want to sweep it
+# (default 128 has been empirically validated as best on EPYC 7763; if
+# you're on a CPU with a very different L1, try 64, 128, 256, 512).
+# Example: `make CFLAGS+="-DLINEAR_TILE_K=64"`.
