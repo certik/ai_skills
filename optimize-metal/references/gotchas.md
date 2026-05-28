@@ -64,6 +64,10 @@ the same symptoms again.
 | 54 | Optimal SDPA `N_SG` is NOT the theoretical perfect-occupancy divisor — sweep on LONG-decode, not short                | SDPA tuning |
 | 55 | Stale binary trap — user-reported tok/s regression that disappears on a clean rebuild is a thermal/binary cache artifact | Measurement |
 | 56 | B4 (TG-mem X-share) can REGRESS on chips with strong inter-SG cache reuse — measure, don't assume                    | GEMV tuning |
+| 57 | Per-layer `embed_gather` kernels (Gemma 3/4-style) hide a 1-SG-per-row bug worth ~25 ms/token of pure latency        | Dispatch    |
+| 58 | A8 concurrent encoder buys nothing on dense bf16 models — every chain is DRAM-saturated, not parallel-deficient      | Strategy    |
+| 59 | The "are we done?" DRAM-BW ceiling check — per-token weight bytes ÷ peak GB/s ≥ measured ms/token                    | Strategy    |
+| 60 | K_OUT=8 regresses on bf16 GEMV too — the K_OUT=4 sweet spot is independent of precision                              | Register tile |
 
 ---
 
@@ -180,6 +184,18 @@ running W regs) sits well above the per-thread budget on M4 Max.
 Don't re-litigate K_OUT after any inner-loop rewrite that grows
 the per-iter register footprint; the sweet spot only moves DOWN
 with heavier inner loops, never up. **Stay at K_OUT=4.**
+
+**Update — also confirmed neutral on plain bf16 dense GEMV**:
+Tested K_OUT=8 against K_OUT=4 on Gemma 4 E4B (bf16, M4 Max) for
+the two extreme N: `lm_head` (N=262144) and Q-proj (N=2048). Both
+measured within ±0.4% (50.7-50.9 tok/s) — pure noise. Tempting to
+say "bf16 doesn't have the dequant pressure, so K_OUT=8 should
+be safer" but it doesn't matter: at any reasonable N the GPU is
+already saturated with SG count at K_OUT=4 (e.g. lm_head spawns
+65k SGs vs M4 Max's ~160 concurrent capacity = 410 waves), and
+K_OUT=8 just halves the wave count without changing the wave
+duration. **Stay at K_OUT=4 for bf16 too.** See gotcha #60 for
+the full Gemma 4 datapoint.
 
 # 9. Host-side breaks are the single biggest hidden cost
 
@@ -1630,3 +1646,182 @@ Heuristic for whether B4 will help on YOUR target:
 Always **measure with best-of-5 + thermal cool-down**, not a
 single run. The catalog's 1.05–1.10× is a CHIP/MODEL/STAGE-
 specific figure, not a guarantee.
+
+# 57. Per-layer `embed_gather` kernels (Gemma 3/4-style) hide a 1-SG-per-row bug worth ~25 ms/token of pure latency
+
+Modern architectures (Gemma 3, Gemma 4, some Llama variants) add a
+**per-layer embedding** read on every layer: an extra `[V, L*D_pli]`
+embedding table from which each layer gathers one row per token and
+adds it to the hidden state. In Gemma 4 E4B that's `D=10752` bf16 per
+row, ×42 layers, ×1 token at decode — a small dispatch *but* called
+**42× per token**.
+
+If the port-c-to-metal naive kernel uses 1 thread per output row
+(very common — the C version is a `for (d=0; d<D; d++) out[d]=tab[r,d]`
+loop and the naive Metal port keeps tg=(1,1,1)), KPROF will show:
+
+    embed_gather_bf16   total=25060.6us  calls=42  us_per_call=596.7  (4.1%)
+
+That's **597 µs of single-threaded sequential bf16 reads PER LAYER**
+(M4 Max: 10752 bf16 = 21 KB sequentially streamed at ~36 GB/s instead
+of the ~410 GB/s the GPU is capable of). At 42 layers/token this
+costs **25 ms/token of pure latency**.
+
+This is structurally the same bug as gotcha #17 (TG=(1,1,1) waste)
+but **far more expensive** because:
+- D is large (10000+) — the serial loop is long.
+- It runs PER LAYER PER TOKEN (vs once-per-token elemwise).
+- Sequential bf16 reads from DRAM at 1 thread/load hit memory-latency
+  floor (~10 cycles/load), not bandwidth.
+
+**Fix**: TG-per-row + 128-thread cooperative bfloat4 copy. All embed
+dim values in Gemma-family models are divisible by 4, so the bfloat4
+loads land at 8-byte-aligned addresses.
+
+```metal
+kernel void embed_gather_bf16(
+    device const bfloat4* table   [[buffer(0)]],   // [V, D/4]
+    device const uint*    ids     [[buffer(1)]],   // [M]
+    device bfloat4*       out     [[buffer(2)]],   // [M, D/4]
+    constant uint&        D       [[buffer(3)]],
+    constant uint&        M       [[buffer(4)]],
+    uint  tid_in_tg [[thread_position_in_threadgroup]],
+    uint  tg_id     [[threadgroup_position_in_grid]],
+    uint  threads_per_tg [[threads_per_threadgroup]])
+{
+    if (tg_id >= M) return;
+    uint  D4  = D / 4u;
+    uint  row = ids[tg_id];
+    device const bfloat4* src = table + (size_t)row * D4;
+    device bfloat4* dst       = out   + (size_t)tg_id * D4;
+    for (uint i = tid_in_tg; i < D4; i += threads_per_tg) dst[i] = src[i];
+}
+```
+
+Dispatch:
+```c
+gpu_cmdbuf_dispatch(cb, pso_embed_gather, args, 5,
+                    (size_t)M * 128, 1, 1,   // total threads = M rows × 128
+                    128, 1, 1);              // 128 threads per TG = 4 SGs
+```
+
+**Measured impact (Gemma 4 E4B, M4 Max, bf16)**:
+- Before: 596.7 µs/call, 4.1% of GPU (per-layer embed alone)
+- After:  9.0 µs/call, 0.1% of GPU
+- Wall: short bench 48.7 → 50.9 tok/s (+4.5%), long bench
+  43.7 → 45.3 tok/s (+3.7%). **Crossed MLX parity to MLX-beating
+  on both benches**.
+
+**When to check for this**: any model with per-layer additional
+embeddings (Gemma 3, Gemma 4, some recent multimodal models). Look
+for a `per_layer_input` / `per_layer_embed` tensor in the safetensors
+index, or for an `embed_gather` call inside the per-layer loop in
+your `forward()` (not just before/after it). Run KPROF — if
+`embed_gather` shows ≥ 2% of GPU with `us_per_call > 50`, you have
+this bug.
+
+# 58. A8 concurrent encoder buys nothing on dense bf16 models — every chain is DRAM-saturated
+
+Catalog A8 ("parallelize independent chains via concurrent encoder")
+was THE big late-stage win on Qwen3.6-35B-A3B (quantized MoE, +3-5%
+final). Tempting to apply on every model. But on a **dense bf16**
+model like Gemma 4 E4B (no quantization, no MoE), the A8 framework
+will run cleanly but produce **zero speedup or slight regression**.
+
+**Why**: A8 wins when one chain has GPU headroom that another
+chain's barriers were forcing idle. In quantized models, the
+linear_q8 kernel is at ~50% of theoretical W-BW peak (dequant
+overhead), leaving 50% of DRAM bandwidth available for a parallel
+chain. In **dense bf16**, the linear_k4_k8 kernel is at **~100%**
+of peak (just streams bf16 weights directly). There is no spare
+DRAM bandwidth for a second chain to consume. Running two BW-bound
+kernels concurrently → each takes 2× as long → same wall.
+
+**Concrete (Gemma 4 E4B, M4 Max)**:
+- KPROF: top two kernels (`linear_k4_k8` 48%, `gate_up_geglu` 41%)
+  read weights at ~100-110% of 410 GB/s peak (L1/L2 cache hits).
+- A8 of Q+K+V projections + qknorm + vnorm chain (4 independent
+  GEMVs): tokens correct, no speedup. Adding the encoder's
+  autobar=false toggling cost ~2% wall.
+- Reverted A8, no net change. Stayed at 50.9 tok/s.
+
+**Diagnostic before applying A8**: profile each candidate kernel's
+% of DRAM peak. If both kernels in the candidate parallel pair are
+each already ≥ 90% of DRAM peak in isolation, A8 will not help.
+Apply A8 only when one chain has clear compute headroom (SDPA,
+small elemwises) or when at least one chain is bottlenecked on
+something other than DRAM (e.g. dispatch latency).
+
+**General rule**: A8 helps quantized/MoE models (Qwen3.6, Mixtral,
+DeepSeek-V2/V3 style). For dense bf16 (Gemma 4, Llama-3 bf16,
+Mistral-7B bf16), skip A8 and finish at MLX parity via embed_gather
+fix + standard SG-per-output GEMV + multi-SG SDPA.
+
+# 59. The "are we done?" DRAM-BW ceiling check
+
+Late in optimization, decide whether further effort is worth it
+with this 4-line analytical check (separate from KPROF):
+
+1. Sum the weights you read PER TOKEN at decode (skip the embedding
+   table — only 2 rows are gathered per token).
+2. Divide by peak LPDDR5 bandwidth (M4 Max: 410 GB/s; M3 Max: 400;
+   M2 Max: 400; M1 Max: 400; Pro/base chips ≈ 200; Ultra: 800).
+3. That's your theoretical minimum ms/token.
+4. Compare to measured wall ms/token. If ≥ 95%, you are at the
+   wall — STOP. Further wins require quantization or a smaller
+   model.
+
+**Worked example (Gemma 4 E4B, M4 Max)**:
+- Per token weights: 42 layers × ~200 MB + lm_head 1.34 GB +
+  per_layer_model_projection 55 MB ≈ **8.9 GB** for short bench.
+- 8.9 GB / 410 GB/s = 21.7 ms/token = **46.1 tok/s ceiling**.
+- Measured: 49.7 tok/s short. That's **108% of theoretical** (cache
+  hits help). We're past the wall. STOP.
+- Long bench adds KV cache reads (~3.9 MB/token × growing context
+  / 410) → ~22 ms/token = 45 tok/s ceiling. Measured 45.6. Same.
+
+**For quantized models**: replace "weights bytes" with the actual
+on-disk byte count (q8 = N_params × 1.125 incl. scales/biases,
+q4 = N_params × 0.625, mxfp4 = N_params × 0.5625). Same math.
+
+If you're at < 60% of the ceiling, a lot of optimization remains.
+If at 80%, maybe one more pass. If at ≥ 95%, the *only* further
+wins are algorithmic (smaller model, lower precision). The
+catalog's A–I sections all assume sub-ceiling status; once
+you're at the ceiling they are no-ops.
+
+**Don't confuse "% of DRAM peak measured by KPROF on the dominant
+kernel" with this whole-decode ceiling**. KPROF often shows
+linear_k4_k8 at 100% of peak while the rest of the forward
+(rmsnorm, SDPA, elemwises) adds 5-10% extra wall. The ceiling
+above is the *aggregate* check.
+
+# 60. K_OUT=8 regresses on bf16 GEMV too — the K_OUT=4 sweet spot is independent of precision
+
+Gotcha #8 originally documented K_OUT=8 regression for q8 + q-affine
+(dequant overhead bloats the inner loop). The 2025 update added a
+second q8/uint4 datapoint. **Third datapoint, same conclusion, on
+plain bf16**:
+
+Tested two flavours of K_OUT on Gemma 4 E4B bf16 (M4 Max):
+- K_OUT=4 (current production)
+- K_OUT=8 inner-unrolled — `linear_k8_k8.metal` — used in
+  `lm_head` (N=262144) and Q proj (N=2048).
+
+Both within ±0.4% (50.7-50.9 tok/s) over best-of-5. Pure noise.
+No measurable win.
+
+**Why bf16 doesn't help here either**: even at lm_head's huge
+N=262144, K_OUT=4 spawns 65k SGs over the GPU. M4 Max has ~160
+concurrent SG capacity → 410 waves. The GPU is already fully
+subscribed. Halving the SG count via K_OUT=8 (to 32k SGs = 205
+waves) just halves the wave count while each wave does 2× the
+work. No dispatch-overhead amortization either — each SG already
+amortizes over K=2560 inner iterations, dispatch overhead is
+< 0.1% of kernel time.
+
+**Conclusion**: K_OUT=4 is universally the sweet spot on
+M4-generation Apple Silicon, across q8, q4, uint4, and bf16.
+Don't sweep K_OUT in your optimization workflow; just set it to 4
+and move on. (If you're on a future generation with much higher
+concurrent-SG capacity, e.g. > 500, this may flip — re-test then.)

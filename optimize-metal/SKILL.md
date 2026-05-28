@@ -300,47 +300,29 @@ each cap at <1% wall.
 - C1/C2/C3 (GEMM MMA for prefill) — only relevant if your goal is to
   match prefill speed.
 
+### Dense bf16 LLMs (Gemma 3 / Gemma 4 / Llama bf16 / Mistral bf16)
+
+Same default order from B1/D1/H1 up through SDPA endgame, but the
+late-stage list is different (per-layer `embed_gather` is the single
+biggest win on Gemma 3/4; A8/B4/B6/K_OUT=8 all skip). The DRAM-BW
+ceiling check often retires the model before chasing the last 1-2%.
+
+Full ordered list + skip rules + worked Gemma 4 E4B example (5.6 →
+49.7 tok/s, +3.1% over MLX) in **`references/dense-bf16.md`**.
+
 ### Diffusion LLMs (Dream / LLaDA / fastdllm)
 
-These are NOT autoregressive. The forward runs twice per block: once
-at `M = L` (prefetch) and many times at `M = BL` (refine). The naive
-host post-processing — per-position softmax + argmax + confidence — 
-dominates the MLX gap, and most A/H techniques (A4, A8) do less work
-or don't help. **Total wall (load + gen) matters as much as gen
-tok/s** — gen is only ~1 s, so a slow loader loses on `time ./binary`
-even with faster gen.
+NOT autoregressive — `forward` runs at two M shapes per block
+(prefetch `M=L`, refine `M=BL`), `host_post` (sampler softmax + argmax
++ confidence over V) is large and invisible to `gpu_busy`, and total
+wall (load + gen) matters as much as gen tok/s. Different attack
+order: A9 → F3 (host_post → GPU) → H3 (single-row prefetch lm_head) →
+C2 dual-tile-by-M → C2 BK/WN sweep → B5 → C4/C5 aspect-ratio routing
+→ D5 SDPA K-per-iter ILP → F4 multi-SG rmsnorm. Skip A4 and A8.
 
-The wins, in order (see `references/diffusion-llm.md` for details and
-per-step Dream-7B numbers):
-
-0. **A9 parallel pread weight loader** — biggest user-visible win.
-   Dream-7B load 1.71 → 0.82 s, total 3.08 → 2.17 s, beats MLX 19%
-   on `time ./dream`. Apply FIRST.
-1. **F3 GPU per-row softmax + argmax + confidence** — replaces the
-   host `host_post` loop (often 0.25 s, invisible in `gpu_busy`).
-2. **H3 single-row prefetch lm_head** — output pruning via X offset.
-3. **C2 dual-tile-by-M** — two PSOs with different (BM, BK), picked
-   by `M > 16`. Refine ≠ prefetch best tile.
-4. **C2 BK ∈ {16, 32, 64} with WN tuning** — the "BK=16 maximum"
-   rule is a `WN=2` artifact. At `WN=4`, BK=64 fits at BM=16. Sweep
-   BK × WN; biggest mid-stage Dream-7B win was BK=64 WN=4 in BN=32
-   (-10% wall). See gotcha #41 + catalog C2.
-5. **B5 fused residual** — modest win, same as autoregressive.
-6. **C4 K > N aspect-ratio (BL ≥ 32)** — `use_bm32 = (M>16) && (K<=N)`.
-   Routes MLP down_proj to BM=16, doubles TG count. -12% wall BL=32.
-7. **C5 small-N aspect-ratio (refine)** — `use_bn32 = (M<=16) &&
-   (N<5120)`. -5.4% wall on Dream-7B BL=16.
-8. **D5 SDPA K-per-iter ILP unrolling** — process 8 K-vectors per
-   iter with 8 independent accumulators. -81% cumulative SDPA.
-9. **F4 multi-SG-per-row RMSNorm** — at M=BL=16, 1-SG-per-row spawns
-   only 16 SGs. Use 4 or 16 SGs/row. -7% cumulative wall.
-
-Skip A4 (refine step N+1 depends on step N argmax — no usable overlap)
-and A8 (the forward chain is mostly serial).
-
-`references/diffusion-llm.md` has the full worked Dream-7B example
-(naive ~10 s wall → 1.68 s gen / 2.17 s total on BL=16 long bench —
-39% faster than MLX gen, 19% faster on total wall).
+Full attack order, skip rules, profile recipe, and worked Dream-7B
+example (~10 s naive → 2.17 s total, +19% wall / +39% gen over MLX)
+in **`references/diffusion-llm.md`**.
 
 ## The optimization catalog
 
@@ -359,7 +341,7 @@ details.
 | E       | MoE                         | decode qmv4 · fused gate_up_swiglu · prefill sorted-gather GEMM · fused combine_scatter |
 | F       | Reductions                  | parallel argmax · parallel topk softmax · per-row softmax+argmax (F3, diffusion samplers) · multi-SG-per-row rmsnorm (F4, large D) |
 | G       | Decode/Prefill split        | two implementations, dispatch by Lq                                   |
-| H       | Host/GPU boundary cleanup   | glue kernels (H1, often biggest single win) · embed+forward+argmax merge · output-row pruning via X offset (H3) |
+| H       | Host/GPU boundary cleanup   | glue kernels (H1, often biggest single win) · embed+forward+argmax merge · output-row pruning via X offset (H3) · per-layer embed_gather TG-per-row (H4, Gemma 3/4) |
 | I       | Recurrent / SSM             | SG-per-(state_row, state_dim)                                         |
 
 Each catalog entry points to a code snippet under `patterns/` — those
@@ -390,138 +372,47 @@ For symptom-driven debugging recipes (token divergence localization,
 
 ## Top pitfalls (read these before you start)
 
-Each is a war story that cost at least one debug iteration. Full list
-in `references/gotchas.md`; here are the ones most likely to bite during
-optimization:
+The curated short-list of war stories most likely to bite during an
+optimization session lives in **`references/pitfalls.md`** — organised
+by what kind of debugging session you're about to have (encoding
+traps, correctness traps, profile-reading, tuning sweeps, regressions,
+weight loader, "unreproducible" benches). Read it once before you
+start; re-read whenever a benchmark goes sideways.
+
+The full numbered war-story archive (60 entries with full
+reproductions and fixes) is in **`references/gotchas.md`** — that's
+where each curated pitfall links to.
+
+The absolute must-internalize-before-you-touch-anything subset:
 
 - **`dispatchThreads:` takes TOTAL THREADS, not threadgroups**. For
-  SG-per-output kernels, you want `grid_x = 32 * N`. Passing `N` directly
+  SG-per-output kernels you want `grid_x = 32 * N`. Passing `N`
   silently launches `ceil(N/32)` SGs. (gotcha #2)
 - **KV cache `max_ctx` and SDPA TG-mem `MAX_CTX` must agree AND be ≥
-  prompt_len + max_tokens**. Silent buffer overruns produce wrong
-  tokens that look like numerical drift past the first ~32 tokens.
-  (gotchas #3, #15)
+  prompt_len + max_tokens**. Silent overruns produce wrong tokens
+  that look like numerical drift past ~32 tokens. (gotchas #3, #15)
 - **`gpu_busy << wall` after batched dispatches** → host-side breaks
   (look for `commit_wait` inside `forward()`); apply H1 glue kernels.
-  Usually the single biggest win. (gotcha #9)
+  Usually the single biggest win in the whole pipeline. (gotcha #9)
 - **Argmax over VOCAB=200k single-threaded** is by far the most common
-  "why is decode capped at <5 tok/s" answer (also caps mid-pipeline
-  decode at ~40 tok/s once everything else is in). Apply F1 immediately.
-- **K_OUT in qmv4 has a sweet spot.** 4 wins for q8 affine dequant; 8
-  hurts (41 → 31 tok/s in one port) due to register spills. Measure
-  before scaling up. The sweet spot only moves DOWN with heavier
-  inner loops (e.g. after applying B6 uint4 W loads, K_OUT=8
-  regressed AGAIN — 103 → 90.7 tok/s). Stay at 4. (gotcha #8)
-- **Quant GEMV: amortize `(scale, bias)` across the quant group.**
-  Naive q8 inner loops re-read `(s, b)` every uint32 even though
-  they're constant for the whole group. Load packed W as `uint4`
-  (16 q8 weights = one 64-elem group) → one `(s, b)` per uint4.
-  Single biggest second-pass win on Qwen3.6 — +18.7% decode.
-  Same trick generalizes to q4 and mxfp4. See catalog B6.
-- **The first generated token IS the prefill argmax.** When wiring up a
-  2-deep pipeline that primes itself, it's easy to skip emitting this
-  token, shifting all output by 1. (gotcha #10)
+  "why is decode capped at <5 tok/s" answer. Apply F1 immediately.
+- **K_OUT in qmv4 has a sweet spot. Stay at 4.** 8 hurts at every
+  precision measured (q8/uint4/bf16) due to register spills. Don't
+  even sweep it on the way up. (gotchas #8, #60)
 - **Concurrent encoder + missing barrier** = non-deterministic
-  divergence that often passes per-kernel tests (which serialize one
-  kernel at a time) but fails end-to-end. (gotchas #18, #26)
-- **bfloat4 alignment.** Load `bfloat4` only at 8-byte-aligned
-  addresses, or you'll get garbage on some Apple GPU generations.
-- **Premature multi-SG SDPA hides the real SDPA win.** Apply D1 (parallel
-  softmax) BEFORE D3 (multi-SG split), or you'll measure +5–10% and
-  conclude SDPA isn't worth optimizing. (gotcha #31)
-- **Tile-size cargo-culting.** MLX's tile sizes for M2 are not optimal
-  for M4 or M1. Always sweep `(BM, BN, WM, WN)` on your target
-  machine. (gotcha #32)
-- **Forgetting GQA in the SDPA tile.** The K/V head index is
-  `head_kv = head_q / (Nq/Nkv)`, not `head_q`. Easy to break during
-  tile refactorings. (gotcha #33)
-- **Fused-residual epilogue shifts the bf16 round point.** `y = W·x +
-  residual` rounds once (in f32) instead of twice; tokens may
-  legitimately differ — regenerate the oracle or loosen tolerance.
-  (gotcha #34)
-- **Persistent param buffer + 2-deep pipeline = race.** Duplicate the
-  param ring (`gpu_param_buf[slot]`, `slot ∈ {0,1}`) the same way you
-  duplicated the id ring. (gotcha #35)
-- **Diffusion-LLM samplers do CPU work invisible to `gpu_busy`.**
-  Per-step softmax/argmax/confidence over V shows up only in wall.
-  Add `host_post`; if > ~5% of wall, apply F3. (gotcha #36)
-- **Two M shapes need two PSOs.** When prefetch (M=L) and refine
-  (M=BL) differ by 4–5×, compile two GEMM PSOs with different
-  `(BM, BK)` and switch at dispatch by `M > 16`. Pad workspace buffers
-  to the larger `BM`. (gotcha #38)
-- **GEMM aspect-ratio routing — both K>N and small-N need attention.**
-  K>N matmuls at BM=32 BN=64 produce only N/BN TGs (`use_bm32 =
-  (M > 16) && (K <= N)`); small-N refine matmuls at M≤16 BM=16 N<5120
-  BN=64 are TG-starved on the N-axis (`use_bn32 = (M <= 16) &&
-  (N < 5120)`). (gotcha #39, catalog C4 + C5)
-- **"BK=16 is the maximum" is a `WN=2` artifact.** At `WN=4` per-SG
-  register pressure halves, unlocking BK=32/BK=64. Always sweep
-  BK ∈ {16,32,64} × WN ∈ {2,4} with the register-budget formula.
-  (gotcha #41, catalog C2)
-- **SDPA inner-loop ILP unrolling is separate from D1/D2/D3.**
-  Process 8 K-vectors/iter with 8 independent accumulators. -81%
-  cumulative SDPA on Dream-7B. (catalog D5)
-- **1-SG-per-row rmsnorm undersubscribes GPU at small M.** At M=BL=16
-  you spawn 16 SGs vs M4 Max's ~160 capacity — kernel becomes
-  memory-latency-bound. Use 4–16 SGs/row, merge via TG-mem. (catalog F4)
-- **`mmap + memcpy` is page-fault-bound at ~1 GB/s on macOS.** Even
-  with `dispatch_apply` parallelism you cap ~4 GB/s aggregate (VM
-  fault handler serializes on per-page locks). Use parallel `pread`
-  per shard — one fd per shard, sequential reads, dispatch_apply
-  across shards. Critical for diffusion / short benches. (gotcha #29, A9)
-- **`newBufferWithBytesNoCopy:` per-tensor doesn't work; per-shard
-  works but is slower than pread on warm cache.** Per-tensor fails on
-  8-byte alignment (#40); per-shard is API-valid but page-fault BW
-  (~20 GB/s) loses to pread's page-cache memcpy fast path (~50 GB/s).
-  Counter-intuitive trap. (gotchas #40, #47)
-- **Co-tune `SHARD_SPLIT` against bg compile + residency_async.**
-  pread workers + bg compile + bg residency all contend for P-cores.
-  Target `n_shards × SHARD_SPLIT ≈ P_cores` (12 on M4 Max). Going
-  higher regresses by starving bg compile. (gotcha #45)
-- **Async kernel compile QoS matters.** Start compile + PSO creation
-  on a bg dispatch queue *before* `cache_weights()`. Use
-  `QOS_CLASS_USER_INITIATED`, not `USER_INTERACTIVE` (steals from
-  pread). Metal compile is system-cached cross-process (~3 ms warm),
-  so the overlap is essentially free. (gotcha #46)
-- **Shard-sized MTLBuffer + per-tensor views.** One MTLBuffer per
-  safetensors shard; each tensor is a `(parent, offset, size)` view.
-  Residency set shrinks N_tensors → N_shards (339 → 4). Small but
-  consistent wall win. (gotcha #50)
-- **At decode, GEMM is W-bandwidth bound, not M.** Halving M
-  (row-selective compute) when `M ≪ K` saves <1% — the W read
-  dominates. Only worth it on compute-bound kernels. (gotcha #49)
-- **MSL position attributes must agree in dimensionality.** All
-  `[[thread_position_in_*]]` / `[[threadgroup_position_in_grid]]` /
-  `[[threads_per_threadgroup]]` parameters must be all-uint or
-  all-uint3 — mixing gives "expecting input declarations with either
-  all scalar types or all vector types". INDEX attrs (`sg_id`,
-  `lane`) are exempt. (gotcha #51)
-- **`dispatchThreads:` with `grid_x % tg_x != 0` makes the last TG
-  non-uniform.** Cooperative TG-mem loads using `stride = tg_x` then
-  leave most of TG-mem uninitialized. Either keep grid_x a multiple
-  of tg_x, or use `threads_per_threadgroup` dynamically inside the
-  kernel and handle the small case. (gotcha #52)
-- **SDPA `N_SG` constexpr and host `threads_per_threadgroup` MUST
-  match.** Desync (kernel `N_SG=12`, host dispatches `32 * 16`) →
-  SGs 12..15 overflow `sg_m[]` / `sg_o[]` → garbage tokens. Update
-  BOTH in lock-step when sweeping. (gotcha #53)
-- **Optimal SDPA `N_SG` is NOT the perfect-occupancy divisor.**
-  Always sweep `N_SG ∈ {12, 16, 20, 24, 28}` on LONG decode (not
-  short — at low Lk SDPA share is too small to discriminate). On
-  Qwen3.6 M4 Max 1500-tok decode, 20 wins; 16/20 within 1% of each
-  other but 12/28 are 5%+ worse. (gotcha #54, catalog D3)
-- **Stale binary / thermal trap.** User reports a tok/s regression
-  that you cannot reproduce. Common causes: thermally loaded GPU
-  (background process), stale `.o` files in build, or DYLD caches
-  from prior debug session. Fix: `make clean && make`, close GPU-
-  using apps, `sleep 60` before first bench, best-of-5 with
-  `sleep 30` between runs. (gotcha #55)
-- **B4 (TG-mem X-share) can REGRESS once B6 is in.** Apple-Silicon
-  cores effectively share X across SGs via L1/L2, so explicit
-  TG-mem staging adds barrier + load cost without saving DRAM BW.
-  Cataloged 1.05-1.10× was on early-stage W-dominant ports; after
-  B6 the ratio flips and B4 can lose 1-2%. Measure and revert if
-  it regresses. (gotcha #56, catalog B4)
+  divergence that PASSES per-kernel tests (they serialize one kernel
+  at a time) but FAILS end-to-end. (gotchas #18, #26)
+- **Stale binary / thermal trap.** Unreproducible regression? Almost
+  always `make clean && make`, GPU thermals, or DYLD cache. Standard
+  bench discipline: `sleep 60` before first run, best-of-5 with
+  `sleep 30` between. (gotcha #55)
+
+Everything else — bfloat4 alignment, fused-residual round-point
+shifts, `dispatchThreads` non-uniform last-TG, SDPA `N_SG` desync,
+parallel pread weight loader, per-layer `embed_gather` on Gemma 3/4,
+B4 regression once B6 is in, A8 uselessness on dense bf16, DRAM-BW
+ceiling check, etc. — is in `references/pitfalls.md`. Don't skip it
+in a real port; you WILL hit several of those.
 
 ## Commit strategy
 
@@ -545,10 +436,20 @@ src-metal: fuse res_attn into gemm_bf16 (template DO_ADD)
 
 ## Hand-off / stop condition
 
-Done when both prefill and decode are within ±5% of MLX (plus total
-wall, if startup is a meaningful fraction — see Success criteria).
-Document final tok/s and machine in `./src-metal/PERF.md` and write
-a summary commit:
+Done when EITHER of:
+
+1. **Both prefill and decode within ±5% of MLX** (plus total wall,
+   if startup is a meaningful fraction — see Success criteria), OR
+2. **You are at the DRAM-BW ceiling.** Compute `(per-token weight
+   bytes) / (peak GB/s)` = theoretical minimum ms/token. If your
+   measured ms/token is within 5% (≥ 95% of theoretical), the
+   forward pass is reading weights at memory-controller saturation
+   and no kernel-level technique in this catalog can help further.
+   This is a HARD ceiling for bf16; only weight quantization
+   (mxfp4/q4/q8 — out of scope here) breaks it. See gotcha #59.
+
+Document final tok/s, machine, AND ceiling-% in `./src-metal/PERF.md`
+and write a summary commit:
 
 ```
 src-metal: optimization complete (prefill X.X tok/s vs MLX Y.Y, decode A.A vs B.B)
@@ -583,22 +484,36 @@ not drop-ins. Full inventory in `references/catalog.md`. Highlights:
 - **F** (reductions) — `argmax_parallel.metal`,
   `topk_parallel_router.metal`, `softmax_argmax_per_row.metal`.
 - **H/I** — `glue_kernels_no_host_break.metal`,
-  `gemm_x_offset_row_prune.c`, `recurrent_state_sg_per_row.metal`.
+  `gemm_x_offset_row_prune.c`, `recurrent_state_sg_per_row.metal`,
+  `embed_gather_per_layer.metal` (TG-per-row + 128-thread bfloat4
+  for per-layer embed gather — Gemma 3/4-style models, gotcha #57).
 
 ### Long-form references (`references/`)
 
 Loaded on demand — read the one your situation calls for.
 
-- `catalog.md` — full A–I optimization catalog (the menu).
+- `catalog.md` — full A–I optimization catalog (the menu, with TOC).
 - `profiling.md` — wall vs gpu_busy diagnostic, host_post for samplers,
   KPROF, variance discipline, startup phase-breakdown.
 - `debugging.md` — symptom → recipe table + late-stage barrier checklist.
-- `gotchas.md` — 56 numbered war stories with TOC.
+- `pitfalls.md` — **curated short-list of war stories most likely to
+  bite during optimization**, organised by debugging session type
+  (encoding traps, correctness, profile-reading, tuning, regressions,
+  weight loader, "unreproducible" benches). Each entry links into
+  `gotchas.md`.
+- `gotchas.md` — full 60-entry numbered war-story archive (with TOC).
+  The deepest reference; read the TOC top-to-bottom once, then dive in
+  when a specific gotcha number is referenced.
+- `dense-bf16.md` — dense-bf16 attack order (Gemma 3/4, Llama bf16,
+  Mistral bf16). Same B1/D1/H1/SDPA base, different late-stage list,
+  DRAM-BW ceiling stop condition.
+- `diffusion-llm.md` — Dream / LLaDA / fastdllm attack order + worked
+  Dream-7B example.
 - `decode-prefill-split.md` — G category.
 - `parallel-chains.md` — A8 late-decode endgame.
 - `sliding-kv-cache.md` — D4 rotating KV cache.
-- `diffusion-llm.md` — Dream / LLaDA / fastdllm attack order + worked example.
 
-When you start the skill, **read `references/gotchas.md` first** — many
-of the gotchas there will save you from rediscovering them the hard
-way. The TOC at the top lets you scan in under a minute.
+When you start the skill, **read `references/pitfalls.md` first**
+(curated, ~10 minutes) — it covers the war stories most likely to bite
+during the session in front of you. Then keep `references/gotchas.md`
+open for when a specific number is cross-referenced.

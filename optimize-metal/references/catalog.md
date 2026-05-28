@@ -1340,6 +1340,40 @@ state at position p-1" trips up most refactors.
 
 **Commit**: 304484b (Dream-7B fastdllm reference port).
 
+### H4. Parallelize per-layer `embed_gather` (Gemma 3 / Gemma 4 / similar)
+
+**What**: Models with per-layer additional embeddings (Gemma 3 / 4
+"per_layer_inputs", some recent multimodal arches) gather one row
+per layer per token from a `[V, L*D_pli]` table and add it to the
+hidden state. The naive port-c-to-metal keeps this as 1 thread per
+row — at D=10752 × 42 layers, that's ~25 ms of pure serial latency
+per decode token even though the table is small.
+
+Replace with TG-per-row + 128-thread cooperative bfloat4 copy. The
+embed dim is always divisible by 4 in mainstream architectures, so
+bfloat4 loads land at 8-byte-aligned addresses.
+
+**When**: Any model where you see an `embed_gather` call INSIDE the
+per-layer loop in `forward()` (not just before/after it). KPROF will
+flag the offender — ≥ 2% of GPU with `us_per_call > 50` is the
+signature.
+
+**Speedup**: 60-70× per-kernel speedup (597 µs → 9 µs on Gemma 4
+E4B, M4 Max). Wall: +4-5% on both short and long decode benches.
+This was the SINGLE BIGGEST late-stage win on Gemma 4 E4B and
+crossed it from MLX-parity to MLX-beating.
+
+**Snippet**: `patterns/embed_gather_per_layer.metal` — both the
+flat-table and `[V, L, D_pli]` interleaved-by-layer variants.
+
+**Commit**: cd9709e (gemma-4-E4B Metal port).
+
+**Related**: This is a high-impact subvariant of gotcha #17
+("TG=(1,1,1) waste"). Plain elemwise kernels with TG=(1,1,1) waste
+31/32 lanes per dispatch (small but free); per-layer embed_gather
+*also* wastes 31/32 lanes BUT amplifies the cost by D × layers per
+token. Always check it.
+
 ---
 
 ## I. Recurrent / state-update kernels

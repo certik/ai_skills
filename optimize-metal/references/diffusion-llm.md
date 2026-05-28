@@ -10,6 +10,15 @@ Read this file when your `./src-metal/` is a diffusion LLM and you've
 just finished the kernel-level wins. The end-game looks different from
 an autoregressive port.
 
+## Table of contents
+
+- [What's different](#whats-different) — autoregressive vs block-diffusion forward structure
+- [Profiling diffusion runs](#profiling-diffusion-runs) — `gpu_busy` vs `host_post` vs wall, per-step breakdown
+- [What does NOT help](#what-does-not-help-relative-to-autoregressive-ports) — A4, A8, output pruning that doesn't fire
+- [What DOES help (in order)](#what-does-help-in-order) — the diffusion attack order, A9 → F3 → H3 → C2 dual-tile → C2 BK/WN → B5 → C4 → C5 → D5 → F4
+- [End-to-end validation](#end-to-end-validation) — fastdllm-style block-by-block diffs
+- [Worked example: Dream-7B on M4 Max](#worked-example-dream-7b-on-m4-max-this-skills-reference-port) — naive ~10 s wall → 2.17 s total, beats MLX by 19% wall / 39% gen
+
 ## What's different
 
 A diffusion LLM doesn't generate one token at a time. Instead:
