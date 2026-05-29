@@ -2,27 +2,21 @@
 name: optimize-cpu
 description: >
   Optimize a naive pure-C CPU LLM inference reference (./src-cpu/ from
-  build-c-reference) to run as fast as possible on a multi-core x86_64
-  (or aarch64) CPU. Catalog: -O3 -march=native -ffast-math -fopenmp -flto
-  baseline; OpenMP-per-output GEMV; K-tile split bf16->fp32-from-FMA so
-  gcc auto-vectorizes as vfmadd231ps + vpmovzxwd+vpslld (THE big GEMV
-  win on bf16 / CPUs without bf16-FMA); real GEMM tile for M>1 prefill
-  (W loaded once per N-tile, reused across M); KPROF per-kernel timer to
-  confirm `linear` dominates; mmap MADV_HUGEPAGE + multi-threaded
-  parallel page prefault for fast warm cache; OMP_NUM_THREADS = physical
-  cores (NOT SMT-doubled); OMP_WAIT_POLICY=active + OMP_PROC_BIND=close
-  OMP_PLACES=cores; DRAM-bandwidth ceiling stop condition.
-  Pure C only -- no inline asm and no SIMD intrinsics (no _mm_*, no
-  arm_neon), but ANY compiler flag and gcc -S asm inspection is
-  encouraged to coax auto-vectorization.
-  Validates tokens against a saved reference output after each change;
-  accepts numerical drift past first ~50 tokens when -ffast-math
-  reorders the fp32 reduction. Use this skill whenever the user wants
-  to make a C/C++ LLM inference run faster on a CPU, mentions
-  OpenMP/auto-vectorization/AVX2/NEON for an LLM forward pass, says
-  "optimize src-cpu" or "speed up the C reference" or "make decode
-  faster on the CPU", or asks for a CPU analog of optimize-metal -- even
-  if they don't explicitly say "skill".
+  build-c-reference) to run fast on multi-core x86_64 / aarch64.
+  Catalog: -O3 -march=native -ffast-math -fopenmp -flto baseline;
+  OpenMP-per-output GEMV; K-tile split bf16-to-fp32-via-FMA so gcc
+  auto-vectorizes (THE big GEMV win on bf16 CPUs lacking bf16-FMA);
+  GEMM tile for multi-row prefill (W reused across M); KPROF per-kernel
+  timer; mmap MADV_HUGEPAGE + parallel page prefault for warm cache;
+  OMP_NUM_THREADS = physical cores (not SMT); OMP_WAIT_POLICY=active,
+  OMP_PROC_BIND=close, OMP_PLACES=cores; stop at DRAM-BW ceiling. Pure
+  C only -- no inline asm, no SIMD intrinsics (no _mm_, no arm_neon),
+  but any compiler flag and gcc -S inspection is fair game to coax
+  auto-vectorization. Validates tokens after each change; accepts
+  -ffast-math drift past ~50 tokens. Triggers: optimize cpu, optimize
+  src-cpu, speed up the C reference, make decode faster on CPU, OpenMP
+  / auto-vectorization / AVX2 / NEON for an LLM forward, CPU analog of
+  optimize-metal.
 ---
 
 # optimize-cpu — make the pure-C CPU reference fast
