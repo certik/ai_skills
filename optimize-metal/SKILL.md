@@ -261,8 +261,9 @@ Document actual commands, identities, full-ID scope, timer boundaries,
 median/spread/pairs, limitations and deferred hypotheses in project PERF
 documentation. Do not call partial decode parity “optimization complete.”
 An explicitly chosen research milestone can retain a promising candidate
-with caveats; it does not turn failed frozen acceptance gates into passes or
-authorize a downstream Fortran transition.
+with caveats, but failed frozen acceptance gates remain FAIL. A milestone
+does not by itself lift an existing downstream-work hold; an explicit
+user/coordinator disposition can do so.
 
 ## Deeper material
 

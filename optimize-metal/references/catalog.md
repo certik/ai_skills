@@ -619,7 +619,7 @@ Use the source/parity and measurement protocols, not operator gain as approval.
   picks how many SIMD groups split the BN dimension (more parallelism
   per TG), AND it sets per-SG register pressure (more SGs → smaller
   per-SG share of C accumulator and Bt staging). `WN=2` is a good
-  starting point (64 threads/TG); **`WN=4` is the register-pressure
+  starting point (64 threads/TG when `WM=1`); **`WN=4` is the register-pressure
   relief lever** that can unlock larger BK; verify `32*WM*WN` threads/TG
   and staging rather than assuming thread count stays fixed. On Dream-7B:
   WN=2 BK=64 in BN=64 catastrophically spills

@@ -89,7 +89,7 @@ These are questions to answer from source; the hybrid case study's formulas
 are not universal model recipes. Passing a literal pilot establishes only
 the covered shapes/values/options, not AOT/ISA equality.
 
-### Source-faithful specialization after native parity
+### Source-faithful specialization after native math validation
 
 An unchanged native body can expose a useful new tile specialization without
 rewriting its arithmetic. Inspect template parameter order: the illustrative
