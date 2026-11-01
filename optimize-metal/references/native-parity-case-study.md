@@ -73,20 +73,35 @@ population noninferiority, ISA equality or measured bandwidth saturation.
 Native GPU busy was unavailable/null. All interrupted attempts stayed
 separate; completed unrelated cohorts were not rerun.
 
-## Open hypotheses, not lessons claimed as successes
+## Bounded residency result and remaining hypotheses
 
 A short sample showed about8ms encode/commit stamping then929ms until
 GPU execution. That is not evidence of slow CPU encoding. Source inspection
 found a native ResidencySet/global-limit lifecycle with allocatedSize
 admission, pending sets, queue attachment/commit and sync/restore; no tensor
-reread/page-touch/forward/wait at entry. A tracked-hazard-preserving
-prototype built and passed focused lifetime checks. At an **initial
-checkpoint**, Battery Power blocked all full-model probes (0/3 launched).
-AC was subsequently restored and bounded probes resumed; their results
-were pending when this case was recorded. No later performance or causal
-result is claimed here. The reviewed source baseline was
-persisted and publication verified where authorized; the prototype remained
-an unaccepted experiment.
+reread/page-touch/forward/wait at entry. A tracked-hazard-preserving prototype
+then passed three diagnostics: short17/reset, short65 and2K/65 exact
+IDs/counts/lifetimes. First-submit gaps collapsed, but explicit residency
+entry moved cost before conventional prefill, not out of user-visible time.
+
+A separate same-window **C-baseline versus C-prototype short65 ABBA screen**
+had four valid samples, N2 per engine, with all65 IDs/counts/source/power
+checks passing. It is not the24-sample MLX cohort above. Lower duration is
+better; ratios below are prototype/baseline:
+
+| Metric | Ratio of medians | Screen disposition |
+|---|---:|---|
+| Outer child wall |1.0775|slower; both adjacent ratios1.120/1.033|
+| Ready-to-first |1.1236|slower|
+| Decode duration |1.0005|nearly unchanged|
+
+**LOSS at this bounded screening scope:** retain the faster production
+baseline and archive the functional prototype locally, without promoting it.
+This is not a formal/N4/all-workload regression or proof residency is
+universally harmful. The original diagnostics' restore cost was tiny
+(about0.7ms short and3.85ms2K); no teardown, physical page-in or JIT cause
+was established. Next diagnose the retained baseline's startup and
+first-command timeline, not blindly rewrite its loader or hazard policy.
 
 Native Shared/Untracked allocation, candidate Shared/Tracked allocation,
 loader/cache and submission granularity still differed. Nominal full

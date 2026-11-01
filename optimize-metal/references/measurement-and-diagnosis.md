@@ -38,13 +38,19 @@ Define endpoints and included work in the manifest **before measuring**:
 
 | Metric | Required boundary |
 |---|---|
-| Outer child wall | Timestamp immediately around actual Popen and blocking wait/reap; includes spawn/import/init/output/teardown, excludes supervisor/environment activation/cooling if so declared. |
+| Outer child wall | Retain actual supervisor monotonic Popen-start, Popen-return and blocking-wait/reap endpoints, not just elapsed duration; includes spawn/import/init/output/teardown, excludes supervisor/environment activation/cooling if so declared. |
 | Startup | Separate config/tokenizer, libraries/PSOs, weight reads, workspace/cache allocation, prewire and residency entry. |
 | Ready-to-first / TTFT | Precisely define “ready”; list excluded allocations/cache/wiring/warmup work on both engines. |
 | Conventional prefill | Follow the pinned reference's convention; report setup excluded by that convention separately. |
 | Decode | Exact emitted-count numerator and first-token/final-sync/lookahead endpoints from the native generator. |
 | Restore/exit | Final sync, residency restoration, cache/report/teardown lifetimes when excluded by inner clocks. |
 | GPU coverage | Valid completed intervals on a compatible monotonic clock; interval union clipped to phase, or null if unavailable. |
+
+Save child-main, ready, first-token and final-sync endpoints too, with clock
+identity and compatibility/calibration for joining supervisor/child clocks.
+A correct child duration alone cannot reconstruct common spawn-to-first.
+Matched `CLOCK_UPTIME_RAW` endpoints enabled that comparison in the residency
+screen; Unix stamps are not a substitute without clock calibration.
 
 For autoregressive generation, first output is normally the prefill argmax;
 decode often uses `(G−1)/decode_seconds`. Confirm exact pinned behavior:
@@ -63,6 +69,13 @@ Moving wiring/warmup/page-touch outside conventional prefill can improve
 that number with zero benefit to the user. Charge it to setup-inclusive
 ready/outer wall. Never subtract independently computed medians to manufacture
 parity.
+
+The residual outside a reported inner body includes pre-main/import **and**
+later output/teardown; do not label it isolated teardown. Inspect source scope
+before interpreting coarse labels such as `pread` or `Metal_JIT`: they may
+include allocation, worker scheduling, context or residency work. Diagnose
+parallel stages through interval unions/critical path, not summed durations
+or subtraction of independent medians.
 
 ## 3. Validate clocks before believing profiles
 
@@ -152,6 +165,13 @@ needed; no new sustained/N4 series until the causal question and source
 review warrant it. Report before/after first-submit delay **and** entry/
 ready/exit/outer clocks. A prototype without returned full-model results is
 pending, even if source or tiny lifecycle tests pass.
+
+If a bounded same-window screen shows collapsed submit gaps but worse
+setup-inclusive ready/child time, retain the faster baseline and archive
+the functional prototype. Do not repeat broad cohorts to obtain a win or
+generalize an N2 short screen to all residency/workloads. Next localize the
+baseline's startup/first-command timeline; tiny restore time and coarse
+body residuals do not establish teardown, page-in or JIT causality.
 
 ## 6. Bandwidth claims
 
