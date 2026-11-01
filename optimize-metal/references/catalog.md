@@ -576,10 +576,22 @@ AND the hardware.
   on M4 Max. BK=16 at BM=32 spills registers (TM=4 doubles the A
   footprint).
 
-**When**: After C1. Sweep `(BM, BN, BK, WM, WN)` and pick the fastest
-for each kernel shape.
+**When**: After a current profile identifies a hot shape. Inspect native
+template order/ABI first, screen a few source-supported choices on meaningful
+typed fixtures, then test the narrow production selector. Do not run a full
+model cohort for every tile or generalize an exact-shape experiment blindly.
 
 **Speedup**: 1.10–1.30× per kernel.
+
+**Modern affine-QMM example, not a universal tile:** native `affine_qmm_t`
+orders BM/BK/BN; a 64×64×32 specialization therefore passes 64,32,64. One
+M=2047/N=17408/K=5120 gate/up experiment kept WM/WN 2×2, TG128, BK32, BF16
+group64/native BlockMMA/SafePrecise arithmetic while staging grew 5120→10240
+bytes and grid groups fell 34816→8704. Full outputs/tails, no-split small-C
+cases, guards and actual off-target/split/failed-PSO routes passed. A steadier
+all-call batch screen was promising, but the subsequent three-arm model
+readiness and promotion gates **failed** despite a better median prefill.
+Use the source/parity and measurement protocols, not operator gain as approval.
 
 **Knobs and gotchas**:
 
@@ -608,8 +620,9 @@ for each kernel shape.
   per TG), AND it sets per-SG register pressure (more SGs → smaller
   per-SG share of C accumulator and Bt staging). `WN=2` is a good
   starting point (64 threads/TG); **`WN=4` is the register-pressure
-  relief lever** that unlocks larger BK without changing total
-  threads/TG. On Dream-7B: WN=2 BK=64 in BN=64 catastrophically spills
+  relief lever** that can unlock larger BK; verify `32*WM*WN` threads/TG
+  and staging rather than assuming thread count stays fixed. On Dream-7B:
+  WN=2 BK=64 in BN=64 catastrophically spills
   (64 regs/lane → 4× slowdown); WN=4 BK=64 (40 regs/lane) fits and
   beats WN=2 BK=32 by -6% wall. Cost: A is now redundant across WN
   SGs, but at BN=64 with BK=64 the A footprint is small enough that

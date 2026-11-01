@@ -109,10 +109,94 @@ weight bytes were not measured memory-controller traffic. Scalar-C80 failure,
 earlier mismatch causality, physical memory peaks and downstream Fortran
 real-model/GPU acceptance remained separate limitations.
 
+## Subsequent-request scope and the QMM64 experiment
+
+A matched-byte resource-count/parent-view pilot remained inconclusive, so
+object count did not justify a production loader/consolidation rewrite.
+
+A new comparison loaded once, reported the complete conditioning request, then
+timed a reset/new request from **before** cache/reset/conversion/wiring on both
+engines. “Resident” meant retained model, not physical page pinning. Native
+created a fresh cache; C retained/zeroed KV. These real setup/stride/count
+differences were disclosed, not artificially erased; ingress JSON was parsed
+once per child. The original cold cohort above was never retimed.
+
+The two-arm study covered 16 children, 32 requests and 2,080 exact IDs. Short
+second-request prefill was 80.07 versus 67.74 tokens/s, but 2K was 181.34 versus
+196.10: the 2K median gate **failed**, and other 2K gates had losing pairs.
+A good short result was not a substitute for long-workload readiness.
+
+Review caught earlier-request evidence fallback, omitted clock/calibration
+fields, stable-but-wrong power mode and an undefined pre-child power receipt
+in successful admission. Omission and complete mocked-admission tests repaired
+the harness before the campaign. The lesson is to reuse/test the full success
+path, not build more framework or repeat costly runs to discover tooling errors.
+
+### Profile the current bottleneck, then validate meaningful inputs
+
+Normal matched 2K C coverage was about 99.7%; reset took roughly 14ms, uncovered
+generation about 30ms and initial submit delay about 2ms. In losing matched
+pairs, C GPU union alone exceeded native's entire request, so those small
+host/setup delays could not explain the excess without any native GPU counter.
+The next isolated profile attributed 94.53% to q8 QMM/folds and about 1.6% to
+SDPA. Its elapsed intervals included stalls and changed synchronization/cache
+behavior; they did not prove arithmetic, frequency or retained-KV causality.
+
+One hot shape (M=2047,N=17408,K=5120; 126 calls, 4.181s isolated warm elapsed)
+motivated a native-body 64×64×32 QMM specialization. Template order was BM/BK/BN,
+so 64,32,64; WM/WN 2×2, TG128, BK32 and BF16 affine/native arithmetic stayed
+fixed. Staging doubled 5120→10240 bytes; grid groups fell 34816→8704. This was
+an exact-shape experiment, not a general compiler tile rule.
+
+An initial unsigned-negation bug wrapped bias to 4,194,304 and BF16 staging
+collapsed quantization variation. Both kernels agreed, but those timings were
+unrepresentative and could not justify promotion. Corrected typed range/sign/distinct/
+dequant-span/midpoint audits preceded fresh timing. Complete actual-shape
+native output scans, M=2048 tails, small K=64/no-split C cases, guards/reuse and
+actual narrow/off-target/split/fail-closed production paths passed without a
+days-long scalar 2K oracle. Live complete scans were not advertised as independently
+saved full payload comparisons.
+
+Single-call screens remained inconclusive. A fresh declared study used eight
+batches of 32 serial completed calls, no inner idle/log/hash/fill, retaining all
+256 intervals including first calls. It gave 6.58–10.63% paired reductions,
+median 8.19%. The sample unit was eight batches (N4/arm), not 128 independent
+calls per arm; this promising operator result was still not a model gain.
+
+### Three-arm acceptance and public information limits
+
+Protected model diagnostics passed before a same-window MLX/old-C/candidate
+comparison with balanced triplets, own binaries/assets and explicit within-block
+pairs, sometimes nonadjacent. Readiness versus MLX and promotion versus old C
+were separate frozen decisions. The 24-child/48-request study verified 3,120 IDs:
+
+| 2K subsequent-request prefill | Median tokens/s |
+|---|---:|
+|MLX|185.040938|
+|Old C|182.843067|
+|QMM64 candidate|194.002953|
+
+The candidate median was 6.10% above old C and 4.84% above MLX, yet **both overall
+gates failed** from cold-cost medians and losing pairs. A valid severe sample
+(112.709 prefill, 8.351 decode tokens/s; 58.993s child) remained included.
+Correct outputs and a good median did not override the agreed regressions.
+
+A bounded public-only baseline/candidate two-request diagnostic verified 260
+IDs but did **not reproduce** the severe slowdown. Own-task VM/event/rusage
+and public thermal/QoS/Metal evidence had documented units and sampling limits;
+about one million cold decompressions near first GPU/driver execution were
+correlation, not cause. Warm zero-decompression prefixes still had longer GPU
+elapsed. Logical compressed-ledger bytes were not physical residency.
+Public counters exposed timestamps, not frequency/traffic/utilization; declined
+admin access was respected. The information limit did not justify excluding
+the old sample, promoting the candidate or rerunning until a win. Readiness
+and promotion remained failed; no Fortran transition followed.
+
 ## Carry-forward checklist
 
 Freeze → inspect literal source/dispatch → unchanged pilot → whole compatible
-family → threshold/lifetime/identical-input gates → all workload IDs →
-one final counterbalanced cohort → diagnose setup separately → persist.
+family → meaningful typed-input/threshold/lifetime gates → stable all-call
+operator sampling → protected model IDs → one appropriate final comparison →
+diagnose only the remaining bounded question → persist.
 Keep manifests/handoffs compact, failure states honest and deferred work
 off the performance critical path.

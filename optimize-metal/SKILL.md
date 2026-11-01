@@ -117,6 +117,11 @@ softmax fallbacks and recurrent helper math come from this reference.
 
 For each changed family:
 
+Audit actual typed fixture ranges before timing; native/candidate agreement
+alone can hide a shared degenerate input. Exercise successful controller
+admission and independent request receipts before expensive model runs.
+Reuse existing minimal harness helpers rather than building a new framework.
+
 1. Check complete identical-input outputs against pinned native kernels;
    run unchanged C tolerance/conversion checks independently. Include
    final normalization and vocabulary head, not just internal layers.
@@ -172,6 +177,10 @@ criterion before editing. A practical default is one representative profile,
 one pilot and at most two failed diagnostic approaches before changing
 the hypothesis; allocate a different budget explicitly when justified.
 Screen operator geometry cheaply, not with a full model for every tile.
+Use the latest matched profile, not an earlier bottleneck. Batch short
+operator calls when needed, retaining every interval and the declared sample
+unit. Ordinary build/path/pre-dispatch repairs are not failed GPU experiments;
+budget CPU jobs concurrently and keep actual safety/correctness gates firm.
 Small wins below measured variability are INCONCLUSIVE, not automatically
 good or bad. Native parity is a gate, not proof no further speed is possible.
 
@@ -213,6 +222,9 @@ Before acceptance, read the [measurement protocol](references/measurement-and-di
 - Compare actual work: prefix demand, generated/consumed counts, head calls,
   lookahead and final synchronization. Derive numerator/timer conventions
   from the pinned generator; typically autoregressive decode is G−1.
+- Declare subsequent-request timing separately: load once, report conditioning,
+  then time reset/cache/conversion/wiring on both engines. Use a same-window
+  reference/old/candidate comparison when both readiness and promotion matter.
 - Report conventional prefill, setup-inclusive ready-to-first/TTFT, decode
   and **true outer child wall** separately. Document excluded work at every
   ready/timer boundary; moving work outside a timer is not a speedup.
@@ -248,6 +260,9 @@ an explicit blocked/partial disposition with the unmet metric and next test.
 Document actual commands, identities, full-ID scope, timer boundaries,
 median/spread/pairs, limitations and deferred hypotheses in project PERF
 documentation. Do not call partial decode parity “optimization complete.”
+An explicitly chosen research milestone can retain a promising candidate
+with caveats; it does not turn failed frozen acceptance gates into passes or
+authorize a downstream Fortran transition.
 
 ## Deeper material
 

@@ -23,6 +23,17 @@ For native parity and timing, use `native-source-parity.md` and
   suites, full traces, model runs for every tile and unrelated compiler work.
 - **Persist early.** Buildable checkpoints/source-to-binary maps and compact
   handoffs survive service failures; old failed receipts stay failed.
+- **Output agreement does not validate fixture quality.** Audit typed ranges,
+  signs, dequant span/distinctness and BF16 midpoints before timing. Shared
+  unsigned-wrap bias bugs can make both kernels agree on degenerate data.
+- **Test successful admission and omissions.** Separate request receipts cannot
+  borrow earlier IDs/clocks/counters. Baseline absence applies to nested records,
+  even fake zero variant counters; mock each full controller arm before models.
+- **Repair administration without moving real gates.** Asset-path/build/
+  pre-dispatch tooling fixes can stay within a bounded objective. CPU budget is
+  concurrent jobs, not total compiler invocations. Do not demand a coordinator
+  round trip for every typo or count it as a completed GPU experiment; never
+  waive GPU correctness/resources or replace failed timings.
 
 ## During encoding / dispatch
 
@@ -81,9 +92,9 @@ For native parity and timing, use `native-source-parity.md` and
 - **`gpu_busy << wall` is an unattributed gap.** Check host breaks/sampler,
   setup, queue/first-submit delay, residency/paging and waits. Low coverage
   alone does not prove CPU encoding is slow. (gotcha #9)
-- **Argmax over VOCAB=200k single-threaded** is by far the most common
-  "why is decode capped at <5 tok/s" answer (also caps mid-pipeline
-  decode at ~40 tok/s once everything else is in). Apply F1 immediately.
+- **Single-threaded large-vocabulary argmax can cap decode**, but apply F1 only
+  when the current profile shows that cost, preserving rounded native sampling.
+  Old-model attack orders do not replace the latest shape/family profile.
 - **Diffusion-LLM samplers do CPU work invisible to `gpu_busy`.**
   Per-step softmax/argmax/confidence over V shows up only in wall.
   Add `host_post`; if > ~5% of wall, apply F3. (gotcha #36)
@@ -102,6 +113,13 @@ For native parity and timing, use `native-source-parity.md` and
   actual controller traffic, instructions and queue costs determine the
   real limit. Neither nominal bandwidth nor MLX parity proves further
   optimization impossible. (gotcha #59)
+- **Public driver timestamps are not GPU arithmetic or CPU-busy time.**
+  Completed kernelStart/EndTime measures driver scheduling elapsed; GPUStart/
+  EndTime includes execution stalls. Empty wrappers remain raw/unknown/excluded.
+  Same-label PSO instances need separate count reconciliation.
+- **A good median is not promotion.** Freeze readiness versus reference and
+  improvement versus old implementation independently, retain bad valid pairs,
+  and do not repair a failed cohort with a later normal diagnostic.
 
 ## Tuning sweeps
 
@@ -117,25 +135,29 @@ For native parity and timing, use `native-source-parity.md` and
   per aligned uint4, with the group index derived from the format.
   Single biggest second-pass win on Qwen3.6 — +18.7% decode.
   Same trick generalizes to q4 and mxfp4. See catalog B6.
-- **Premature multi-SG SDPA hides the real SDPA win.** Apply D1 (parallel
-  softmax) BEFORE D3 (multi-SG split), or you'll measure +5–10% and
-  conclude SDPA isn't worth optimizing. (gotcha #31)
+- **In naive SDPA, serial softmax can hide a later multi-SG win.** Inspect
+  native selectors/current profiling first; do not follow the historical
+  D1→D3 order after another family has become dominant. (gotcha #31)
 - **Tile-size cargo-culting.** First match the actual pinned device/shape
   selector. Sweep a few profile-supported geometries only after native
   routing works; use cheap operator screens, not full-model runs for every
   combination. (gotcha #32)
-- **"BK=16 is the maximum" is a `WN=2` artifact.** At `WN=4` per-SG
-  register pressure halves, unlocking BK=32/BK=64. Always sweep
-  BK ∈ {16,32,64} × WN ∈ {2,4} with the register-budget formula.
+- **"BK=16 is the maximum" was a `WN=2` artifact.** A source-supported
+  geometry can relieve register pressure, but inspect template order and
+  TG/staging changes. Screen one profiled shape before a broader sweep.
   (gotcha #41, catalog C2)
 - **SDPA inner-loop ILP unrolling is separate from D1/D2/D3.**
   Process 8 K-vectors/iter with 8 independent accumulators. -81%
   cumulative SDPA on Dream-7B. (catalog D5)
 - **Optimal SDPA `N_SG` is NOT the perfect-occupancy divisor.**
-  Always sweep `N_SG ∈ {12, 16, 20, 24, 28}` on LONG decode (not
+  When long-context SDPA is hot, screen a few supported widths (not
   short — at low Lk SDPA share is too small to discriminate). On
   Qwen3.6 M4 Max 1500-tok decode, 20 wins; 16/20 within 1% of each
   other but 12/28 are 5%+ worse. (gotcha #54, catalog D3)
+- **Batch sample units stay honest.** Retain all inner calls, including
+  first-call costs; eight batches of 32 calls are eight samples, not 256
+  independent measurements. Invalid fixture timings and inconclusive studies
+  stay separate from the corrected/fresh batch study.
 - **Two M shapes need two PSOs.** When prefetch (M=L) and refine
   (M=BL) differ by 4–5×, compile two GEMM PSOs with different
   `(BM, BK)` and switch at dispatch by `M > 16`. Pad workspace buffers

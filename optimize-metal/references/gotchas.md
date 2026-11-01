@@ -973,7 +973,7 @@ halves the K-loop count and improves ILP.
 
 ```python
 # Before declaring "BK=N doesn't fit", check both WN=2 AND WN=4.
-# WN=4 doubles SGs per TG (4 instead of 2). Same total threads/TG.
+# With WM fixed, WN=4 doubles SGs and threads/TG versus WN=2.
 def regs_per_lane(BM, BN, BK, WM, WN):
     TM, TN, TKB = BM // WM // 8, BN // WN // 8, BK // 8
     return TM*TN*2 + TM*TKB + TN*TKB    # C(fp32) + A(bf16) + Bt(bf16)

@@ -52,6 +52,10 @@ do not count every language-runtime/event wait.
 
 Keep instrumentation out of throughput runs. Sparse counters/source-bound
 receipts are usually more useful than multi-GiB captures.
+Preflight exact generated asset paths and loaded-library selection before GPU
+work; a filename typo is not a kernel failure. When counters change a C struct,
+update the matching FFI array size/layout too. Variant evidence must show actual
+PSO/source/ABI/grid and dispatch counts, not just capability labels.
 
 ## 3. Pilot, then complete compatible families
 
@@ -84,6 +88,26 @@ Critical numerical audit questions:
 These are questions to answer from source; the hybrid case study's formulas
 are not universal model recipes. Passing a literal pilot establishes only
 the covered shapes/values/options, not AOT/ISA equality.
+
+### Source-faithful specialization after native parity
+
+An unchanged native body can expose a useful new tile specialization without
+rewriting its arithmetic. Inspect template parameter order: the illustrative
+`affine_qmm_t` takes **BM, BK, BN**, so a 64×64×32 tile is encoded 64,32,64.
+Retain declared WM/WN, threads, BF16 staging, affine grouping, native BlockMMA
+and effective Safe/Precise options. Larger staging and accumulator pressure
+can erase a theoretical grid reduction; shape counts alone prove no speedup.
+
+Start with one latest-profile hot shape, not a model-wide tile rule. Test the
+actual narrow production selector, off-target/tail/decode/split paths, missing
+PSO failure and unchanged reducers. Small shapes do not necessarily use the
+same split policy: choose and verify genuinely no-split C fixtures separately.
+Full native actual-shape output/reuse checks plus small fixed C cases can
+avoid a days-long scalar large-prefill oracle. Then require protected model
+IDs/state/counts and per-request/per-forward variant counters before promotion.
+Keep baseline and candidate assets/builds isolated and map each committed tree
+to its measured binary; exact-shape experimental selectors are not general
+compiler heuristics without new proof.
 
 ## 4. Port the lazy graph, sampler and lifetimes too
 
@@ -135,6 +159,14 @@ capacity arithmetic, including view-offset subtraction. Include:
 Use nonuniform attention and BF16-midpoint/nondefault-epsilon fixtures.
 Uniform inputs or exactly representable values can hide scaling, round-point
 and configuration-wiring bugs even when shapes and short IDs pass.
+
+Audit **actual typed** input min/max, signs, distinct values and staged dequant
+span before timing. Unsigned subtraction/negation can wrap an affine bias so
+far that BF16 staging removes quantization variation: native and candidate
+then agree on unrepresentative data. Cast before signed subtraction/negation;
+isolate intentional modular PRNG arithmetic. Include nonzero biases and
+midpoints, and check output variation as well as finiteness. A fixture repair
+requires a fresh declared timing study; do not reuse its invalid timings.
 
 **Illustrative pinned g16s/D256/GQA6 boundaries:** vector eligibility
 `M<=8 && M*GQA<=32` means M1–M5, causal for M>1; M6+ uses native generic

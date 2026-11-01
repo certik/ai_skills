@@ -4,6 +4,16 @@ Use this for late token mismatches, apparent prefill/setup wins, noisy
 comparisons and first-submit stalls. A small bounded experiment should
 answer one causal question before another whole-model campaign.
 
+## Contents
+
+- [First divergence](#1-first-divergence-ladder)
+- [Timers and subsequent requests](#2-timer-dictionary)
+- [Clock and instrumentation semantics](#3-validate-clocks-before-believing-profiles)
+- [Harness, operator sampling and comparisons](#4-acceptance-cohort-not-best-of-hunting)
+- [Residency probes](#5-residencyfirst-submit-causal-probe)
+- [Bandwidth estimates](#6-bandwidth-claims)
+- [Public telemetry limits](#7-public-telemetry-and-information-limits)
+
 ## 1. First-divergence ladder
 
 1. Verify source/binary/loaded-library/options/input/cache identities, tensor
@@ -77,6 +87,21 @@ include allocation, worker scheduling, context or residency work. Diagnose
 parallel stages through interval unions/critical path, not summed durations
 or subtraction of independent medians.
 
+### Subsequent requests are a separate service scope
+
+Load one model, report a complete real conditioning request, then reset/start
+a new request. On **both** engines start before cache/reset, input conversion
+and wiring. Parse ingress JSON once per child, not inside only one engine's
+timed loop; required native tensor conversion still belongs inside its request.
+Preserve actual cold spawn, both requests, audit/inter-request/exit and whole
+child costs. Never retime an old cold cohort as this new scope.
+
+“Resident” means logical same-process model retention, not physically pinned
+pages. Native fresh cache versus C retained/zeroed KV is a real implementation
+difference: disclose capacities/strides/growth/fill counts and charge setup,
+rather than force artificial identical work. Short,2K and sustained scopes
+remain separate; one fast second short request does not establish long parity.
+
 ## 3. Validate clocks before believing profiles
 
 Keep CPU encoding/commit stamps and GPU uptime endpoints on compatible
@@ -98,6 +123,25 @@ Overlapping command buffers and lookahead can straddle TTFT:
 KPROF per-dispatch commit/wait changes scheduling and timing; cross-profile
 absolute deltas are not proof of a production cost reduction. Use focused
 attribution to choose the next experiment, then measure uninstrumented.
+
+Metal's public `kernelStartTime/kernelEndTime` describes **CPU-driver scheduling
+elapsed**, not GPU arithmetic or CPU-busy time. `GPUStartTime/GPUEndTime` is
+execution elapsed including stalls. Read supported properties after actual
+completion on compatible clocks. Empty command wrappers can report tiny or
+nonsensical values; preserve raw/unknown/excluded status instead of fabricating
+a parent-prefix interval from them.
+
+Reconcile actual dispatches by loaded PSO instance as well as text name: several
+PSOs can share one label. A purely offline parser correction can reuse successful
+raw GPU data if exact counts/intervals reconcile; keep its failed parser/log
+and do not replace a failed timing sample.
+
+Use the latest matched profile to bound the gap. If C's valid GPU interval
+union alone exceeds native's **entire request** in a losing matched pair,
+small reset/host/uncovered delays cannot be the main excess; native GPU
+counters are unnecessary for that bound. This does not identify which kernel,
+stall or frequency effect caused it. Do not subtract unrelated medians, or
+keep tuning yesterday's SDPA/startup bottleneck after current QMM dominates.
 
 ## 4. Acceptance cohort, not best-of hunting
 
@@ -129,6 +173,47 @@ not formal statistical noninferiority.
 
 Report source-bound scope and every unmet metric. One GPU interval gain,
 short-workload speedup or ID control is not whole-model parity.
+
+### Validate admission before paying for a cohort
+
+Reuse existing controllers with the minimum gates for the declared study:
+
+- Require independent IDs, counters, clocks and records for **every** request.
+  Never fill missing request fields from a top-level/earlier request dictionary.
+  Inherit only an explicit immutable identity allowlist.
+- Test omissions as well as wrong values. A baseline absence contract covers
+  nested request/forward records too, including forbidden counters set to 0.
+  A new variant requires its loaded identity and actual per-forward dispatches.
+- Mock successful complete controller admission for every arm, not only helper
+  validators/imports. Capture immediate pre-child power in the launch scope,
+  not an out-of-scope cooldown local; test admission and saved assessment.
+- Gate ordered perf **and** uptime endpoints, identities/calibrations, and the
+  agreed active power mode, not merely an unchanged arbitrary mode. Derive
+  manifest/handoff/runtime caps from one authority so copied metadata cannot
+  silently contradict execution limits.
+
+### Stable operator sampling without selecting the fastest calls
+
+For short variable calls, declare batches long enough to discriminate the
+effect. Keep identical serial dispatch/commit/completion policy and workload/
+cache scope in both arms, with no inner idle, logging, fills or hashes.
+Retain every interval, including each batch's first call. The batch—not every
+correlated inner call—is the sample unit. Report host/setup/outer costs too.
+A changed batch duration is a new declared study: preserve prior inconclusive
+runs separately, do not pool them or infer a frequency cause from timing alone.
+Operator gains still require protected model and final workload comparisons.
+
+### Readiness and promotion are different decisions
+
+When both matter, compare reference, old implementation and candidate in one
+balanced same-window study. Bind each arm's own cwd/binary/assets and variant
+contract; declare chronological directions and within-block pairs explicitly,
+including nonadjacent pairs. The example triplet order is not a universal rule.
+Freeze candidate/reference readiness and candidate/old promotion gates
+separately before measurement. Good medians or functional correctness do not
+override cold-cost/pair regressions. Keep severe valid samples; a later normal
+diagnostic cannot exclude them or repair their acceptance result. A user may
+choose a qualified research milestone without retroactively lowering criteria.
 
 ## 5. Residency/first-submit causal probe
 
@@ -182,3 +267,25 @@ traffic; rates above advertised bandwidth imply reused/cache-served bytes or
 bad assumptions. Use counters or a controlled access-pattern/timing study
 before claiming saturation. Decode parity with MLX alone is neither a
 bandwidth-floor proof nor an impossibility theorem for further optimization.
+
+## 7. Public telemetry and information limits
+
+Respect declined administrator access: no sudo, privileged powermetrics,
+private API workaround or settings change. Use supported own-task
+TASK_VM_INFO/TASK_EVENTS_INFO, rusage and public NSProcessInfo/Metal telemetry
+with documented units and phase-bracketed snapshots. Logical compressed-ledger
+bytes are not physical compressed storage or GPU residency; process/global
+counters and sampled gauges have different scopes.
+Equal logical/allocated byte footprints and page-rounded address spans are
+not equal resident-page evidence. If a short child ends before resource polling
+observes it, zero sampled RSS means NOT SAMPLED, not a verified zero peak.
+
+Public Metal capabilities may expose only timestamps, with stage sampling
+supported but dispatch sampling unsupported. Leave frequency, traffic and
+utilization UNKNOWN when unavailable. Nominal thermal/default QoS/power
+samples do not exclude unsampled clock/stall/global activity; timestamp duration
+is not a frequency measurement. Decompression near first GPU/driver execution
+is temporal correlation, not causality; a warm request with no decompressions
+can still have slower GPU elapsed. If a severe slowdown is not reproduced,
+retain its historical result and stop at the information limit instead of
+rerunning until a win appears.
