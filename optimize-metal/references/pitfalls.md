@@ -6,9 +6,23 @@ points to the full numbered entry in `gotchas.md` for context. Read
 this list once before you start optimizing; re-read whenever a
 benchmark goes sideways.
 
-The full numbered list (60 entries with full reproductions) lives in
-`gotchas.md`. This file is the curated subset most directly relevant
-to the empirical attack order in SKILL.md.
+The full numbered list (60 historical entries) lives in `gotchas.md`.
+Examples are shape/device-specific, not universal attack-order rules.
+For native parity and timing, use `native-source-parity.md` and
+`measurement-and-diagnosis.md` alongside this list.
+
+## Before another experiment
+
+- **Read literal pinned source and observe real dispatch early.** A serial-
+  C-order “MLX-like” replacement can be correct but several times slower.
+  The frozen C diagnostic is not the optimized arithmetic schedule.
+- **Freeze config, not the directory name.** Verify quant group, layout,
+  hybrid attention, gate/state dtypes, installed packages and loaded shaders.
+- **Bound the diagnostic ladder.** One unchanged-kernel pilot, focused
+  family/threshold controls, then whole-model IDs. Avoid repeated broad
+  suites, full traces, model runs for every tile and unrelated compiler work.
+- **Persist early.** Buildable checkpoints/source-to-binary maps and compact
+  handoffs survive service failures; old failed receipts stay failed.
 
 ## During encoding / dispatch
 
@@ -52,16 +66,21 @@ to the empirical attack order in SKILL.md.
 - **Persistent param buffer + 2-deep pipeline = race.** Duplicate the
   param ring (`gpu_param_buf[slot]`, `slot ∈ {0,1}`) the same way you
   duplicated the id ring. (gotcha #35)
-- **Fused-residual epilogue shifts the bf16 round point.** `y = W·x +
-  residual` rounds once (in f32) instead of twice; tokens may
-  legitimately differ — regenerate the oracle or loosen tolerance.
-  (gotcha #34)
+- **Fused-residual epilogue shifts the BF16 round point.** Preserve the
+  native intermediate store/cast when required. Do not regenerate the
+  frozen C oracle or loosen bounds to accept a fusion. (gotcha #34)
+- **Rounded normalization can change argmax.** Native BF16 logsumexp
+  scalar → BF16 subtract → argmax is not raw-logit argmax by real-number
+  invariance. Replay sampler/head on identical inputs before blaming drift.
+- **Attention selectors size workspaces too.** Use the same checked
+  query/head/block selector in allocation and dispatch. Sweep small-M/GQA,
+  causal offsets and long-softmax/two-pass boundaries, not just short IDs.
 
 ## Profile-reading and "where's the gap?"
 
-- **`gpu_busy << wall` after batched dispatches** → host-side breaks
-  (look for `commit_wait` inside `forward()`); apply H1 glue kernels.
-  Usually the single biggest win. (gotcha #9)
+- **`gpu_busy << wall` is an unattributed gap.** Check host breaks/sampler,
+  setup, queue/first-submit delay, residency/paging and waits. Low coverage
+  alone does not prove CPU encoding is slow. (gotcha #9)
 - **Argmax over VOCAB=200k single-threaded** is by far the most common
   "why is decode capped at <5 tok/s" answer (also caps mid-pipeline
   decode at ~40 tok/s once everything else is in). Apply F1 immediately.
@@ -79,11 +98,10 @@ to the empirical attack order in SKILL.md.
 - **1-SG-per-row rmsnorm undersubscribes GPU at small M.** At M=BL=16
   you spawn 16 SGs vs M4 Max's ~160 capacity — kernel becomes
   memory-latency-bound. Use 4–16 SGs/row, merge via TG-mem. (catalog F4)
-- **"Are we done?" DRAM-BW ceiling check.** Sum per-token weight
-  bytes ÷ peak GB/s = your theoretical floor. At ≥ 95% of that
-  floor, further bf16 optimization is impossible; only quantization
-  can win more. Use this BEFORE chasing the last 1-2% — it usually
-  isn't there. (gotcha #59)
+- **Weight bytes/peak bandwidth is only an estimate.** Cache/reuse,
+  actual controller traffic, instructions and queue costs determine the
+  real limit. Neither nominal bandwidth nor MLX parity proves further
+  optimization impossible. (gotcha #59)
 
 ## Tuning sweeps
 
@@ -95,15 +113,17 @@ to the empirical attack order in SKILL.md.
 - **Quant GEMV: amortize `(scale, bias)` across the quant group.**
   Naive q8 inner loops re-read `(s, b)` every uint32 even though
   they're constant for the whole group. Load packed W as `uint4`
-  (16 q8 weights = one 64-elem group) → one `(s, b)` per uint4.
+  (16 q8 weights = one quarter of a 64-element group) → one `(s, b)`
+  per aligned uint4, with the group index derived from the format.
   Single biggest second-pass win on Qwen3.6 — +18.7% decode.
   Same trick generalizes to q4 and mxfp4. See catalog B6.
 - **Premature multi-SG SDPA hides the real SDPA win.** Apply D1 (parallel
   softmax) BEFORE D3 (multi-SG split), or you'll measure +5–10% and
   conclude SDPA isn't worth optimizing. (gotcha #31)
-- **Tile-size cargo-culting.** MLX's tile sizes for M2 are not optimal
-  for M4 or M1. Always sweep `(BM, BN, WM, WN)` on your target
-  machine. (gotcha #32)
+- **Tile-size cargo-culting.** First match the actual pinned device/shape
+  selector. Sweep a few profile-supported geometries only after native
+  routing works; use cheap operator screens, not full-model runs for every
+  combination. (gotcha #32)
 - **"BK=16 is the maximum" is a `WN=2` artifact.** At `WN=4` per-SG
   register pressure halves, unlocking BK=32/BK=64. Always sweep
   BK ∈ {16,32,64} × WN ∈ {2,4} with the register-budget formula.
@@ -134,12 +154,10 @@ to the empirical attack order in SKILL.md.
   Cataloged 1.05-1.10× was on early-stage W-dominant ports; after
   B6 the ratio flips and B4 can lose 1-2%. Measure and revert if
   it regresses. (gotcha #56, catalog B4)
-- **A8 concurrent encoder is useless on dense bf16 models.**
-  Catalog A8 works on quantized/MoE because the dominant linear
-  is at ~50% of W-BW peak (dequant overhead leaves bandwidth
-  free). On dense bf16 every chain is at 100% of peak — running
-  two BW-bound chains concurrently means each takes 2× longer.
-  Skip A8 for Gemma 4, Llama-3 bf16, Mistral bf16, etc. (gotcha #58)
+- **A8 can regress on dense BF16.** Shared-bandwidth contention can erase
+  concurrency gains, as in the Gemma case. Measure actual critical-path
+  overlap/headroom rather than declaring all dense chains saturated from
+  nominal weight-byte estimates. (gotcha #58)
 - **At decode, GEMM is W-bandwidth bound, not M.** Halving M
   (row-selective compute) when `M ≪ K` saves <1% — the W read
   dominates. Only worth it on compute-bound kernels. (gotcha #49)
@@ -175,6 +193,14 @@ to the empirical attack order in SKILL.md.
 - **Stale binary / thermal trap.** User reports a tok/s regression
   that you cannot reproduce. Common causes: thermally loaded GPU
   (background process), stale `.o` files in build, or DYLD caches
-  from prior debug session. Fix: `make clean && make`, close GPU-
-  using apps, `sleep 60` before first bench, best-of-5 with
-  `sleep 30` between runs. (gotcha #55)
+  from prior debug session. Verify dependencies, binary/loaded-library/
+  sidecar hashes and power/thermal state first; rebuild through project
+  tasks only when indicated. Then use a predeclared cooled counterbalance
+  with all samples, not best-of hunting. (gotcha #55)
+- **A timer-only residency win is not a user win.** Include residency
+  entry/restore and workspace/cache setup in ready/outer wall. Preserve
+  math/hazards/barriers during the first causal probe. No returned
+  full-model result means pending, not proven faster.
+- **KPROF must be absent after activation, not `0`.** Validate actual
+  child environment and finite/nonzero/ordered clocks. Union overlapping
+  GPU intervals clipped to phase; keep owner totals separate.

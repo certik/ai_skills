@@ -10,6 +10,11 @@ Read this file when your `./src-metal/` is a diffusion LLM and you've
 just finished the kernel-level wins. The end-game looks different from
 an autoregressive port.
 
+First inspect the pinned source/actual graph as described in SKILL.md.
+The examples/order below are historical, not automatic prescriptions.
+Use `measurement-and-diagnosis.md` for all-sample final counterbalances,
+setup-inclusive wall, hook exclusions and exact native rounding/count gates.
+
 ## Table of contents
 
 - [What's different](#whats-different) — autoregressive vs block-diffusion forward structure
@@ -81,8 +86,9 @@ host_post_wall += now_sec() - th;
 ```
 
 Then your stats line is `wall = gpu_busy + host_post + (encode_gap)`,
-where `encode_gap = wall - gpu_busy - host_post` is the residual
-host-encode overhead — usually small once H1/H2 are in.
+where the residual `wall - gpu_busy - host_post` is still unattributed:
+measure encode, setup and queue/driver waits rather than assuming all
+of it is host encoding. Union overlapping GPU intervals appropriately.
 
 ## What does NOT help (relative to autoregressive ports)
 

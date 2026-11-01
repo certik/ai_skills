@@ -4,10 +4,9 @@
 and any other modern dense (non-MoE, non-quantized) LLM whose every
 linear is one bf16 read of W times an x.
 
-**Why a separate attack order**: a dense bf16 LLM has *no quantization
-headroom* — every linear is at or near peak DRAM bandwidth in
-isolation. The default MoE / quantized attack order in SKILL.md still
-applies up to a point, but several late-pipeline steps that pay off on
+**Why a separate menu**: dense BF16 lacks affine dequantization work, but
+that does not prove every linear is bandwidth-saturated. Start with
+pinned source/actual dispatch and the profile. Several steps that pay off on
 Qwen3.6 do nothing here, and one obscure gotcha (per-layer
 `embed_gather` on Gemma 3/4 architectures) is the single largest
 late-stage win.
@@ -26,24 +25,24 @@ late-stage win.
    diagnosis recipe in gotcha #57.
 2. **F4 multi-SG rmsnorm at decode** (M=1, large D). Same as MoE.
 3. **D3 multi-SG SDPA with online merge.** Same as MoE.
-4. **B5 fuse residual into LAST linear epilogue.** Same as MoE.
-5. **STOP — check the DRAM-BW ceiling** (gotcha #59). If you're at
-   ≥ 95% of `(per-token weight bytes) / (peak GB/s)`, further
-   optimization is futile without quantization.
+4. **B5 round-preserving residual epilogue**, if native rounding allows it.
+5. **Assess remaining headroom**, not a hard weight-byte ceiling. Nominal
+   weight bytes/peak GB/s omits reuse/cache, actual traffic and instructions.
+   Read gotcha #59 and `measurement-and-diagnosis.md`.
 
 ## Skip on dense bf16
 
-- **A8 concurrent encoder** — every parallel chain is already at
-  ~100% DRAM peak; concurrent dispatches share the same ceiling.
-  Tokens correct but ~0% gain or slight regression from the
-  `autobar=false` overhead. (gotcha #58)
+- **A8 concurrent encoder** often loses to shared-bandwidth contention in
+  dense BF16; the Gemma example had no gain. Check actual chain headroom
+  before testing, rather than assuming all dense kernels saturate DRAM.
 - **B6 uint4 amortized (s,b)** — there are no `(scale, bias)` to
   amortize. The kernel doesn't apply.
 - **B4 TG-mem X-share** — gotcha #56's "regresses when L1/L2
   already serves X" applies even harder when W is already at
   peak.
-- **K_OUT=8 in GEMV** — already proven neutral on q8/uint4 and
-  now on bf16 too. Stay at K_OUT=4. (gotcha #60)
+- **K_OUT=8 in GEMV** was neutral/regressive on covered q8/BF16 cases.
+  Start with native geometry or K_OUT4, not an unbounded sweep. Re-test
+  only with a shape/device/profile reason. (gotcha #60)
 
 ## Worked example — Gemma 4 E4B on M4 Max
 
@@ -51,8 +50,8 @@ Naive port: 5.6 tok/s. After B1/D1/H1 + per-layer-embed_gather fix +
 F4 + D3 + B5: **49.7 tok/s short / 45.6 tok/s long, beating MLX
 48.2 / 44.1 by +3.1% / +3.4%**.
 
-At 99-108% of theoretical DRAM ceiling — no more wins available
-without quantization.
+The reported99–108% of a nominal weight-byte estimate reflects cache/reuse
+or imperfect assumptions; it does not prove no further wins are possible.
 
 ## Why per-layer embed_gather is so painful
 

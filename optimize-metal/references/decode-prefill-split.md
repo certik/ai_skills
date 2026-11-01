@@ -24,8 +24,9 @@ if (Lq > 1) {
 | Expert mix    | `expert_mix_bf16_add` (K_top combine)| `moe_combine_scatter` (scatter)     |
 | SDPA          | many SGs per (head,query_token)      | one SG per (head,query_token)       |
 
-The two paths can share everything else (RMSNorm, RoPE, SwiGLU,
-residual_add) — those are equally efficient at any `Lq`.
+These are illustrative paths. RMS, activations, attention and reducers may
+also have shape-dependent native selectors. For literal parity, reproduce
+the pinned device/K/N/M thresholds, not a universal `Lq>1` branch.
 
 ## Why
 
@@ -42,8 +43,9 @@ A single kernel that does both well does not exist on Apple GPUs.
 
 Don't split prematurely. Order of operations:
 
-1. Get both phases working with ONE kernel set (the decode-friendly
-   ones). Prefill will be slow but correct.
+1. Inspect actual native selectors and validate representative decode
+   and prefill shapes. Do not spend days forcing both through serial-
+   C-order kernels when the native family is known.
 2. Profile. If prefill is the dominant cost (almost always when
    prompts are >128 tokens), introduce the prefill-optimized variant.
 3. Switch to two-path dispatch.

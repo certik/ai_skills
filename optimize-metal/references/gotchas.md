@@ -4,6 +4,12 @@ Concrete bug-and-fix war stories from optimizing src-metal/ ports.
 Each one cost at least one debug iteration; consult BEFORE chasing
 the same symptoms again.
 
+This is a historical archive, not a universal attack order. Use SKILL.md's
+source-first path and `measurement-and-diagnosis.md` for current acceptance.
+Best-of examples below retain old observations, not a recommended final
+protocol. Nominal bandwidth figures/ratios are estimates, not measured
+controller saturation. Keep original attributions and failed evidence.
+
 ## Table of contents
 
 | #  | Topic                                                                | Category    |
@@ -32,12 +38,12 @@ the same symptoms again.
 | 22 | Common barrier-removable groups in transformer LLMs                  | Barriers    |
 | 23 | KPROF inflates total runtime ~30% but is the right tool              | Profiling   |
 | 24 | Fuse out-of-place elemwise pairs into one kernel                     | Fusion      |
-| 25 | tok/s differences < 2% are noise — run 5 times                       | Measurement |
+| 25 | Small tok/s differences need a predeclared cohort and spread        | Measurement |
 | 26 | Two different "barriers" — don't confuse them                        | Barriers    |
 | 27 | `forward()` should ACCEPT a cmdbuf, not own one                      | Architecture |
 | 28 | macOS `madvise(MADV_WILLNEED)` is BLOCKING — never use it on big files | Startup |
 | 29 | mmap + memcpy is page-fault-bound at ~1 GB/s — use parallel pread    | Startup     |
-| 30 | First Metal cmdbuf pays ~1 s residency wiring per ~30 GB of buffers  | Startup     |
+| 30 | First-submit gap: distinguish queue/residency hypothesis from timing | Startup     |
 | 31 | Premature multi-SG SDPA hides the real SDPA win                      | SDPA strategy |
 | 32 | Tile-size cargo-culting — MLX tiles for M2 ≠ optimal for M4/M1       | GEMM tuning |
 | 33 | Forgetting GQA when SG handles a (token, head) pair                  | SDPA bug    |
@@ -65,8 +71,8 @@ the same symptoms again.
 | 55 | Stale binary trap — user-reported tok/s regression that disappears on a clean rebuild is a thermal/binary cache artifact | Measurement |
 | 56 | B4 (TG-mem X-share) can REGRESS on chips with strong inter-SG cache reuse — measure, don't assume                    | GEMV tuning |
 | 57 | Per-layer `embed_gather` kernels (Gemma 3/4-style) hide a 1-SG-per-row bug worth ~25 ms/token of pure latency        | Dispatch    |
-| 58 | A8 concurrent encoder buys nothing on dense bf16 models — every chain is DRAM-saturated, not parallel-deficient      | Strategy    |
-| 59 | The "are we done?" DRAM-BW ceiling check — per-token weight bytes ÷ peak GB/s ≥ measured ms/token                    | Strategy    |
+| 58 | A8 can regress on dense BF16 — check critical-path headroom         | Strategy    |
+| 59 | Weight-byte bandwidth estimate is not a hard stopping condition     | Strategy    |
 | 60 | K_OUT=8 regresses on bf16 GEMV too — the K_OUT=4 sweet spot is independent of precision                              | Register tile |
 
 ---
@@ -136,16 +142,17 @@ Concretely (Qwen3.6-35B-A3B on M4 Max):
 
 GPU did 90 ms of prefill compute but the cmdbuf took 3.09s wall.
 
-Always print BOTH wall and gpu_busy in your decode line — the gap is
-your remaining CPU-encode overhead, which is what the 2-deep pipeline
-(A4) eliminates.
+Print both wall and valid GPU interval coverage. The gap is unattributed:
+encoding, setup, host breaks, queue/driver waits and residency can contribute.
+Time encode and post-submit GPU start separately before reaching for A4.
 
 # 6. Decode tok/s variance is +/-20% with short runs
 
 Single short runs (8-32 tokens) on a busy machine routinely show
 3-5x tok/s variance from other apps / thermal state / Metal queue
 contention. Stable measurements need AT LEAST 64 decoded tokens AND
-multiple runs (best-of-3).
+multiple runs. Use a predeclared counterbalanced final cohort with all
+samples, median/spread/pairs; best-of is supplementary.
 
 # 7. Forgetting threadgroup_barrier between phases of a same-SG kernel
 
@@ -457,7 +464,7 @@ Examples from Qwen3.6:
 
 Even more general: any "init buffer; then modify it" pair is fusable.
 
-# 25. tok/s differences < 2% are noise — run 5 times
+# 25. Small tok/s differences need a predeclared cohort and spread
 
 Single-run decode tok/s on a quiet machine still has ~1-2% variance
 from:
@@ -466,12 +473,12 @@ from:
   * Thermal state
   * Memory pressure
 
-When a commit claims a 1-2% speedup, verify with 5 runs and take
-median or best-of-3. Anything below 2% is in the noise band.
-
-Conversely: if a 5-run median is +3% or better, the win is real
-(in our session 66.0 → 66.9 was a 5-run-confirmed real +1.4% win,
-just barely).
+When a change claims a small speedup, use declared margins, a counterbalance
+and all samples with medians/spread/pairs. A fixed2%/3% rule or best-of
+number cannot establish significance. Keep ambiguous screens INCONCLUSIVE;
+do not repeatedly resample until the desired claim appears.
+The historical66.0→66.9 observation was a scoped small effect, not a
+universal noise threshold or formal noninferiority result.
 
 # 26. Two different "barriers" — don't confuse them
 
@@ -561,20 +568,18 @@ This is a good illustration of why total wall is a real success
 criterion, not just tok/s. See gotcha #40 for why per-tensor
 `newBufferWithBytesNoCopy:` isn't a viable alternative.
 
-# 30. First Metal cmdbuf pays ~1 s residency wiring per ~30 GB of buffers
+# 30. First-submit gap: distinguish queue/residency hypothesis from timing
 
-The very first cmdbuf submitted to Metal that references a large
-working set of MTLBuffers blocks for ~1s before the GPU starts work.
-`gpuStartTime - committedTime` is the wait; actual GPU execution time
-(`gpuEndTime - gpuStartTime`) is much smaller. This is Metal's
-residency / wiring of the buffers into the GPU address space, paid
-exactly once.
+Some historical ports observed a large first-submit→GPU-start interval
+with short actual GPU execution. That measurement alone does not establish
+residency/wiring as cause, a fixed per-GB tax or a once-per-process guarantee.
+Measure encode/commit/GPU-start and entry/ready/outer clocks separately.
 
 **Symptom**: `prefill: 1.5s (16 tokens; 11 tok/s; gpu_busy=0.08s)` —
 huge gap between wall time and gpu_busy.
 
-**Quantification**: ~1s per ~30 GB resident, scales roughly linearly
-with the number of distinct MTLBuffers (2090 in our case).
+**Historical observation**: about1s with roughly30GB and2090 buffers;
+this is not a validated scaling law for another device/workload.
 
 **Workaround attempts that did NOT work**:
 - Trivial argmax-only warmup cmdbuf: ineffective because it only
@@ -582,28 +587,21 @@ with the number of distinct MTLBuffers (2090 in our case).
   cmdbuf.
 - Full forward(Lq=1) warmup cmdbuf: works (shifts the 1.4s out of
   prefill into "warmup"), but TOTAL wall time is unchanged.
-- Run warmup forward(Lq=1) CONCURRENTLY with parallel pread copy:
-  fails because the CPU pread writes to wired buffers, and Metal
-  appears to invalidate residency on concurrent CPU writes, so the
-  subsequent real prefill re-pays the residency cost.
+- Concurrent warmup/pread did not remove the gap in that experiment.
+  CPU writes invalidating residency was an unproved explanation, not a
+  portable API rule; buffer hazards/owners and clocks need separate evidence.
 
-**Workable mitigation (TTFT only)**: do the full forward(Lq=1) warmup AFTER copy
-finishes. It shifts the 1.4s out of the user-visible "prefill" phase
-(time-to-first-token) but does not reduce total wall time. Only use
-this if TTFT matters more than total time.
+**Timer-boundary caution**: a warmup after loading can move1.4s outside
+conventional prefill, but it remains setup/user-ready/outer work. That is
+not a genuine user-visible TTFT improvement unless those endpoints improve.
 
-**Better mitigation (macOS 15+): `MTLResidencySet` + async overlap**.
-macOS 15 added `MTLResidencySet` — an explicit resident-set API. Pre-paying
-via `[device newResidencySetWithDescriptor:...]` + `[set addAllocations:...]`
-+ `[set commit]` + `[set requestResidency]` + `[queue addResidencySet:]`
-*before* the first real cmdbuf eliminates the in-cmdbuf wait entirely.
-`requestResidency` itself is blocking (~85 ms for ~12 GB on M4 Max), so
-doing it synchronously just moves the cost to startup — no total-wall
-win. The real win is dispatching the residency request on a background
-`dispatch_async(QOS_CLASS_USER_INITIATED, ...)` queue **immediately
-after MTLBuffer allocation**, so it overlaps with parallel pread. On
-Dream-7B (M4 Max, 14 GB weights, 4 shards): -90 ms total wall, GPU
-utilization 94% → 99%, prefetch wall 190 → 100 ms.
+**Conditional candidate (macOS15+): `MTLResidencySet` + async overlap**.
+Creation/membership/commit/request/queue-attachment is an explicit lifecycle.
+The historical Dream-7B/M4 Max14GB experiment reported -90ms total wall,
+GPU utilization94%→99%, prefetch190→100ms with async overlap. Preserve that
+observation, not a universal elimination guarantee or blocking85ms rule.
+Establish a single-variable lifecycle control and actual setup-inclusive
+benefit first, then separately test overlap with parallel pread.
 
 Skeleton (Objective-C, macOS 15+):
 
@@ -625,23 +623,24 @@ Skeleton (Objective-C, macOS 15+):
       for (size_t i = 0; i < n_bufs; i++) allocs[i] = nil;
       free(allocs);
       [set commit];
-      [set requestResidency];      // ← BLOCKS for ~85 ms / 12 GB; put on bg
+      [set requestResidency];      // time lifecycle/outer wall; no fixed tax assumed
       [queue addResidencySet:set]; // wire to the command queue
   }
 #endif
 ```
 
-The previous "concurrent warmup vs CPU pread" race (above) is also
-avoided: `MTLResidencySet` operates on **already-allocated** buffers
-*after* their content writes — CPU writes via `[buf contents]` to
-shared-storage buffers don't invalidate the residency the way the
-warmup-cmdbuf path did.
+The skeleton illustrates API spelling, not complete allocation/cache/
+pending-member/thread-safe/in-flight-owner accounting. Do not infer a
+CPU-write invalidation rule from the historical warmup attempt.
 
-**Conclusion (revised)**: this is *not* a fixed cost on macOS 15+.
-The combined recipe (parallel pread + async MTLResidencySet)
-saves both the I/O time *and* the residency wiring time, hiding
-~85 ms inside the pread tail. Treat it as a standard optimization
-for any large-working-set Metal workload.
+**Scope correction**: the historical Dream result supports a conditional
+async-overlap experiment, not a universal fixed85ms tax or mandatory remedy.
+The skeleton is not the full pinned allocator lifecycle. Inspect request/
+queue attachment, allocatedSize admission, pending/cached owners, membership
+commit and sync/limit restoration. First change residency alone with math,
+hazards/barriers/loader fixed; report entry/ready/submit/GPU/exit/outer wall.
+Native entry need not reread/page-touch/forward/wait. No performance result
+means pending; moving entry outside prefill is not a speedup.
 
 # 31. Premature multi-SG SDPA hides the real SDPA win
 
@@ -701,19 +700,13 @@ When you fuse `y = (W·x + residual)` instead of doing
 the residual is now added inside the same f32 accumulator. The bf16
 round happens once at the end, not twice. **Token output may differ.**
 
-This is correct (one fewer rounding step), but:
-
-1. The first-N-tokens-match check against the unfused C reference may
-   fail at token ~10–50 even though the kernel is "right".
-2. The diff vs an ORACLE dump (MLX or HF) typically *shrinks* (fewer
-   rounds = closer to f32).
-3. Per-element tolerance vs the unfused C ref may need to loosen from
-   1e-2 to ~5e-2 absolute on residual-stream arrays.
-
-**Fix**: ALSO regenerate the C-reference oracle dump with the
-equivalent fused-rounding kernel, OR loosen the tolerance and re-verify
-the first N tokens match the model's actual greedy output (e.g., MLX
-greedy on the same prompt).
+Fewer rounding steps do **not** automatically implement the reference.
+For literal native parity, preserve its intermediate BF16 cast/store before
+residual addition, even within a fused dispatch. Compare identical inputs
+to native output and frozen C bounds independently; require full workload
+IDs before promotion. Do not regenerate the frozen C oracle or loosen
+bounds to accept the failure. A genuinely requested semantic/precision
+change needs a separately versioned contract, not an optimization waiver.
 
 # 35. Persistent param buffer + 2-deep pipeline = race; duplicate the ring
 
@@ -1593,19 +1586,17 @@ session. The Metal runtime + macOS combined are extremely sensitive
 to all three.
 
 Recovery recipe:
-1. `make clean && make qwen35` (force fresh build — there have been
-   cases where stale `.o` files were keeping a prior kernel in the
-   binary).
-2. Close all other apps using the GPU (Slack, Chrome with hardware-
-   accelerated video, anything running an ML model).
-3. `sleep 60` to thermally cool the GPU before the first run.
-4. Best-of-5 with `sleep 30` between each.
+1. Compare source/binary/loaded libraries/generated sidecars/options and
+   build dependencies; rebuild via project tasks when indicated, not an
+   automatic broad clean.
+2. Check actual child hooks/environment, timer/workload scope and power/
+   thermal/memory/quiet receipts. Do not kill unrelated processes.
+3. Arrange an authorized cooled window and one predeclared counterbalance,
+   retaining every sample and all interrupted attempts separately.
 
-If the regression persists, `git bisect` is the right tool — but
-don't bisect on a single short run; each commit needs the same
-best-of-5 + thermal-cool-down treatment to be reliable. A "70 vs
-95" gap is BIGGER than this measurement's noise floor (±2-3% on a
-quiet machine), so if it survives the cool-down protocol it's real.
+If a source-bound regression persists, bisect with focused correctness/
+operator evidence and a stable timing protocol. Do not spend a full model
+cohort on every commit or repeatedly hunt a favorable best-of result.
 
 # 56. B4 (TG-mem X share) can REGRESS — Apple cache is already good at sharing X
 
@@ -1637,14 +1628,13 @@ On Qwen3.6-35B-A3B (M4 Max, K=2048, post-B6) the net was **-1 to
 Heuristic for whether B4 will help on YOUR target:
 - **Apply B6 first.** If W is no longer the dominant traffic
   source (B6 didn't change the picture much), B4 likely helps.
-- **Profile with KPROF.** If the linear_q8 kernel is still well
-  below the W-bandwidth floor (e.g. <40% of theoretical peak),
-  cache hits aren't yet saturating — B4 may help.
-- **If at the W-BW floor already**, B4 is risky. Try at WG=2
-  first (smaller barrier cost) before WG=4.
+- **Profile actual shapes.** Low nominal W-bytes/time suggests a
+  cache/load/occupancy hypothesis, not proof of saturation or its absence.
+- **If X already hits cache**, B4 is risky. Try a bounded small geometry
+  first; use source/traffic evidence before a broader sweep.
 
-Always **measure with best-of-5 + thermal cool-down**, not a
-single run. The catalog's 1.05–1.10× is a CHIP/MODEL/STAGE-
+Use a declared cooled counterbalance/all samples for acceptance, not
+one run or best-of alone. The catalog's1.05–1.10× is a CHIP/MODEL/STAGE-
 specific figure, not a guarantee.
 
 # 57. Per-layer `embed_gather` kernels (Gemma 3/4-style) hide a 1-SG-per-row bug worth ~25 ms/token of pure latency
@@ -1720,7 +1710,7 @@ your `forward()` (not just before/after it). Run KPROF — if
 `embed_gather` shows ≥ 2% of GPU with `us_per_call > 50`, you have
 this bug.
 
-# 58. A8 concurrent encoder buys nothing on dense bf16 models — every chain is DRAM-saturated
+# 58. A8 can regress on dense BF16 — check critical-path headroom
 
 Catalog A8 ("parallelize independent chains via concurrent encoder")
 was THE big late-stage win on Qwen3.6-35B-A3B (quantized MoE, +3-5%
@@ -1728,14 +1718,11 @@ final). Tempting to apply on every model. But on a **dense bf16**
 model like Gemma 4 E4B (no quantization, no MoE), the A8 framework
 will run cleanly but produce **zero speedup or slight regression**.
 
-**Why**: A8 wins when one chain has GPU headroom that another
-chain's barriers were forcing idle. In quantized models, the
-linear_q8 kernel is at ~50% of theoretical W-BW peak (dequant
-overhead), leaving 50% of DRAM bandwidth available for a parallel
-chain. In **dense bf16**, the linear_k4_k8 kernel is at **~100%**
-of peak (just streams bf16 weights directly). There is no spare
-DRAM bandwidth for a second chain to consume. Running two BW-bound
-kernels concurrently → each takes 2× as long → same wall.
+**Why it can lose**: A8 needs critical-path headroom. Concurrent chains can
+contend for shared bandwidth/compute and add encoding/barrier overhead.
+Nominal weight-bytes/time percentages do not measure free controller
+bandwidth, so neither “quantized always helps” nor “dense always saturates”
+follows. Check real shape/graph/overlap evidence.
 
 **Concrete (Gemma 4 E4B, M4 Max)**:
 - KPROF: top two kernels (`linear_k4_k8` 48%, `gate_up_geglu` 41%)
@@ -1745,56 +1732,37 @@ kernels concurrently → each takes 2× as long → same wall.
   autobar=false toggling cost ~2% wall.
 - Reverted A8, no net change. Stayed at 50.9 tok/s.
 
-**Diagnostic before applying A8**: profile each candidate kernel's
-% of DRAM peak. If both kernels in the candidate parallel pair are
-each already ≥ 90% of DRAM peak in isolation, A8 will not help.
-Apply A8 only when one chain has clear compute headroom (SDPA,
-small elemwises) or when at least one chain is bottlenecked on
-something other than DRAM (e.g. dispatch latency).
-
-**General rule**: A8 helps quantized/MoE models (Qwen3.6, Mixtral,
-DeepSeek-V2/V3 style). For dense bf16 (Gemma 4, Llama-3 bf16,
-Mistral-7B bf16), skip A8 and finish at MLX parity via embed_gather
-fix + standard SG-per-output GEMV + multi-SG SDPA.
+**Diagnostic before A8**: inspect shared/disjoint read/write ownership and
+actual critical-path idle/overlap, then screen a bounded change. The Gemma
+negative result remains useful; it is not a theorem for every dense model.
 
 # 59. The "are we done?" DRAM-BW ceiling check
 
-Late in optimization, decide whether further effort is worth it
-with this 4-line analytical check (separate from KPROF):
+Compute a **weight-only estimate**, not a hard stopping rule:
 
-1. Sum the weights you read PER TOKEN at decode (skip the embedding
-   table — only 2 rows are gathered per token).
-2. Divide by peak LPDDR5 bandwidth (M4 Max: 410 GB/s; M3 Max: 400;
-   M2 Max: 400; M1 Max: 400; Pro/base chips ≈ 200; Ultra: 800).
-3. That's your theoretical minimum ms/token.
-4. Compare to measured wall ms/token. If ≥ 95%, you are at the
-   wall — STOP. Further wins require quantization or a smaller
-   model.
+1. Derive bytes from actual demand/packing/group metadata, not all on-disk
+   tensors or an assumed one-read-per-forward rule.
+2. Verify the specific device's advertised bandwidth; do not reuse a
+   historical family-wide figure.
+3. Label bytes/bandwidth analytical; measure real kernel/phase time.
+4. Account for cache/reuse, actual controller traffic, KV/state/partial
+   traffic, instructions and queue/setup. Use counters or a causal study
+   before claiming saturation or no further optimization headroom.
 
 **Worked example (Gemma 4 E4B, M4 Max)**:
 - Per token weights: 42 layers × ~200 MB + lm_head 1.34 GB +
   per_layer_model_projection 55 MB ≈ **8.9 GB** for short bench.
 - 8.9 GB / 410 GB/s = 21.7 ms/token = **46.1 tok/s ceiling**.
-- Measured: 49.7 tok/s short. That's **108% of theoretical** (cache
-  hits help). We're past the wall. STOP.
+- Measured:49.7 tok/s short,108% of that nominal estimate. Cache/reuse or
+  incomplete assumptions explain why it is not a hard physical ceiling.
 - Long bench adds KV cache reads (~3.9 MB/token × growing context
   / 410) → ~22 ms/token = 45 tok/s ceiling. Measured 45.6. Same.
 
-**For quantized models**: replace "weights bytes" with the actual
-on-disk byte count (q8 = N_params × 1.125 incl. scales/biases,
-q4 = N_params × 0.625, mxfp4 = N_params × 0.5625). Same math.
-
-If you're at < 60% of the ceiling, a lot of optimization remains.
-If at 80%, maybe one more pass. If at ≥ 95%, the *only* further
-wins are algorithmic (smaller model, lower precision). The
-catalog's A–I sections all assume sub-ceiling status; once
-you're at the ceiling they are no-ops.
-
-**Don't confuse "% of DRAM peak measured by KPROF on the dominant
-kernel" with this whole-decode ceiling**. KPROF often shows
-linear_k4_k8 at 100% of peak while the rest of the forward
-(rmsnorm, SDPA, elemwises) adds 5-10% extra wall. The ceiling
-above is the *aggregate* check.
+For quantized models, metadata bytes depend on actual group size/dtype/
+format; there is no universal q8/q4 multiplier. Nominal effective bandwidth
+from KPROF is not measured controller traffic or a whole-decode ceiling.
+Native parity itself is not proof no faster algorithm/kernel/runtime exists.
+Stop on agreed gates or explicit evidence-backed disposition, not95%.
 
 # 60. K_OUT=8 regresses on bf16 GEMV too — the K_OUT=4 sweet spot is independent of precision
 
@@ -1820,8 +1788,7 @@ work. No dispatch-overhead amortization either — each SG already
 amortizes over K=2560 inner iterations, dispatch overhead is
 < 0.1% of kernel time.
 
-**Conclusion**: K_OUT=4 is universally the sweet spot on
-M4-generation Apple Silicon, across q8, q4, uint4, and bf16.
-Don't sweep K_OUT in your optimization workflow; just set it to 4
-and move on. (If you're on a future generation with much higher
-concurrent-SG capacity, e.g. > 500, this may flip — re-test then.)
+**Conclusion**: K_OUT4 is a useful historical default for these shapes.
+Prefer actual native geometry; do not sweep without a profile/shape/device
+reason. These results do not establish a universal optimum for all kernels,
+formats or current/future hardware.

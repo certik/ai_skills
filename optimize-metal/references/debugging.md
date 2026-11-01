@@ -8,31 +8,21 @@ parity.
 
 ### "Tokens diverged after change X — how do I localize?"
 
-1. Make sure the C reference (`./src-cpu/`) is still committed and
-   produces the same tokens it always did.
-2. Add a `--dump <dir>` flag to BOTH `./src-cpu/<BIN_CPU>` and
-   `./src-metal/<BIN>` that writes every per-kernel input + output to
-   `<dir>/<kernel>_L<layer>.bin` (same .bin format as
-   `tools/dump_ref.py`).
-3. Run both with the same prompt:
-   ```
-   ./src-cpu/<BIN_CPU>  --prompt "..." --dump src-cpu/refs
-   ./src-metal/<BIN>    --prompt "..." --dump src-metal/refs
-   ```
-4. Binary-diff per kernel:
-   ```
-   for f in src-cpu/refs/*.bin; do
-       name=$(basename "$f")
-       cmp -l "$f" "src-metal/refs/$name" | wc -l
-   done | sort -nr | head
-   ```
-   The first non-zero kernel in forward order is the culprit.
+Verify frozen C, candidate and pinned native source/binary/options/input
+identities. Use identical teacher-forced tokens/state, then native sampler
+on candidate logits, native head on candidate normalized hidden, and first
+upstream primitive replay. Retain sparse first-divergence slices/hashes or
+streaming comparisons, not every large tensor indiscriminately.
+Follow [the diagnosis ladder](measurement-and-diagnosis.md#1-first-divergence-ladder).
+The first differing tensor localizes evidence; it is not automatically
+the cause or a compiler defect.
 
 ### "Decode is fast, prefill is slow"
 
-You probably have not yet implemented the **prefill GEMM path** (MMA
-tile) or the **sorted-gather MoE** for prefill (E3). Apply C1+C2 and
-E3.
+Check timing/setup exclusions first, then actual native prefill routes and
+hot shapes. MMA/split reducers (C1/C2), attention or recurrence may dominate.
+Use E3 only for an actual MoE path. D256 prefill can select generic native
+QK/softmax/PV rather than flash; inspect the selector.
 
 ### "Prefill is fast, decode is slow"
 
@@ -41,13 +31,14 @@ gate+up+swiglu** (E2), or **parallel argmax** (F1).
 
 ### "Tok/s drops every few tokens"
 
-Memory pressure / paging. Check `wired_limit` (A7) and verify weights
-are zero-copy mmap'd (`gpu_buf_wrap_nocopy`).
+Check memory pressure, queue/copy/allocation and residency clocks before
+attribution. Inspect the actual pinned loader; direct pread into Metal
+buffers can be native, so zero-copy mmap is not a prerequisite.
 
 ### "Performance is bursty"
 
-CPU encode is becoming the bottleneck. Apply 2-deep cmdbuf pipeline (A4)
-+ persistent / const param buffers (A2 + A3).
+Separate encode from post-submit GPU delay and host sampling/setup. Apply
+A4/A2/A3 only if measured encode/lifetime overhead is the bottleneck.
 
 ### "Validated kernel-by-kernel but end-to-end tokens still diverge"
 
@@ -62,10 +53,10 @@ barriers (`threadgroup_barrier` inside a kernel vs
 
 ### "First N tokens match, then diverge slowly"
 
-This is *probably* pure numerical drift. To confirm: dump per-layer
-intermediates from both the old commit and the new commit on the SAME
-input ids; verify they agree to bf16 tolerance. If yes, the divergence
-is purely numerical and acceptable. If no, you have a bug — revert.
+Do not assume drift or waive the ID gate. Check native rounded sampler,
+identical-input head/hidden and first upstream state, plus dispatch/capacity/
+hazard boundaries. Primitive bounds on identical inputs do not automatically
+cover an accumulated divergent trajectory. Record unlocalized causes honestly.
 
 Common silent-bug source: KV cache `max_ctx` and SDPA TG-mem `MAX_CTX`
 not agreeing, OR both not being ≥ `prompt_len + max_tokens`. The first
@@ -74,19 +65,20 @@ N tokens still match because the overrun hasn't happened yet. See
 
 ### "Numbers look great but I can't reproduce them"
 
-Variance is the most likely culprit. See `profiling.md` "Run length and
-best-of-N". Below 2% is noise; require best-of-3 or 5-run median
-before declaring a win.
+Check actual binary/library/sidecar/options, timer boundaries, power/thermal
+and guard receipts first. Use a predeclared counterbalance with all samples,
+medians/spread/pairs; see `measurement-and-diagnosis.md`. A fixed percentage
+does not by itself distinguish a real effect from noise.
 
 ## Late-stage barrier-removal checklist
 
-When you're at ~95% of MLX and decode is GPU-bound (`gpu_busy ≈ wall`),
-the remaining gap is almost always serialized concurrency. Walk
-through this checklist for each layer type in your model.
+If the actual graph/profile shows independent chains with critical-path
+headroom, walk through this checklist. Near-MLX throughput and GPU coverage
+alone do not prove concurrency is the remaining cause.
 
-For each item, verify with a token-id match against the prior commit
-(`--max-tokens 16`). For each commit, run 5 times and use median to
-distinguish a real 1–2% win from noise.
+For each changed dependency, validate focused guards/reuse and short production
+IDs; require all requested native workload IDs before final promotion. Avoid
+a full timing series for every barrier. Preserve native round points in fusion.
 
 ### Attention layer
 
@@ -138,10 +130,8 @@ the ones with no overlap. See `gotchas.md` #22 for the full pattern.
 
 ## Critical-path concurrency wins last
 
-Once individual kernels are ~bandwidth-saturated (e.g., linear_q8 at
-25µs for K=N=2880 is reading ~11MB of weights at ~430 GB/s — within 7%
-of M4 Max's peak), making the kernel "faster" buys nothing. The only
-remaining wins are:
+When measured critical-path evidence indicates heavy kernels have little
+headroom, useful remaining candidates include:
 
 1. Reducing the critical path (fuse dispatches that produce X →
    consume X).
@@ -149,4 +139,5 @@ remaining wins are:
    parallel (see `parallel-chains.md`).
 
 For Qwen3.6-35B-A3B at >65 tok/s, ALL further wins came from category
-(2). None from kernel-internal optimization. See `gotchas.md` #19.
+(2) in that historical stage. This is not a universal ceiling derived from
+nominal weight bytes/time. See `gotchas.md` #19 and #59.

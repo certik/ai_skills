@@ -4,8 +4,8 @@
 
 When you've already pulled the obvious decode wins (qmv4, parallel
 argmax, multi-SG SDPA, glue kernels, 2-deep pipeline) and you're stuck
-~5% short of MLX, the remaining gap is almost always **serialization
-of independent computation chains**.
+~5% short of MLX, **serialization of independent computation chains**
+is one candidate if the actual critical-path profile supports it.
 
 A typical MoE layer has two completely independent subgraphs that share
 ONLY their input (post_attn_rmsnorm output):
@@ -100,11 +100,13 @@ plain dispatches except at the genuine fan-in barriers.
 
 ## Diagnostic — measure first
 
-If `gpu_busy ≈ wall` (within a few %), you ARE GPU-bound and removing
-serial barriers WILL help if hazards permit.
+If GPU interval coverage is near wall, check actual chain headroom and
+overlap. Removing barriers can help when hazards permit, but bandwidth
+contention can erase the gain.
 
-If `gpu_busy << wall`, you have CPU-encode overhead — fix that first
-with the 2-deep pipeline (A4).
+If coverage is low, separate CPU encoding, host sampling, first-submit/
+residency/queue waits and setup first. Use A4 only for measured encoding
+overhead and preserve completion-owned arenas/retired owners.
 
 ## Commit reference
 

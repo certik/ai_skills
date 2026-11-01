@@ -1,9 +1,17 @@
 # Optimization Catalog
 
 The full menu of named optimization techniques, organized by bottleneck
-category. SKILL.md gives the **empirical attack order** (what to apply
-first); this file is the menu you consult when the profile tells you
-which kernel category is hot.
+category. SKILL.md gives the source-first workflow; this is the menu
+after observed native dispatch and the current profile identify the gap.
+Empirical speedups below are historical shape/device observations, not
+universal promises or evidence of literal native equivalence.
+
+For source/options/ABI/rounding/graph parity use
+[native-source-parity.md](native-source-parity.md); for final timing,
+first-submit/residency probes and bandwidth limits use
+[measurement-and-diagnosis.md](measurement-and-diagnosis.md).
+Best-of statistics in historical examples are supplementary, not the
+final acceptance protocol. Keep frozen C bounds/oracles independent.
 
 Each entry has:
 
@@ -33,7 +41,8 @@ each section the entries are roughly in the order you'd apply them.
 
 ## A. Host-side scheduling
 
-Apply first; costs nothing in correctness.
+Apply when the graph/profile justifies it. Scheduling changes affect
+ownership, work counts and hazards, so they require correctness checks too.
 
 ### A1. Batch all dispatches per forward() pass
 
@@ -110,6 +119,10 @@ so the CPU never races with the in-flight argmax write).
 
 **Commit**: 1f1afbd.
 
+**Native-graph caveat**: preserve actual prefix demand, normalized sampler,
+queued lookahead and final synchronization. Slots/arenas/scratch and retired
+KV owners belong to command-buffer completion, not CPU yield/handle swap.
+
 ### A5. Concurrent encoder with explicit barriers
 
 **What**: By default, Metal's compute encoder serializes every dispatch.
@@ -133,7 +146,9 @@ Per-kernel sources can be compiled lazily on first dispatch and cached.
 For many kernels, dedicate one combined library at startup (see
 `kernel_concat.c`) so JIT happens once.
 
-**When**: Always. The naive port already does this through `kernel_concat`.
+**When**: Match the observed runtime and declared startup scope. Use
+option-sensitive caches and tracked generator/header/sidecar dependencies;
+do not assume eager single-library JIT is always the native path.
 
 **Speedup**: indirect — avoids first-dispatch hiccups in timing.
 
@@ -141,39 +156,38 @@ For many kernels, dedicate one combined library at startup (see
 
 ### A7. `wired_limit` hint for working-set residency
 
-**What**: `[MTLDevice setShouldMaximizeConcurrentCompilation:YES]` and
-`[buffer setPurgeableState:MTLPurgeableStateNonVolatile]` keep the
-weights resident in unified memory. The `recommendedMaxWorkingSetSize`
-API gives you the residency budget.
+**What**: Mirror the actual supported allocator/residency lifecycle, not
+unrelated compilation or purgeability hints. In the pinned macOS15+/Metal3
+MLX path, a persistent requested residency set attaches to relevant queues.
+The global limit uses recommended working-set size; allocatedSize admission,
+pending membership/commit and synchronized restoration are separate from
+logical model bytes. These calls do not prove physical page-in latency.
 
 **When**: If you see paging hiccups with large models.
 
-**Speedup**: variable; eliminates worst-case stalls.
+**Speedup**: conditional; validate entry/ready/submit/GPU/exit/outer clocks
+before claiming a stall was removed. See `measurement-and-diagnosis.md`.
 
 **Commit**: 6361113.
 
 ### A7b. Async `MTLResidencySet` to hide first-cmdbuf residency tax (macOS 15+)
 
-**What**: Pre-pay the first-cmdbuf residency-wiring cost on a
-background queue while parallel pread runs. Replaces gotcha #30's
-"this is a fixed cost" with an actual mitigation.
+**What**: A conditional async residency/loader-overlap experiment, after
+a single-variable lifecycle probe establishes the relevant cost.
 
-**Why**: The first cmdbuf to touch a multi-GB working set of
-MTLBuffers blocks for ~80–100 ms inside its commit→GPUStart gap
-(invisible to encoder timing — it shows up only as a `gpu_busy/wall`
-ratio drop). On macOS 15+, `MTLResidencySet` + `requestResidency`
-removes this. The blocking ~85 ms `requestResidency` call must run
-on a `dispatch_async(QOS_CLASS_USER_INITIATED, ...)` queue so it
-overlaps with the (typically longer) weight-pread phase. After
-pread finishes, you `dispatch_group_wait` the residency block and
-call `[queue addResidencySet:]` to bind it.
+**Why**: Some historical ports improved first-submit behavior this way.
+That does not establish every commit→GPUStart gap as residency or every
+request as a fixed blocking tax. Read actual pinned source and measure
+entry/encode/submit/GPU-start/restoration separately. Keep setup in
+ready/outer wall; moving it outside prefill is not a speedup.
 
-**When**: Always, on macOS 15+, for any LLM that loads weights from
-disk into MTLBuffers and runs a forward pass shortly after. The
-larger the model the bigger the win.
+**When**: Supported APIs/runtime and observed first-submit/entry costs
+justify the test. First keep math, tracked hazards, barriers, loader and
+queue unchanged; test async overlap separately after that causal control.
 
-**Speedup**: gen wall -5%, GPU utilization 94% → 99%, total wall
--90 ms on Dream-7B (M4 Max). Cost is fully hidden inside pread.
+**Historical speedup**: gen wall -5%, GPU utilization94%→99%, total
+wall -90ms on Dream-7B/M4 Max. Re-establish causal/outer-wall benefit
+for the current workload; no universal win is implied.
 
 **Catch**: `addAllocations:count:` takes a C array of
 `id<MTLAllocation>`; under ARC, declare it `__strong id<MTLAllocation>*`
@@ -231,7 +245,7 @@ threads: target `n_shards × SHARD_SPLIT ≈ P_cores`. On M4 Max
 (12 P-cores, 4 shards) `SHARD_SPLIT=3` is optimal; `SHARD_SPLIT=4`
 regresses because bg compile starves. See gotcha #45 for the table.
 
-**Companion wins (apply together for full startup savings)**:
+**Companion candidates (screen independently before combining)**:
 
 - **Drop `madvise(MADV_WILLNEED)`** — it's blocking on macOS, costs
   ~340 ms for 14 GB. Gotcha #28.
@@ -273,8 +287,10 @@ on first GPU touch is ~20 GB/s, slower than pread's page-cache memcpy
 fast path at ~50 GB/s. Counter-intuitively, "zero copy" is slower
 here. Gotcha #47.
 
-**When**: From the very first port — startup is the most user-visible
-"wait" and it's trivial to fix.
+**When**: Weight loading is a measured user-visible bottleneck. Native MLX
+can pread directly into per-tensor Shared buffers, not mmap-and-copy.
+Preserve layout/owner/residency semantics and declared file-cache scope;
+historical shard-view speedups are not proof of native allocator parity.
 
 **Speedup**:
 - 28.5 s → 5 s startup (Qwen3.6-35B, 8 shards × ~4 GB, M4 Max).
@@ -418,19 +434,22 @@ dispatch (see `references/gotchas.md` #21).
 
 **Commits**: 130075a, 4e3bb14, ba83808.
 
+**Numerical gate**: keep a native BF16 projection round before residual
+addition where required, even inside one dispatch. Fewer round points are
+not automatically equivalent; do not change frozen C bounds/oracles.
+
 ### B6. Amortize scale/bias across the quant group (uint4 W loads)
 
-**What**: In an affine-quantized GEMV (q8 with `group_size = 64`,
-or q4 with `group_size = 32`), the dequant cost in MLX-style ports
-is dominated by the **scale/bias loads**, not the W byte loads.
+**What**: In an affine-quantized GEMV (illustratively q8/group64 or
+q4/group32), redundant **scale/bias loads** can be expensive.
 The naive inner loop reads one uint32 of packed W per iter (4
 weights), then reloads `(scale, bias)` from device memory every
 iter even though all 4 weights share the same `(s, b)`. Two
 properties combine to make this wasteful:
 
-1. The quant group is wider than a single packed word (16
-   q8-weights fit inside one 64-element group; 8 q4-weights fit
-   inside one 32-element group).
+1. A uint32 holds4 q8 or8 q4 codes; a uint4 holds16 q8 or32 q4.
+   A q8/group64 contains **four uint4**, not one. Groups are a
+   model/format property, not determined by the vector load width.
 2. `(s, b)` is per-group — so a single `(s, b)` load can dequantize
    a whole `uint4` of packed W (= 16 q8 weights or 32 q4 weights).
 
@@ -469,18 +488,18 @@ for (uint u4 = lane; u4 < K_u4; u4 += SIMD_WIDTH) {
 }
 ```
 
-**Why it wins**: Apple GPUs at decode are W-bandwidth bound, but the
-W-bandwidth budget includes `(s, b)` traffic. A per-uint32 loop reads
-`8 bytes` of `(s, b)` per `4 bytes` of W per output — `(s, b)` are
-half the traffic. Amortizing over 16 q8 weights drops `(s, b)` to
-1/8 of the W-byte traffic, putting the budget back on the W bytes
-where it should be.
+**Why it can win**: fewer redundant metadata load instructions can help.
+S/B bytes depend on storage dtype (4 total for BF16,8 for FP32), and caches
+can serve repeated requests; instruction counts are not actual DRAM bytes.
+For literal native parity, retain native affine factoring
+`scale*dot(code,x)+bias*sum(x)` and dtype/reduction boundaries, not this
+illustrative per-weight formula merely because it resembles dequantization.
 
 **When**: After B1–B3 are in. The signal is "linear_q8 (or your
 quantized GEMV family) is the dominant kernel by 70%+ in KPROF and
-it's at ~25-35% of theoretical W-BW peak". If you're already at
-~50%+ of theoretical W-BW peak, you're at the bandwidth floor and
-this technique has nothing left to give.
+it's at low nominal W-bytes/time efficiency". Such estimates suggest a
+load/occupancy hypothesis, not a bandwidth floor at50% of peak.
+Measure the current shape/family before keeping the change.
 
 **Speedup**: 1.15–1.20× decode on the whole pipeline when q8 GEMV
 is the dominant kernel family. Qwen3.6-35B-A3B (linear_q8 ≈ 75%
@@ -513,8 +532,8 @@ per 16 q8) — decode +18.7% (82.8→98.3 tok/s)`).
 
 **Generalization**: This is "amortize per-group state across the
 group". The same principle applies to q4 (one `(s, b)` per `uint`-of-
-packed-q4 = 8 weights), mxfp4 (one shared exponent per 32-byte
-group → load all 32 weights with one `uint8`-vector load), and any
+packed-q4 =8 weights), mxfp4 (inspect its actual code/exponent grouping;
+32 four-bit codes occupy16 bytes, not32), and any
 future block-quant format where the group is wider than the natural
 packed-word width.
 
@@ -1019,6 +1038,11 @@ writes `out + residual`. Drops a dispatch.
 ## F. Reductions — small but pesky kernels
 
 ### F1. Parallel argmax
+
+**Native sampler gate**: first preserve the actual normalization/casts.
+BF16 logsumexp scalar → BF16 subtract → argmax can select a different ID
+from raw-logit argmax. Real-number scalar-subtraction invariance does not
+survive rounding. Do not remove that graph to save dispatches.
 
 **What**: Naive argmax over VOCAB=200k is single-threaded → it's THE
 bottleneck of decode if you don't parallelize. Solution: each SG

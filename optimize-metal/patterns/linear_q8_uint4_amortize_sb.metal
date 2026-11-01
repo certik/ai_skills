@@ -1,35 +1,32 @@
 // patterns/linear_q8_uint4_amortize_sb.metal
 //
 // WHAT: q8 GEMV decode kernel that loads packed W as uint4 (16 bytes
-//       = 16 q8 weights = exactly one 64-element quant group), so one
+//       = 16 q8 weights = one quarter of a 64-element group), so one
 //       (scale, bias) load suffices per 16 weights. The naive form
 //       loads W as uint32 (4 weights) and re-reads (s, b) every 4
 //       weights even though all 4 belong to the same group — pure
 //       redundant memory traffic.
 //
 //       This is catalog B6 — "amortize per-group state across the
-//       group". Same principle applies to q4 (one (s, b) per 8
-//       weights) and mxfp4 (one exponent per 32-byte group), with
+//       group". Same principle applies to q4/group32 and mxfp4, with
 //       different load widths and unpacking arithmetic.
 //
 // WHEN: After B1 (SG-per-output) + B2 (bfloat4 X loads) + B3 (K_OUT
 //       register tile) are in place. The signal is "quantized GEMV
 //       family dominates KPROF (70%+) and runs at ~25–35% of
-//       theoretical W-bandwidth peak". B6 closes most of the gap
-//       to the W-BW floor (~50% peak).
+//       theoretical W-bandwidth peak". This is an illustrative screen,
+//       not measured controller traffic or a bandwidth-floor proof.
 //
 // SPEEDUP: 1.15–1.20× decode on whole pipeline when quantized GEMV
 //          dominates. Qwen3.6-35B-A3B: 82.8 → 98.4 tok/s (+18.7%).
 //
 // SHAPES:
-//   - K must be a multiple of 16 (or 4 × pack_unit for q4).
-//     Trivial for all transformer K (256, 512, 2048, 4096).
-//   - group_size of the quant format must be ≥ 4 × pack_unit
-//     (q8 group_size=64 ≥ 16; q4 group_size=32 ≥ 8). Both hold
-//     for standard MLX-style affine formats.
-//   - K_OUT = 4. Do NOT try K_OUT=8 — the heavier inner loop
-//     (4 X-regs + 8 W-regs + 8 accs) spills registers and
-//     regresses badly (gotcha #8).
+//   - This specific code requires K divisible by64 and aligned vector
+//     pointers; Kgroups and metadata indexing are hardcoded for group64.
+//   - K_OUT4 is a historical starting point, not a universal optimum.
+//   - This per-weight dequantization pattern is not the literal native
+//     affine scale*dot(code,x)+bias*sum(x) body. Preserve pinned native
+//     arithmetic/options/round points when native parity is the objective.
 //
 // COMMIT: cba7169 — "linear_q8 uint4 W loads (1 (s,b) load per 16
 //                    q8) — decode +18.7% (82.8→98.3 tok/s)"
@@ -38,7 +35,7 @@
 using namespace metal;
 
 constant constexpr uint LQ8_SIMD_WIDTH = 32u;
-constant constexpr uint LQ8_K_OUT      = 4u;     // outputs per SG. Stay at 4.
+constant constexpr uint LQ8_K_OUT      = 4u;     // illustrative outputs per SG
 
 struct linear_dims { uint M; uint K; uint N; };
 
@@ -83,7 +80,7 @@ kernel void linear_q8_bf16(device const bfloat*  X     [[buffer(0)]],
     // X row as bfloat4 for fast vector loads.
     const device bfloat4* xrow4 = (const device bfloat4*)(X + m * K);
 
-    // Per-output row pointers: reinterpret W as uint4 (one uint4 = one quant group).
+    // Per-output row pointers: each uint4 is one quarter of a group64.
     const device uint4*   w_rows4[LQ8_K_OUT];
     const device bfloat*  s_rows[LQ8_K_OUT];
     const device bfloat*  b_rows[LQ8_K_OUT];
@@ -100,7 +97,7 @@ kernel void linear_q8_bf16(device const bfloat*  X     [[buffer(0)]],
     for (uint o = 0; o < LQ8_K_OUT; ++o) acc[o] = 0.0f;
 
     // KEY LOOP: lane processes K/16 uint4 packs per row. Each uint4
-    // covers exactly one quant group → ONE (s, b) device read per
+    // stays within one quant group → ONE (s, b) device read per
     // uint4 per output, regardless of K_OUT or unroll factor.
     for (uint u4 = lane; u4 < K_u4; u4 += LQ8_SIMD_WIDTH) {
         uint k4_base = u4 << 2;
@@ -158,8 +155,8 @@ kernel void linear_q8_bf16(device const bfloat*  X     [[buffer(0)]],
 //       (group_size 32 → 32 weights = one group, same trick).
 //
 //   mxfp4 (4-bit + shared 8-bit exponent, group_size 32):
-//     - pack_unit = 16 weights per uint32 (2 × 4-bit packed nybbles
-//       per byte... convention varies — check your dequant header).
+//     - A uint32 contains8 four-bit codes; inspect the model's exponent/
+//       group encoding rather than reusing the affine dequant formula.
 //     - One uint4 (128 bits) = 32 weights = one group → one shared
 //       exponent load per uint4, same amortization win.
 //
